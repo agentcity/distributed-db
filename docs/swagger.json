@@ -1,0 +1,217 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "title": "Distributed DB API",
+        "description": "API for the distributed database",
+        "version": "1.0"
+    },
+    "host": "localhost:8080",
+    "basePath": "/",
+    "schemes": [
+        "http"
+    ],
+    "paths": {
+        "/health": {
+            "get": {
+                "summary": "Healthcheck endpoint",
+                "description": "Get the health status of the node",
+                "tags": [
+                    "health"
+                ],
+                "produces": [
+                    "plain"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/put": {
+            "put": {
+                "summary": "Create data on the node.",
+                "description": "Creates data on the node",
+                "tags": [
+                    "data"
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "plain"
+                ],
+                "parameters": [
+                    {
+                        "name": "key",
+                        "in": "query",
+                        "description": "Key of the data to create",
+                        "required": true,
+                        "type": "string"
+                    }
+                ],
+                "security": [
+                    {
+                        "basicAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                     "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                     "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "405": {
+                        "description": "Method Not Allowed",
+                         "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/get": {
+            "get": {
+                "summary": "Get data from the node.",
+                "description": "Get data from a node by key",
+                "tags": [
+                    "data"
+                ],
+                 "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "plain"
+                ],
+                "parameters": [
+                     {
+                        "name": "key",
+                        "in": "query",
+                        "description": "Key of the data to get",
+                        "required": true,
+                        "type": "string"
+                    }
+                ],
+                 "security": [
+                    {
+                        "basicAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                     "400": {
+                        "description": "Bad Request",
+                          "schema": {
+                            "type": "string"
+                        }
+                    },
+                     "401": {
+                        "description": "Unauthorized",
+                          "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "405": {
+                         "description": "Method Not Allowed",
+                          "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+         "/delete/{key}": {
+             "delete": {
+                "summary": "Delete data from the node.",
+                "description": "Deletes data from a node",
+                "tags": [
+                    "data"
+                ],
+                  "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "plain"
+                ],
+                "parameters": [
+                 {
+                  "consumes": [
+                      "application/json"
+                  ],
+                  "produces": [
+                      "application/json"
+                  ],
+                  "parameters": [
+                       {
+                          "name": "term",
+                          "in": "path",
+                          "required": true,
+                          "description": "Term for election",
+                          "type": "integer",
+                           "format": "int32"
+                      }
+                  ],
+                   "security": [
+                      {
+                          "basicAuth": []
+                      }
+                  ],
+                "responses": {
+                    "200": {
+                         "description": "OK",
+                         "schema": {
+                            "type": "object",
+                             "additionalProperties": {
+                              "type": "boolean"
+                             }
+                        }
+                    },
+                     "400": {
+                        "description": "Bad Request",
+                         "schema": {
+                            "type": "string"
+                        }
+                    },
+                     "401": {
+                        "description": "Unauthorized",
+                         "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "405": {
+                        "description": "Method Not Allowed",
+                         "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "securityDefinitions": {
+        "basicAuth": {
+          "type": "basic"
+        }
+    }
+  
