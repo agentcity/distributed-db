@@ -119,12 +119,13 @@ type Node struct {
 	httpServer *http.Server
 	raft *raft.Raft
 	metrics *metrics.Metrics
+	encryptionKey string
 }
 
 // NewNode создает новый узел
-func NewNode(id int, address string, numNodes int, otherNodes []string, shardId int, coordinatorAddress string, logger *log.Logger, tls bool, serverCert string, clientCert string, authUser string, authPass string) *Node {
+func NewNode(id int, address string, numNodes int, otherNodes []string, shardId int, coordinatorAddress string, logger *log.Logger, tls bool, serverCert string, clientCert string, authUser string, authPass string, encryptionKey string) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
-	ht := data.NewHashTable()
+	ht := data.NewHashTable(encryptionKey)
 	filename := fmt.Sprintf("node_%d_data.json", id)
 	if err := ht.LoadData(filename); err != nil {
 		logger.Printf("Error loading data: %v", err)
@@ -165,6 +166,7 @@ func NewNode(id int, address string, numNodes int, otherNodes []string, shardId 
 		nextIndex:        make(map[int]int),
 		matchIndex:       make(map[int]int),
 		lastLeastLoadedShardUpdate: time.Now(),
+		encryptionKey: encryptionKey,
 	}
 	n.raft = raft.NewRaft(n)
 	n.metrics = metrics.NewMetrics(n)
@@ -212,6 +214,18 @@ func (n *Node) StartServer(nodes []*Node) {
 	}()
 	n.startRaft(nodes)
 	n.startMetrics()
+    go func() {
+        <-n.ctx.Done()
+        n.log(LevelInfo, "Shutting down node %d", n.id)
+        filename := fmt.Sprintf("node_%d_data.json", n.id)
+        if err := n.hashTable.SaveData(filename); err != nil {
+            n.log(LevelError, "Error saving data: %v", err)
+        }
+        n.grpcServer.GracefulStop()
+        if err := n.httpServer.Shutdown(context.Background()); err != nil {
+            n.log(LevelError, "Error shutting down http server: %v", err)
+        }
+    }()
 }
 // SetLogLevel sets log level for node
 func (n *Node) SetLogLevel(level string) {
