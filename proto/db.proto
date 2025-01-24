@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "distributed-db/proto";
+
+// Coordinator service
+service CoordinatorService {
+    rpc HandleShardAssignment(ShardAssignment) returns (ShardAssignmentResponse);
+ rpc HandleLoadReport(LoadReport) returns (LoadReportResponse);
+}
+message ShardAssignment {
+    int32 ShardId = 1;
+    string CoordinatorAddress = 2;
+    repeated string NodeAddresses = 3;
+}
+message ShardAssignmentResponse {
+    bool Success = 1;
+}
+message LoadReport {
+    int32 NodeId = 1;
+ int32 ShardId = 2;
+    int64 Load = 3;
+}
+message LoadReportResponse {
+    bool Success = 1;
+}
+
+// Node service
+service NodeService {
+ rpc PutData(PutRequest) returns (PutResponse);
+ rpc GetData(GetRequest) returns (GetResponse);
+ rpc HandleAppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+ rpc HandleHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+ rpc RequestVote(VoteRequest) returns (VoteResponse);
+ rpc SendMetrics(MetricsRequest) returns (MetricsResponse);
+ rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message PutRequest {
+ string Key = 1;
+}
+
+message PutResponse {
+ bool Success = 1;
+}
+
+message GetRequest {
+ string Key = 1;
+}
+
+message GetResponse {
+ bool Value = 1;
+}
+message LogEntry {
+    int32 Term = 1;
+    string Key = 2;
+ bool Committed = 3;
+}
+message AppendEntriesRequest {
+ int32 Term = 1;
+ int32 LeaderId = 2;
+ int32 PrevLogIndex = 3;
+ int32 PrevLogTerm = 4;
+ repeated LogEntry Entries = 5;
+ int32 LeaderCommitIndex = 6;
+}
+message AppendEntriesResponse {
+    bool Success = 1;
+}
+
+message HeartbeatRequest {
+ int32 Term = 1;
+}
+message HeartbeatResponse {
+}
+message VoteRequest {
+ int32 Term = 1;
+ int32 LastLogIndex = 2;
+ int32 LastLogTerm = 3;
+}
+message VoteResponse {
+    bool Voted = 1;
+}
+message MetricsRequest {
+
+}
+message MetricsResponse {
+ int64 Load = 1;
+}
