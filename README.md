@@ -138,25 +138,25 @@ distributed-db/
 1. Установите Go: Убедитесь, что у вас установлен Go (версия 1.20 или выше).
 2. Склонируйте репозиторий:
 ```bash
-    git clone https://github.com/agentcity/distributed-db/
-    cd distributed-db
+git clone https://github.com/agentcity/distributed-db/
+cd distributed-db
 ```
 3. Установите зависимости:
 ```bash
-    go mod tidy
+go mod tidy
 ```
 4. Сгенерируйте gRPC код:
 ```bash
-    protoc --go_out=. --go-grpc_out=. proto/node.proto
+protoc --go_out=. --go-grpc_out=. proto/node.proto
 ```
 5. Сгенерируйте Swagger JSON:
 ```bash
-    swag init -g cmd/main.go
+swag init -g cmd/main.go
 ```
 6. Создайте TLS сертификаты (опционально): Если вы планируете использовать TLS, создайте необходимые сертификаты. Можно использовать следующую команду для создания тестовых сертификатов:
 ```bash
-    openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
-    openssl req -newkey rsa:4096 -keyout certs/client.key -out certs/client.crt -days 365 -nodes -subj "/CN=localhost"
+openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
+openssl req -newkey rsa:4096 -keyout certs/client.key -out certs/client.crt -days 365 -nodes -subj "/CN=localhost"
 ```
 Внимание: Эти сертификаты предназначены только для тестирования. В продакшене используйте действительные сертификаты.
 
@@ -164,13 +164,13 @@ distributed-db/
    
   -  Запуск Координатора:
 ```bash
-    go run cmd/main.go -id=0 -address=":8081" -logLevel="DEBUG" -tls=true
+go run cmd/main.go -id=0 -address=":8081" -logLevel="DEBUG" -tls=true
 ```
   -  Запуск Узлов:  
 ```bash
-    go run cmd/main.go -id=1 -address=":8082" -otherNodes=":8083,:8084" -shardId=1 -coordinatorAddress=":8081" -logLevel="DEBUG" -tls=true
-    go run cmd/main.go -id=2 -address=":8083" -otherNodes=":8082,:8084" -shardId=1 -coordinatorAddress=":8081" -logLevel="DEBUG" -tls=true
-    go run cmd/main.go -id=3 -address=":8084" -otherNodes=":8082,:8083" -shardId=1 -coordinatorAddress=":8081" -logLevel="DEBUG" -tls=true
+go run cmd/main.go -id=1 -address=":8082" -otherNodes=":8083,:8084" -shardId=1 -coordinatorAddress=":8081" -logLevel="DEBUG" -tls=true
+go run cmd/main.go -id=2 -address=":8083" -otherNodes=":8082,:8084" -shardId=1 -coordinatorAddress=":8081" -logLevel="DEBUG" -tls=true
+go run cmd/main.go -id=3 -address=":8084" -otherNodes=":8082,:8083" -shardId=1 -coordinatorAddress=":8081" -logLevel="DEBUG" -tls=true
 ```
 *  Параметры:
     *  -id: Идентификатор узла (0 для координатора, 1 и более для узлов).
@@ -211,16 +211,16 @@ distributed-db/
 1. Запустите координатор и три узла, как описано в инструкции.
 2. Отправьте PUT запрос на один из узлов:
 ```bash  
-    curl -u admin:admin -X PUT "http://localhost:8082/put?key=testKey"
+curl -u admin:admin -X PUT "http://localhost:8082/put?key=testKey"
 ```  
 3. Отправьте GET запрос на любой узел и убедитесь, что значение было записано:
 ```bash  
-    curl -u admin:admin -X GET "http://localhost:8083/get?key=testKey"
+curl -u admin:admin -X GET "http://localhost:8083/get?key=testKey"
 ```
 Узлы будут перенаправлять запросы PUT и GET на текущего лидера шарда.
 4. Удалите данные через HTTP API одного из узлов
 ```bash  
-    curl -u admin:admin -X DELETE "http://localhost:8082/delete/testKey"
+curl -u admin:admin -X DELETE "http://localhost:8082/delete/testKey"
 ```
 5.  Отправьте GET запрос на любой узел и убедитесь, что значение удалено
 ```bash  
