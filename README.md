@@ -138,7 +138,7 @@ distributed-db/
 1. Установите Go: Убедитесь, что у вас установлен Go (версия 1.20 или выше).
 2. Склонируйте репозиторий:
 ```bash
-    git clone <ваш_репозиторий>
+    git clone https://github.com/agentcity/distributed-db/
     cd distributed-db
 ```
 3. Установите зависимости:
