@@ -1,264 +1,187 @@
 package http
 
 import (
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"strconv"
-	"distributed-db/internal/auth"
-	"distributed-db/node"
+ "context"
+ "crypto/tls"
+ "encoding/json"
+ "fmt"
+ "io/ioutil"
+ "log"
+ "net/http"
+ "time"
+    "distributed-db/node"
+ "github.com/gorilla/mux"
+ "golang.org/x/crypto/bcrypt"
 )
 
-// HTTPServer handles HTTP requests for the Node
-type HTTPServer struct {
-	node *node.Node
-	mux *http.ServeMux
+type HttpServer struct {
+    node *node.Node
+ server *http.Server
+ tlsEnabled bool
+    certFile string
+    keyFile string
+ authUser string
+ authPass string
 }
 
-// NewHTTPServer creates a new HTTP server
-func NewHTTPServer(n *node.Node, mux *http.ServeMux) *HTTPServer {
-    return &HTTPServer{
-        node: n,
-		mux: mux,
+func NewHttpServer(node *node.Node, tlsEnabled bool, certFile string, keyFile string, authUser string, authPass string) *HttpServer{
+ return &HttpServer{
+        node: node,
+  server: &http.Server{
+   ReadTimeout:  5 * time.Second,
+   WriteTimeout: 10 * time.Second,
+  },
+  tlsEnabled: tlsEnabled,
+  certFile: certFile,
+  keyFile: keyFile,
+  authUser: authUser,
+  authPass: authPass,
+ }
+}
+func (s *HttpServer) Start(port string) error {
+ r := mux.NewRouter()
+ r.HandleFunc("/data/{key}", s.getDataHandler).Methods(http.MethodGet)
+ r.HandleFunc("/data/{key}", s.putDataHandler).Methods(http.MethodPut)
+ r.HandleFunc("/data/{key}", s.deleteDataHandler).Methods(http.MethodDelete)
+    r.HandleFunc("/health", s.healthCheckHandler).Methods(http.MethodGet)
+ r.Use(s.authMiddleware)
+ s.server.Handler = r
+
+ addr := fmt.Sprintf(":%s", port)
+ s.node.Log(node.LevelInfo, "Starting HTTP server on: %v", addr)
+ if s.tlsEnabled {
+  cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+  if err != nil {
+   return fmt.Errorf("failed to load key pair: %w", err)
+  }
+        config := &tls.Config{Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true}
+  s.server.TLSConfig = config
+  if err := s.server.ListenAndServeTLS(s.certFile, s.keyFile, addr); err != nil {
+   return fmt.Errorf("failed to start https server: %w", err)
+  }
+ }else{
+  if err := s.server.ListenAndServe(addr); err != nil {
+   return fmt.Errorf("failed to start http server: %w", err)
+  }
+ }
+ return nil
+}
+
+func (s *HttpServer) Shutdown() {
+ ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ defer cancel()
+
+ if err := s.server.Shutdown(ctx); err != nil {
+  s.node.Log(node.LevelError, "Failed to shutdown http server: %v", err)
+ }
+ s.node.Log(node.LevelInfo, "Http server shutdown")
+}
+func (s *HttpServer) authMiddleware(next http.Handler) http.Handler {
+ return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  if s.authUser == "" && s.authPass == ""{
+   next.ServeHTTP(w, r)
+   return
+  }
+  user, pass, ok := r.BasicAuth()
+  if !ok || user != s.authUser {
+     w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+     http.Error(w, "Unauthorized", http.StatusUnauthorized)
+     return
     }
-}
+    err := bcrypt.CompareHashAndPassword([]byte(s.authPass), []byte(pass))
 
-func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/put":
-		s.handlePutRequest(w, r)
-	case "/get":
-		s.handleGetRequest(w, r)
-	case fmt.Sprintf("/delete/%s", r.PathValue("key")):
-		s.handleDeleteRequest(w, r)
-	case fmt.Sprintf("/vote/%s", r.PathValue("term")):
-		s.handleVoteRequest(w, r)
-	case "/health":
-		s.handleHealthCheck(w, r)
-	default:
-		http.Error(w, "Not found", http.StatusNotFound)
-	}
-}
-// handleHealthCheck returns node state
-// @Summary Healthcheck endpoint
-// @Description Get the health status of the node
-// @Tags health
-// @Produce plain
-// @Success 200 {string} string "OK"
-// @Router /health [get]
-func (s *HTTPServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	fmt.Fprint(w, "OK, node state:", s.node.state)
-}
-// handlePutRequest handles put request
-// @Summary Create data on the node.
-// @Description Creates data on the node
-// @Tags data
-// @Accept json
-// @Produce plain
-// @Param key query string true "Key of the data to create"
-// @Security basicAuth
-// @Success 200 {string} string "OK"
-// @Failure 400 {string} string "Bad Request"
-// @Failure 401 {string} string "Unauthorized"
-// @Failure 405 {string} string "Method Not Allowed"
-// @Router /put [put]
-func (s *HTTPServer) handlePutRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	user, pass, ok := r.BasicAuth()
-	if !ok || user != s.node.authUser || !auth.CheckPassword(s.node.hashedAuthPass, pass) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		s.node.log(node.LevelError, "Empty key for PUT request")
-		http.Error(w, "Empty key", http.StatusBadRequest)
-		return
-	}
-	s.node.log(node.LevelDebug, "Node %d received PUT request for key %s", s.node.id, key)
-	if ok := s.node.Put(key); ok {
-		fmt.Fprintf(w, "Data stored succesfully for key %s in node %d \n", key, s.node.id)
-		s.node.putCounter.Inc()
-	} else {
-		s.node.errorCounter.Inc()
-		http.Error(w, "Failed to store data", http.StatusBadRequest)
-	}
-}
+    if err != nil{
+     w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+     http.Error(w, "Unauthorized", http.StatusUnauthorized)
+     return
+    }
+    next.ServeHTTP(w, r)
+   })
+  }
+  func (s *HttpServer) getDataHandler(w http.ResponseWriter, r *http.Request) {
+   vars := mux.Vars(r)
+   key, ok := vars["key"]
+   if !ok {
+    http.Error(w, "Key is missing", http.StatusBadRequest)
+    return
+   }
 
-// handleGetRequest handles get request
-// @Summary Get data from the node.
-// @Description Get data from a node by key
-// @Tags data
-// @Accept json
-// @Produce plain
-// @Param key query string true "Key of the data to get"
-// @Security basicAuth
-// @Success 200 {string} string "OK"
-// @Failure 400 {string} string "Bad Request"
-// @Failure 401 {string} string "Unauthorized"
-// @Failure 405 {string} string "Method Not Allowed"
-// @Router /get [get]
-func (s *HTTPServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	user, pass, ok := r.BasicAuth()
-	if !ok || user != s.node.authUser || !auth.CheckPassword(s.node.hashedAuthPass, pass) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		s.node.log(node.LevelError, "Empty key for GET request")
-		http.Error(w, "Empty key", http.StatusBadRequest)
-		return
-	}
-	s.node.log(node.LevelDebug, "Node %d received GET request for key %s", s.node.id, key)
-	if value := s.node.Get(key); value {
-		fmt.Fprintf(w, "Data found for key %s in node %d \n", key, s.node.id)
-		s.node.getCounter.Inc()
-	} else {
-		s.node.errorCounter.Inc()
-		http.Error(w, "Data not found", http.StatusNotFound)
-	}
-}
-// handleDeleteRequest handles delete request
-// @Summary Delete data from the node.
-// @Description Deletes data from a node
-// @Tags data
-// @Accept json
-// @Produce plain
-// @Param key path string true "Key of the data to delete"
-// @Security basicAuth
-// @Success 200 {string} string "OK"
-// @Failure 400 {string} string "Bad Request"
-// @Failure 401 {string} string "Unauthorized"
-// @Failure 405 {string} string "Method Not Allowed"
-// @Router /delete/{key} [delete]
-func (s *HTTPServer) handleDeleteRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	user, pass, ok := r.BasicAuth()
-	if !ok || user != s.node.authUser || !auth.CheckPassword(s.node.hashedAuthPass, pass) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	key := r.PathValue("key")
-	if key == "" {
-		s.node.log(node.LevelError, "Empty key for DELETE request")
-		http.Error(w, "Empty key", http.StatusBadRequest)
-		return
-	}
-	if len(key) > 255 {
-		s.node.log(node.LevelError, "Key is too long")
-		http.Error(w, "Key is too long", http.StatusBadRequest)
-		return
-	}
-	s.node.log(node.LevelDebug, "Node %d received DELETE request for key %s", s.node.id, key)
-	s.node.appendLog(key)
-	s.node.replicateLog()
-	for _, entry := range s.node.raftLog {
-		if entry.Key == key && entry.Committed {
-			s.node.hashTable.Delete(key)
-			break
-		}
-	}
-
-	fmt.Fprintf(w, "Data deleted succesfully for key %s in node %d \n", key, s.node.id)
-}
-
-// handleVoteRequest handles vote request
-// @Summary Request vote for term.
-// @Description Request vote for term
-// @Tags raft
-// @Accept json
-// @Produce json
-// @Param term path integer true "Term for election"
-// @Security basicAuth
-// @Success 200 {object} map[string]bool "OK"
-// @Failure 400 {string} string "Bad Request"
-// @Failure 401 {string} string "Unauthorized"
-// @Failure 405 {string} string "Method Not Allowed"
-// @Router /vote/{term} [get]
-func (s *HTTPServer) handleVoteRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	user, pass, ok := r.BasicAuth()
-	if !ok || user != s.node.authUser || !auth.CheckPassword(s.node.hashedAuthPass, pass) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	termStr := r.PathValue("term")
-	term, err := strconv.Atoi(termStr)
-	if err != nil {
-		s.node.log(node.LevelError, "Invalid term: %v", err)
-		http.Error(w, "Invalid term", http.StatusBadRequest)
-		return
-	}
-	if !s.node.isAlive {
-		s.node.log(node.LevelError,"Node %d is not alive. Can't handle vote request", s.node.id)
-		response := map[string]bool{"voted": false}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			s.node.log(node.LevelError,"Error encoding response %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
-		return
-	}
-
-	if term > s.node.term {
-		s.node.mu.Lock()
-		defer s.node.mu.Unlock()
-		s.node.log(node.LevelDebug, "Node %d received vote request for term: %d, my term is: %d, voted for: %s", s.node.id, term, s.node.term, s.node.votedFor)
-		s.node.term = term
-		s.node.votedFor = r.RemoteAddr
-		s.node.state = node.Follower
-		response := map[string]bool{"voted": true}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			s.node.log(node.LevelError,"Error encoding response %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
-
-	} else if term == s.node.term && (s.node.votedFor == "" || s.node.votedFor == r.RemoteAddr) && s.node.isLogUpToDate(term, len(s.node.raftLog)){
-		s.node.mu.Lock()
-		defer s.node.mu.Unlock()
-		s.node.log(node.LevelDebug, "Node %d received vote request for term: %d, my term is: %d, voted for: %s", s.node.id, term, s.node.term, s.node.votedFor)
-		s.node.votedFor = r.RemoteAddr
-		s.node.state = node.Follower
-		response := map[string]bool{"voted": true}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			s.node.log(node.LevelError,"Error encoding response %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
-	} else {
-		s.node.log(node.LevelDebug, "Node %d rejected vote request for term: %d, my term is: %d, voted for: %s", s.node.id, term, s.node.term, s.node.votedFor)
-		response := map[string]bool{"voted": false}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			s.node.log(node.LevelError,"Error encoding response %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
-	}
-}
+   ok, err := s.node.GetData(key)
+   if err != nil {
+    s.node.Log(node.LevelError, "Failed to get data: %v", err)
+    http.Error(w, "Failed to get data", http.StatusInternalServerError)
+    return
+   }
+   if !ok {
+    http.Error(w, "Key not found", http.StatusNotFound)
+    return
+   }
+   resp := map[string]interface{}{
+    "key": key,
+    "value": key,
+   }
+   w.Header().Set("Content-Type", "application/json")
+   json.NewEncoder(w).Encode(resp)
+  }
+  func (s *HttpServer) putDataHandler(w http.ResponseWriter, r *http.Request) {
+   vars := mux.Vars(r)
+   key, ok := vars["key"]
+   if !ok {
+    http.Error(w, "Key is missing", http.StatusBadRequest)
+    return
+   }
+   body, err := ioutil.ReadAll(r.Body)
+   if err != nil {
+    http.Error(w, "Failed to read request body", http.StatusBadRequest)
+    return
+   }
+   var data map[string]interface{}
+   if err := json.Unmarshal(body, &data); err != nil {
+    http.Error(w, "Failed to unmarshal request body", http.StatusBadRequest)
+    return
+   }
+   ok, err = s.node.PutData(key, data["value"])
+   if err != nil {
+    s.node.Log(node.LevelError, "Failed to put data: %v", err)
+    http.Error(w, "Failed to put data", http.StatusInternalServerError)
+    return
+   }
+      if !ok {
+    http.Error(w, "Failed to put data", http.StatusInternalServerError)
+    return
+   }
+      w.WriteHeader(http.StatusCreated)
+      resp := map[string]string{
+          "message": "data has been put",
+      }
+      w.Header().Set("Content-Type", "application/json")
+      json.NewEncoder(w).Encode(resp)
+  }
+  func (s *HttpServer) deleteDataHandler(w http.ResponseWriter, r *http.Request) {
+   vars := mux.Vars(r)
+   key, ok := vars["key"]
+   if !ok {
+    http.Error(w, "Key is missing", http.StatusBadRequest)
+    return
+   }
+      err := s.node.DeleteData(key)
+   if err != nil {
+    s.node.Log(node.LevelError, "Failed to delete data: %v", err)
+    http.Error(w, "Failed to delete data", http.StatusInternalServerError)
+    return
+   }
+      w.WriteHeader(http.StatusOK)
+   resp := map[string]string{
+          "message": "data has been deleted",
+      }
+      w.Header().Set("Content-Type", "application/json")
+      json.NewEncoder(w).Encode(resp)
+  }
+  func (s *HttpServer) healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+      w.WriteHeader(http.StatusOK)
+      resp := map[string]bool{
+    "isAlive": s.node.IsAlive(),
+      }
+      w.Header().Set("Content-Type", "application/json")
+      json.NewEncoder(w).Encode(resp)
+  }

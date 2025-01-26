@@ -2,266 +2,569 @@
 package node
 
 import (
-	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
-
-	"distributed-db/internal/auth"
-	"distributed-db/internal/data"
+	"distributed-db/internal/expirable"
 	"distributed-db/internal/grpcpool"
 	"distributed-db/node/grpc"
 	"distributed-db/node/http"
 	"distributed-db/node/raft"
 	"distributed-db/node/metrics"
 	pb "distributed-db/proto"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+    "github.com/cespare/xxhash/v2"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"golang.org/x/time/rate"
-	"net/http/pprof"
-	_ "distributed-db/docs" // Добавляем импорт для автодокументации
 )
-
-// Node states
+type LogLevel int
 const (
-	Follower  = "Follower"
-	Candidate = "Candidate"
-	Leader    = "Leader"
+	LevelError LogLevel = iota
+	LevelWarning
+    LevelInfo
+	LevelDebug
 )
 
-// Log levels
+type NodeState int
+
 const (
-	LevelDebug = "DEBUG"
-	LevelInfo  = "INFO"
-	LevelError = "ERROR"
+	Follower NodeState = iota
+	Candidate
+	Leader
 )
 
-// logEntry структура для хранения записей лога
-type logEntry struct {
-	Term    int    `json:"term"`
-	Key     string `json:"key"`
-	Committed bool `json:"committed"`
+type LogEntry struct {
+	Term  int
+    Index int
+	Key   string
 }
-// messageQueue структура для хранения сообщений для репликации
-type messageQueue struct {
-	queue []logEntry
-	mu    sync.Mutex
+type Node struct {
+	id int
+	address string
+	port string
+    raftPort string
+    state NodeState
+    term int
+    votedFor string
+	commitIndex int
+	lastApplied int
+	raftLog []LogEntry
+    shardCount int
+	nodes []*Node
+	poolManager *grpcpool.PoolManager
+	mu sync.RWMutex
+    grpcServer *grpc.GrpcServer
+	httpServer *http.HttpServer
+	raft *raft.Raft
+	gossipState *gossipState
+	gossipHistory *gossipHistory
+    data map[string]interface{}
+	cache *expirable.LRU[string,interface{}]
+    lastLeaderHeartbeat time.Time
+    logger *log.Logger
+    metrics *metrics.Metrics
+    shardData map[string]int
+    aesGCM cipher.AEAD
+	aesKey string
+	gossipInterval int
 }
-// Push добавляет элемент в очередь
-func (mq *messageQueue) Push(entry logEntry) {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	mq.queue = append(mq.queue, entry)
+
+func NewNode(id int, address string, shardCount int, port string, logger *log.Logger, tlsEnabled bool, certFile string, keyFile string, authUser string, authPass string) *Node{
+    n := &Node{
+		id: id,
+		address: address,
+		shardCount: shardCount,
+		port: port,
+		state: Follower,
+        term: 0,
+		votedFor: "",
+		commitIndex: 0,
+		lastApplied: 0,
+		raftLog: make([]LogEntry, 0),
+		nodes: make([]*Node, 0),
+		poolManager: grpcpool.NewPoolManager(),
+		mu: sync.RWMutex{},
+		data: make(map[string]interface{}),
+		cache: expirable.NewLRU[string,interface{}](1000, time.Minute*5),
+        lastLeaderHeartbeat: time.Now(),
+        logger: logger,
+		shardData: make(map[string]int),
+		gossipInterval: 10,
+    }
+    n.gossipState = &gossipState{
+		shards: make(map[int]shardInfo),
+		nodes: make(map[string]nodeInfo),
+		nodeVersion: 1,
+		mu: sync.RWMutex{},
+	}
+    n.gossipHistory = &gossipHistory{
+		lastSeen: make(map[string]time.Time),
+		mu: sync.RWMutex{},
+	}
+    n.metrics = metrics.NewMetrics()
+    n.metrics.RegisterMetrics()
+	n.raft = raft.NewRaft(n)
+
+	lis, err := net.Listen("tcp", address)
+	if err != nil {
+		n.Log(LevelError, "Failed to listen: %v", err)
+	}
+
+	n.grpcServer = grpc.NewGrpcServer(n, tlsEnabled, certFile, keyFile)
+	go func() {
+		err := n.grpcServer.Start(lis)
+		if err != nil {
+			n.Log(LevelError, "Failed to start gRPC server: %v", err)
+		}
+	}()
+	n.httpServer = http.NewHttpServer(n, tlsEnabled, certFile, keyFile, authUser, authPass)
+	go func() {
+		err := n.httpServer.Start(port)
+        if err != nil {
+			n.Log(LevelError, "Failed to start HTTP server: %v", err)
+        }
+	}()
+
+	n.initializeGossipState()
+    n.Log(LevelInfo, "Node %v started on address: %v, HTTP port: %v", id, address, port)
+	go n.checkGossipHistoryInterval()
+
+    return n
 }
-// PopAll достает все элементы из очереди
-func (mq *messageQueue) PopAll() []logEntry {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	if len(mq.queue) == 0 {
+func (n *Node) Start(nodes []*Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.nodes = nodes
+	n.raft.Start(nodes)
+}
+func (n *Node) Shutdown() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+    n.raft.Shutdown()
+	n.grpcServer.Shutdown()
+	n.httpServer.Shutdown()
+	n.poolManager.Close()
+    n.Log(LevelInfo, "Node shutdown")
+}
+func (n *Node) Address() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.address
+}
+func (n *Node) Port() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.port
+}
+func (n *Node) SetState(state NodeState) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.state = state
+    n.metrics.SetNodeState(state.String())
+}
+
+func (n *Node) State() NodeState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.state
+}
+
+func (n *Node) IncrementTerm(){
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.term++
+    n.metrics.SetTerm(n.term)
+}
+func (n *Node) SetTerm(term int){
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.term = term
+    n.metrics.SetTerm(term)
+}
+func (n *Node) Term() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.term
+}
+func (n *Node) SetVotedFor(votedFor string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.votedFor = votedFor
+}
+
+func (n *Node) VotedFor() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.votedFor
+}
+func (n *Node) SetCommitIndex(commitIndex int){
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.commitIndex = commitIndex
+    n.metrics.SetCommitIndex(int64(commitIndex))
+}
+func (n *Node) CommitIndex() int {
+    n.mu.RLock()
+	defer n.mu.RUnlock()
+    return n.commitIndex
+}
+func (n *Node) SetLastApplied(lastApplied int){
+    n.mu.Lock()
+    defer n.mu.Unlock()
+	n.lastApplied = lastApplied
+    n.metrics.SetLastApplied(int64(lastApplied))
+}
+func (n *Node) LastApplied() int {
+    n.mu.RLock()
+	defer n.mu.RUnlock()
+    return n.lastApplied
+}
+
+func (n *Node) RaftLog() []LogEntry {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raftLog
+}
+func (n *Node) Nodes() []*Node{
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.nodes
+}
+func (n *Node) Id() int{
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.id
+}
+func (n *Node) SetNextIndexValue(nodeId int, value int){
+	n.gossipState.mu.Lock()
+    defer n.gossipState.mu.Unlock()
+    for address, node := range n.gossipState.nodes{
+		if n.getNodeIdFromAddress(address) == nodeId{
+			node.nextIndex[n.id] = value
+			n.gossipState.nodes[address] = node
+			return
+		}
+	}
+}
+func (n *Node) SetMatchIndexValue(nodeId int, value int){
+	n.gossipState.mu.Lock()
+    defer n.gossipState.mu.Unlock()
+    for address, node := range n.gossipState.nodes{
+		if n.getNodeIdFromAddress(address) == nodeId{
+			node.matchIndex[n.id] = value
+			n.gossipState.nodes[address] = node
+			return
+		}
+	}
+}
+func (n *Node) getNextIndexValue(nodeId int) int{
+	n.gossipState.mu.RLock()
+	defer n.gossipState.mu.RUnlock()
+	for address, node := range n.gossipState.nodes{
+		if n.getNodeIdFromAddress(address) == nodeId{
+			if val, ok := node.nextIndex[n.id]; ok{
+				return val
+			}
+			return 1
+		}
+	}
+	return 1
+}
+func (n *Node) getMatchIndexValue(nodeId int) int{
+	n.gossipState.mu.RLock()
+	defer n.gossipState.mu.RUnlock()
+	for address, node := range n.gossipState.nodes{
+		if n.getNodeIdFromAddress(address) == nodeId{
+			if val, ok := node.matchIndex[n.id]; ok{
+				return val
+			}
+			return 0
+		}
+	}
+	return 0
+}
+func (n *Node) getShardForHash(key string) int{
+    hash := xxhash.Sum64([]byte(key))
+    shardId := int(hash % uint64(n.shardCount))
+    return shardId
+}
+func (n *Node) GetConn(address string) (*grpc.ClientConn, error){
+	p, _ := n.poolManager.GetConn(address)
+	if p == nil{
+		conn, err := n.grpcServer.GetClientConn(address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get connection: %w", err)
+		}
+		pool := grpcpool.NewPool(conn)
+		n.poolManager.PutConn(address, pool)
+		p, _ = n.poolManager.GetConn(address)
+		if p == nil{
+			return nil, fmt.Errorf("failed to get connection from pool")
+		}
+	}
+	return p.conn, nil
+}
+
+func (n *Node) PutConn(address string, conn *grpc.ClientConn) {
+    pool, _ := n.poolManager.GetConn(address)
+	if pool != nil {
+		n.poolManager.PutConn(address, pool)
+	}
+}
+func (n *Node) Log(LogLevel LogLevel, format string, v ...interface{}) {
+    if LogLevel <= LevelDebug{
+        n.logger.Printf(format, v...)
+	}
+}
+func (n *Node) Raft() *raft.Raft {
+	return n.raft
+}
+func (n *Node) GossipHandler(ctx context.Context, req *pb.GossipRequest) (*pb.GossipResponse, error) {
+	return n.gossipHandler(ctx, req)
+}
+func (n *Node) ShardHeartbeatHandler(ctx context.Context, req *pb.ShardHeartbeatRequest) (*pb.ShardHeartbeatResponse, error) {
+	return n.shardHeartbeatHandler(ctx, req)
+}
+func (n *Node) IsAlive() bool {
+    n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.state != 0
+}
+func (n *Node) putDataLocal(key string, value interface{}) {
+	n.mu.Lock()
+    defer n.mu.Unlock()
+    if n.aesKey != ""{
+		encryptedData, err := n.encryptData(value)
+		if err != nil {
+			n.Log(LevelError, "Failed to encrypt data: %v", err)
+			return
+		}
+		n.data[key] = encryptedData
+	}else{
+		n.data[key] = value
+	}
+	n.cache.Add(key, value)
+}
+func (n *Node) getDataLocal(key string, originalKey string) (bool, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+    if val, ok := n.cache.Get(key); ok {
+        if n.aesKey != "" {
+            data, ok := val.(string)
+            if !ok{
+				return false, fmt.Errorf("failed to convert data to string")
+            }
+            decryptedData, err := n.decryptData(data)
+            if err != nil{
+                return false, fmt.Errorf("failed to decrypt data: %w", err)
+            }
+            return decryptedData == originalKey, nil
+        }
+        return val == originalKey, nil
+    }
+    if val, ok := n.data[key]; ok {
+		if n.aesKey != "" {
+            data, ok := val.(string)
+            if !ok{
+				return false, fmt.Errorf("failed to convert data to string")
+            }
+			decryptedData, err := n.decryptData(data)
+            if err != nil{
+                return false, fmt.Errorf("failed to decrypt data: %w", err)
+            }
+            n.cache.Add(key, decryptedData)
+            return decryptedData == originalKey, nil
+        }
+		n.cache.Add(key, val)
+        return val == originalKey, nil
+    }
+    return false, nil
+}
+func (n *Node) deleteDataLocal(key string) {
+	n.mu.Lock()
+    defer n.mu.Unlock()
+	delete(n.data, key)
+    n.cache.Invalidate(key)
+}
+func (n *Node) PutData(key string, value interface{}) (bool, error) {
+	if n.State() != Leader {
+        leader, ok := n.getShardLeader(key)
+        if !ok {
+			n.Log(LevelWarning, "Leader not found for shard: %v", n.getShardForHash(key))
+            return false, fmt.Errorf("leader not found for shard: %v", n.getShardForHash(key))
+		}
+		if leader == n.address {
+            n.Raft().PutData(key)
+            return true, nil
+		}
+        conn, err := n.GetConn(leader)
+        if err != nil{
+            return false, fmt.Errorf("failed to get connection: %w", err)
+        }
+        defer n.PutConn(leader, conn)
+        client := pb.NewNodeServiceClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+        _, err = client.PutData(ctx, &pb.PutRequest{Key: key})
+		if err != nil {
+            return false, fmt.Errorf("failed to put data to leader: %w", err)
+		}
+        return true, nil
+	}
+    n.Raft().PutData(key)
+	return true, nil
+}
+
+func (n *Node) GetData(key string) (bool, error) {
+	if n.State() != Leader {
+		leader, ok := n.getShardLeader(key)
+        if !ok {
+            return false, fmt.Errorf("leader not found for shard: %v", n.getShardForHash(key))
+        }
+        if leader == n.address {
+            return n.Raft().GetData(key)
+		}
+		conn, err := n.GetConn(leader)
+        if err != nil{
+            return false, fmt.Errorf("failed to get connection: %w", err)
+        }
+        defer n.PutConn(leader, conn)
+        client := pb.NewNodeServiceClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+        resp, err := client.GetData(ctx, &pb.GetRequest{Key: key})
+		if err != nil {
+			return false, fmt.Errorf("failed to get data from leader: %w", err)
+		}
+		return resp.Success, nil
+    }
+	return n.Raft().GetData(key)
+}
+
+func (n *Node) DeleteData(key string) error {
+	if n.State() != Leader {
+		leader, ok := n.getShardLeader(key)
+        if !ok {
+            return fmt.Errorf("leader not found for shard: %v", n.getShardForHash(key))
+        }
+        if leader == n.address {
+            return n.Raft().DeleteData(key)
+		}
+		conn, err := n.GetConn(leader)
+        if err != nil{
+            return fmt.Errorf("failed to get connection: %w", err)
+        }
+        defer n.PutConn(leader, conn)
+        client := pb.NewNodeServiceClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+        _, err = client.DeleteData(ctx, &pb.DeleteRequest{Key: key})
+		if err != nil {
+			return fmt.Errorf("failed to delete data from leader: %w", err)
+		}
 		return nil
 	}
-	popped := mq.queue
-	mq.queue = nil
-	return popped
+    return n.Raft().DeleteData(key)
 }
-// Len возвращает длинну очереди
-func (mq *messageQueue) Len() int {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	return len(mq.queue)
-}
-// Node структура для представления узла распределенной базы данных
-type Node struct {
-	id                    int
-	address               string
-	numNodes              int
-	otherNodes            []string
-	shardId               int
-	coordinatorAddress    string
-	tls                  bool
-	serverCert           string
-	clientCert           string
-	authUser            string
-	authPass            string
-	hashedAuthPass     string
-	state                 string
-	term                  int
-	votedFor              string
-	isAlive               bool
-	lastLeaderHeartbeat   time.Time
-	electionTimer         *time.Timer
-	logLevel              string
-	hashTable             *data.HashTable
-	logger                *log.Logger
-	mu                    sync.RWMutex
-	putCounter            prometheus.Counter
-	getCounter            prometheus.Counter
-	errorCounter          prometheus.Counter
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	grpcServer *grpc.Server
-	coordinatorPool *grpcpool.Pool
-	messageQueue *messageQueue
-	raftLog []logEntry
-	commitIndex        int
-	lastApplied        int
-	nextIndex      map[int]int
-	matchIndex      map[int]int
-	leastLoadedShard   *Node
-	lastLeastLoadedShardUpdate time.Time
-	limiter *rate.Limiter
-	httpServer *http.Server
-	raft *raft.Raft
-	metrics *metrics.Metrics
-	encryptionKey string
-}
-
-// NewNode создает новый узел
-func NewNode(id int, address string, numNodes int, otherNodes []string, shardId int, coordinatorAddress string, logger *log.Logger, tls bool, serverCert string, clientCert string, authUser string, authPass string, encryptionKey string) *Node {
-	ctx, cancel := context.WithCancel(context.Background())
-	ht := data.NewHashTable(encryptionKey)
-	filename := fmt.Sprintf("node_%d_data.json", id)
-	if err := ht.LoadData(filename); err != nil {
-		logger.Printf("Error loading data: %v", err)
+func (n *Node) SetAesKey(key string){
+	n.mu.Lock()
+	defer n.mu.Unlock()
+    if len(key) != 32{
+		n.Log(LevelError, "AES key must be 32 bytes")
+		return
 	}
-
-	hashedPass := auth.HashPassword(authPass)
-    n := &Node{
-        id:                    id,
-        address:               address,
-        numNodes:              numNodes,
-        otherNodes:            otherNodes,
-        shardId:               shardId,
-        coordinatorAddress:    coordinatorAddress,
-        tls:                  tls,
-        serverCert:           serverCert,
-        clientCert:           clientCert,
-        authUser:            authUser,
-        authPass:            authPass,
-        hashedAuthPass:     hashedPass,
-        state:                 Follower,
-        term:                  0,
-        votedFor:              "",
-        isAlive:               true,
-        lastLeaderHeartbeat:   time.Now(),
-        hashTable:             ht,
-        logger:                logger,
-        mu:                    sync.RWMutex{},
-        putCounter:            promauto.NewCounter(prometheus.CounterOpts{Name: "db_put_counter", Help: "Number of put requests"}),
-        getCounter:            promauto.NewCounter(prometheus.CounterOpts{Name: "db_get_counter", Help: "Number of get requests"}),
-        errorCounter:          promauto.NewCounter(prometheus.CounterOpts{Name: "db_error_counter", Help:"Number of errors"}),
-        ctx:                   ctx,
-        cancel:                cancel,
-		limiter: rate.NewLimiter(rate.Every(time.Second), 100), // Allow 100 requests per second
-		grpcServer: grpc.NewServer(),
-		coordinatorPool: grpcpool.NewPool("localhost"+coordinatorAddress, 10, logger, tls, clientCert),
-		messageQueue: &messageQueue{queue: make([]logEntry,0)},
-		raftLog:          make([]logEntry, 0),
-		nextIndex:        make(map[int]int),
-		matchIndex:       make(map[int]int),
-		lastLeastLoadedShardUpdate: time.Now(),
-		encryptionKey: encryptionKey,
-	}
-	n.raft = raft.NewRaft(n)
-	n.metrics = metrics.NewMetrics(n)
-	if tls {
-		creds, err := credentials.NewServerTLSFromFile(serverCert, "certs/server.key")
-		if err != nil {
-			logger.Fatalf("Failed to generate credentials %v", err)
-		}
-		n.grpcServer = grpc.NewServer(grpc.Creds(creds))
-	}
-	pb.RegisterNodeServiceServer(n.grpcServer, grpc.NewGRPCServer(n))
-	return n
-}
-
-// StartServer start grpc and http servers
-func (n *Node) StartServer(nodes []*Node) {
-	lis, err := net.Listen("tcp", n.address)
-	if err != nil {
-		n.logger.Fatalf("failed to listen: %v", err)
-	}
-	go func() {
-		if err := n.grpcServer.Serve(lis); err != nil {
-			n.logger.Fatalf("failed to serve: %v", err)
-		}
-	}()
-    mux := http.NewServeMux()
-    mux.HandleFunc("/debug/pprof/", pprof.Index)
-    mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-    mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-    mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-    mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	mux.Handle("/metrics", promhttp.Handler())
-	// Добавьте обработчик для Swagger UI
-	mux.HandleFunc("/swagger/", func(w http.ResponseWriter, r *http.Request) {
-		http.StripPrefix("/swagger/", http.FileServer(http.Dir("./docs"))).ServeHTTP(w, r)
-	})
-	n.httpServer = &http.Server{
-        Addr: n.address,
-        Handler: http.NewHTTPServer(n, mux),
+    n.aesKey = key
+	block, err := aes.NewCipher([]byte(key))
+	if err != nil{
+		n.Log(LevelError, "Failed to create cipher: %v", err)
+        return
     }
-	go func() {
-		if err := n.httpServer.ListenAndServe(); err != nil {
-			n.log(LevelError,"Failed to start HTTP server %v", err)
-		}
-	}()
-	n.startRaft(nodes)
-	n.startMetrics()
-    go func() {
-        <-n.ctx.Done()
-        n.log(LevelInfo, "Shutting down node %d", n.id)
-        filename := fmt.Sprintf("node_%d_data.json", n.id)
-        if err := n.hashTable.SaveData(filename); err != nil {
-            n.log(LevelError, "Error saving data: %v", err)
-        }
-        n.grpcServer.GracefulStop()
-        if err := n.httpServer.Shutdown(context.Background()); err != nil {
-            n.log(LevelError, "Error shutting down http server: %v", err)
-        }
-    }()
+    aesGCM, err := cipher.NewGCM(block)
+    if err != nil{
+		n.Log(LevelError, "Failed to create GCM: %v", err)
+        return
+    }
+    n.aesGCM = aesGCM
 }
-// SetLogLevel sets log level for node
-func (n *Node) SetLogLevel(level string) {
-	n.logLevel = level
-}
-
-// log logs a message with the specified level
-func (n *Node) log(level string, format string, v ...interface{}) {
-	if n.shouldLog(level) {
-		n.logger.Printf("[%s] %s: %s", level, fmt.Sprintf("Node %d", n.id), fmt.Sprintf(format, v...))
+func (n *Node) encryptData(data interface{}) (string, error) {
+	bytes, err := json.Marshal(data)
+	if err != nil{
+		return "", fmt.Errorf("failed to marshal data: %w", err)
 	}
-}
-
-// shouldLog checks if a message should be logged based on the current level
-func (n *Node) shouldLog(level string) bool {
-	switch n.logLevel {
-	case LevelDebug:
-		return true
-	case LevelInfo:
-		return level != LevelDebug
-	case LevelError:
-		return level == LevelError
-	default:
-		return false
+	nonce := make([]byte, n.aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("failed to read nonce: %w", err)
 	}
+    ciphertext := n.aesGCM.Seal(nonce, nonce, bytes, nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
+func (n *Node) decryptData(data string) (string, error) {
+	ciphertext, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode data: %w", err)
+	}
+    nonceSize := n.aesGCM.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
 
-func (n *Node) startRaft(nodes []*Node) {
-	go n.raft.StartHeartbeat(nodes, time.Second)
-	go n.raft.StartGossip(nodes, time.Second)
-	go n.raft.StartElectionTimer(nodes)
+    plaintext, err := n.aesGCM.Open(nil, nonce, ciphertext, nil)
+    if err != nil {
+        return "", fmt.Errorf("failed to open gcm: %w", err)
+    }
+    return string(plaintext), nil
 }
-func (n *Node) startMetrics(){
-	go n.metrics.StartLoadReport(time.Second)
+func (n *Node) SetGossipInterval(interval int){
+    n.mu.Lock()
+	defer n.mu.Unlock()
+	n.gossipInterval = interval
 }
-
-func (n *Node) isNodeAlive() bool {
-	return n.isAlive
+func (n *Node) GetRandomElectionTimeout() int {
+    return rand.Intn(150) + 150
+}
+func (n *Node) getNodeIdFromAddress(address string) int {
+    for _, node := range n.nodes{
+        if node.address == address{
+            return node.id
+        }
+    }
+    return 0
+}
+func (n *Node) StateString() string{
+    n.mu.RLock()
+    defer n.mu.RUnlock()
+    return n.state.String()
+}
+func (s NodeState) String() string {
+    switch s {
+    case Follower:
+        return "Follower"
+    case Candidate:
+        return "Candidate"
+    case Leader:
+        return "Leader"
+    default:
+        return "Unknown"
+    }
+}
+func (n *Node) getShardLeader(key string) (string, bool){
+    shardId := n.getShardForHash(key)
+    n.gossipState.mu.RLock()
+    defer n.gossipState.mu.RUnlock()
+    shard, ok := n.gossipState.shards[shardId]
+    if !ok {
+        return "", false
+    }
+    if shard.leader == ""{
+		return "", false
+    }
+    return shard.leader, true
 }

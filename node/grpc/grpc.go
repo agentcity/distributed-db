@@ -1,209 +1,122 @@
 package grpc
 
 import (
-	"context"
-	"errors"
-	"distributed-db/internal/data"
-	pb "distributed-db/proto"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"time"
-	"distributed-db/node"
+ "context"
+ "crypto/tls"
+ "crypto/x509"
+ "fmt"
+ "io/ioutil"
+ "log"
+ "net"
+ "distributed-db/node"
+    pb "distributed-db/proto"
+ "google.golang.org/grpc"
+ "google.golang.org/grpc/credentials"
 )
-type GRPCServer struct {
-	pb.UnimplementedNodeServiceServer
-	node *node.Node
+
+type GrpcServer struct {
+ node *node.Node
+    server *grpc.Server
+    tlsEnabled bool
+    certFile string
+    keyFile string
 }
-// NewGRPCServer creates a new gRPC server
-func NewGRPCServer(n *node.Node) *GRPCServer {
-    return &GRPCServer{
-        node: n,
+
+func NewGrpcServer(node *node.Node, tlsEnabled bool, certFile string, keyFile string) *GrpcServer {
+    return &GrpcServer{
+        node: node,
+        server: grpc.NewServer(),
+        tlsEnabled: tlsEnabled,
+        certFile: certFile,
+        keyFile: keyFile,
     }
 }
-func (s *GRPCServer) PutData(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	if !s.node.limiter.Allow() {
-		s.node.log(node.LevelError, "Node %d: Rate limit exceeded for PUT request for key %s", s.node.id, req.Key)
-		return &pb.PutResponse{Success: false}, nil
-	}
-	if len(req.Key) > 255 {
-		s.node.log(node.LevelError, "Key is too long")
-		return &pb.PutResponse{Success: false}, nil
-	}
-	err := s.node.hashTable.Put(req.Key)
-	if errors.Is(err, data.ErrKeyExists){
-		s.node.log(node.LevelDebug, "Node %d key %s already exists", s.node.id, req.Key)
-		return &pb.PutResponse{Success: false}, nil
-	}
-	if err != nil {
-		s.node.log(node.LevelError, "Node %d error putting key %s to local db: %v", s.node.id, req.Key, err)
-		return &pb.PutResponse{Success: false}, nil
-	}
-	s.node.log(node.LevelDebug, "Node %d stored key %s locally", s.node.id, req.Key)
-    s.node.appendLog(req.Key)
-	s.node.replicateLog()
-	return &pb.PutResponse{Success: true}, nil
-}
-
-func (s *GRPCServer) GetData(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	if !s.node.limiter.Allow() {
-		s.node.log(node.LevelError, "Node %d: Rate limit exceeded for GET request for key %s", s.node.id, req.Key)
-		return &pb.GetResponse{Value: false}, nil
-	}
-	if len(req.Key) > 255 {
-			s.node.log(node.LevelError, "Key is too long")
-			return &pb.GetResponse{Value: false}, nil
-		}
-	value := s.node.hashTable.Get(req.Key)
-	return &pb.GetResponse{Value: value}, nil
-}
-
-func (s *GRPCServer) HandleAppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	s.node.mu.Lock()
-	defer s.node.mu.Unlock()
-    if !s.node.isAlive {
-		s.node.log(node.LevelError, "Node %d is not alive. Can't handle append entries request", s.node.id)
-		return &pb.AppendEntriesResponse{Success: false,}, nil
-	}
-	if req.Term < int32(s.node.term) {
-		s.node.log(node.LevelDebug, "Node %d rejected append entries request, term: %d is less then my term: %d", s.node.id, req.Term, s.node.term)
-		return &pb.AppendEntriesResponse{Success: false,}, nil
-	}
-
-	if req.Term > int32(s.node.term) {
-		s.node.log(node.LevelDebug, "Node %d received append entries request for term: %d, my term is: %d, set my term to %d", s.node.id, req.Term, s.node.term, req.Term)
-		s.node.term = int(req.Term)
-		s.node.votedFor = ""
-		s.node.state = node.Follower
-	}
-	s.node.lastLeaderHeartbeat = time.Now()
-	if len(s.node.raftLog) < int(req.PrevLogIndex) {
-		s.node.log(node.LevelDebug, "Node %d rejected append entries request, my log length is %d, prev log index is: %d", s.node.id, len(s.node.raftLog), req.PrevLogIndex)
-		return &pb.AppendEntriesResponse{Success: false}, nil
-	}
-	if req.PrevLogIndex > 0 && s.node.raftLog[req.PrevLogIndex-1].Term != int(req.PrevLogTerm) {
-		s.node.log(node.LevelDebug, "Node %d rejected append entries request, prev log term is: %d, my term on that index: %d", s.node.id, req.PrevLogTerm, s.node.raftLog[req.PrevLogIndex-1].Term)
-		return &pb.AppendEntriesResponse{Success: false}, nil
-	}
-
-	entries := req.Entries
-	for i, entry := range entries {
-        index := int(req.PrevLogIndex) + 1 + i
-		if len(s.node.raftLog) > index-1 {
-			if s.node.raftLog[index-1].Term != int(entry.Term) {
-				s.node.log(node.LevelDebug, "Node %d deleting log entries starting from %d, because term is not matching", s.node.id, index)
-				s.node.raftLog = s.node.raftLog[:index-1]
-				s.node.raftLog = append(s.node.raftLog, node.logEntry{
-					Term:    int(entry.Term),
-					Key:  entry.Key,
-					Committed: entry.Committed,
-				})
-			}
-		} else {
-			s.node.log(node.LevelDebug, "Node %d appending log entry: %v to local log", s.node.id, entry)
-			s.node.raftLog = append(s.node.raftLog, node.logEntry{
-				Term:    int(entry.Term),
-				Key:  entry.Key,
-				Committed: entry.Committed,
-			})
-		}
-
-
-    }
-    if int(req.LeaderCommitIndex) > s.node.commitIndex {
-        s.node.commitIndex = min(int(req.LeaderCommitIndex), len(s.node.raftLog))
-		s.node.applyLogEntries()
-		s.node.log(node.LevelDebug,"Node %d commit index was set to %d, applying entries", s.node.id, s.node.commitIndex)
+func (s *GrpcServer) Start(lis net.Listener) error {
+    pb.RegisterNodeServiceServer(s.server, s)
+ if s.tlsEnabled {
+  cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+  if err != nil {
+   return fmt.Errorf("failed to load key pair: %w", err)
+  }
+  config := &tls.Config{Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true}
+        creds := credentials.NewTLS(config)
+        s.server = grpc.NewServer(grpc.Creds(creds))
+  pb.RegisterNodeServiceServer(s.server, s)
     }
 
-	return &pb.AppendEntriesResponse{Success: true}, nil
-}
-func (s *GRPCServer) HandleHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	s.node.mu.Lock()
-	defer s.node.mu.Unlock()
-	if !s.node.isAlive {
-		s.node.log(node.LevelError, "Node %d is not alive. Can't handle heartbeat request", s.node.id)
-		return &pb.HeartbeatResponse{}, nil
-	}
-    if req.Term > int32(s.node.term) {
-		s.node.log(node.LevelDebug, "Node %d received heartbeat request for term: %d, my term is: %d, set my term to %d", s.node.id, req.Term, s.node.term, req.Term)
-		s.node.term = int(req.Term)
-		s.node.votedFor = ""
-		s.node.state = node.Follower
-	}
-	s.node.lastLeaderHeartbeat = time.Now()
-	return &pb.HeartbeatResponse{}, nil
-}
-func (s *GRPCServer) RequestVote(ctx context.Context, req *pb.VoteRequest) (*pb.VoteResponse, error) {
-	s.node.mu.Lock()
-	defer s.node.mu.Unlock()
-	if !s.node.isAlive {
-		s.node.log(node.LevelError,"Node %d is not alive. Can't handle vote request", s.node.id)
-		return &pb.VoteResponse{Voted: false}, nil
-	}
-	if int(req.Term) > s.node.term {
-		s.node.log(node.LevelDebug, "Node %d received vote request for term: %d, my term is: %d, voted for: %s", s.node.id, req.Term, s.node.term, s.node.votedFor)
-		s.node.term = int(req.Term)
-		s.node.votedFor = ""
-		s.node.state = node.Follower
-		return &pb.VoteResponse{Voted: true}, nil
-
-	} else if int(req.Term) == s.node.term && (s.node.votedFor == "" || s.node.votedFor == s.node.address) && s.node.isLogUpToDate(int(req.Term), int(req.LastLogIndex)) {
-		s.node.log(node.LevelDebug, "Node %d received vote request for term: %d, my term is: %d, voted for: %s", s.node.id, req.Term, s.node.term, s.node.votedFor)
-		s.node.votedFor = s.node.address
-		s.node.state = node.Follower
-		return &pb.VoteResponse{Voted: true}, nil
-	} else {
-		s.node.log(node.LevelDebug, "Node %d rejected vote request for term: %d, my term is: %d, voted for: %s", s.node.id, req.Term, s.node.term, s.node.votedFor)
-		return &pb.VoteResponse{Voted: false}, nil
-	}
+    if err := s.server.Serve(lis); err != nil {
+  return fmt.Errorf("failed to serve: %w", err)
+    }
+ return nil
 }
 
-func (s *GRPCServer) SendHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	s.node.mu.Lock()
-	defer s.node.mu.Unlock()
-	if !s.node.isAlive {
-		s.node.log(node.LevelError, "Node %d is not alive. Can't handle heartbeat request", s.node.id)
-		return &pb.HeartbeatResponse{}, nil
-	}
-    if req.Term > int32(s.node.term) {
-		s.node.log(node.LevelDebug, "Node %d received heartbeat request for term: %d, my term is: %d, set my term to %d", s.node.id, req.Term, s.node.term, req.Term)
-		s.node.term = int(req.Term)
-		s.node.votedFor = ""
-		s.node.state = node.Follower
-	}
-	s.node.lastLeaderHeartbeat = time.Now()
-	return &pb.HeartbeatResponse{}, nil
+func (s *GrpcServer) GetClientConn(address string) (*grpc.ClientConn, error) {
+ if s.tlsEnabled {
+  certPool := x509.NewCertPool()
+  cert, err := ioutil.ReadFile(s.certFile)
+  if err != nil {
+   return nil, fmt.Errorf("could not read certificate: %w", err)
+  }
+  if ok := certPool.AppendCertsFromPEM(cert); !ok {
+   return nil, fmt.Errorf("failed to append certificate")
+  }
+
+  config := &tls.Config{
+   RootCAs:            certPool,
+   InsecureSkipVerify: true,
+  }
+        creds := credentials.NewTLS(config)
+        conn, err := grpc.Dial(address, grpc.WithTransportCredentials(creds))
+  if err != nil {
+   return nil, fmt.Errorf("did not connect: %w", err)
+  }
+        return conn, nil
+ }
+    conn, err := grpc.Dial(address, grpc.WithInsecure())
+    if err != nil {
+  return nil, fmt.Errorf("did not connect: %w", err)
+    }
+ return conn, nil
 }
-func (s *GRPCServer) sendPutRequest(key string, address string) bool {
-	var opts []grpc.DialOption
-	if s.node.tls {
-		creds, err := credentials.NewClientTLSFromFile(s.node.clientCert, "")
-		if err != nil {
-			s.node.log(node.LevelError, "Failed to create client credentials: %v", err)
-			return false
-		}
-		opts = append(opts, grpc.WithTransportCredentials(creds))
-	} else {
-		opts = append(opts, grpc.WithInsecure())
-	}
-	conn, err := grpc.Dial(address, opts...)
-	if err != nil {
-		s.node.log(node.LevelError,"did not connect: %v", err)
-		return false
-	}
-	defer func() {
-		if err := conn.Close(); err != nil {
-			s.node.log(node.LevelError,"Error closing gRPC connection %v", err)
-		}
-	}()
-	client := pb.NewNodeServiceClient(conn)
-	req := &pb.PutRequest{
-		Key: key,
-	}
-	_, err = client.PutData(context.Background(), req)
-	if err != nil {
-		s.node.log(node.LevelError,"Error sending gRPC put request: %v", err)
-		return false
-	}
-	return true
+
+func (s *GrpcServer) Shutdown(){
+    s.server.Stop()
+}
+
+func (s *GrpcServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+ return s.node.Raft().RequestVoteHandler(ctx, req)
+}
+func (s *GrpcServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+    return s.node.Raft().AppendEntriesHandler(ctx, req)
+}
+func (s *GrpcServer) Gossip(ctx context.Context, req *pb.GossipRequest) (*pb.GossipResponse, error) {
+ return s.node.GossipHandler(ctx, req)
+}
+func (s *GrpcServer) PutData(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+ key := req.Key
+    ok, err := s.node.PutData(key, key)
+ if err != nil {
+  return &pb.PutResponse{Success: ok}, fmt.Errorf("failed to put data: %w", err)
+ }
+    return &pb.PutResponse{Success: ok}, nil
+}
+func (s *GrpcServer) GetData(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+ key := req.Key
+    ok, err := s.node.GetData(key)
+ if err != nil {
+        return &pb.GetResponse{Success: ok}, fmt.Errorf("failed to get data: %w", err)
+    }
+ return &pb.GetResponse{Success: ok}, nil
+}
+func (s *GrpcServer) DeleteData(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+    key := req.Key
+ err := s.node.DeleteData(key)
+    if err != nil {
+        return &pb.DeleteResponse{}, fmt.Errorf("failed to delete data: %w", err)
+    }
+    return &pb.DeleteResponse{}, nil
+}
+
+func (s *GrpcServer) ShardHeartbeat(ctx context.Context, req *pb.ShardHeartbeatRequest) (*pb.ShardHeartbeatResponse, error) {
+ return s.node.ShardHeartbeatHandler(ctx, req)
 }

@@ -4,70 +4,111 @@ import (
  "flag"
  "fmt"
  "log"
+ "net/http"
  "os"
  "os/signal"
+ "runtime"
+ "strconv"
  "syscall"
-
  "distributed-db/node"
+ "github.com/prometheus/client_golang/prometheus/promhttp"
+ "golang.org/x/crypto/bcrypt"
 )
-
+var (
+    id          = flag.Int("id", 0, "Node ID")
+    address     = flag.String("address", "localhost:50051", "Node address")
+    port        = flag.String("port", "8081", "HTTP port")
+    shardCount  = flag.Int("shardCount", 1, "Number of shards")
+    tlsEnabled  = flag.Bool("tls", false, "Enable TLS")
+    certFile    = flag.String("cert", "", "Path to TLS certificate file")
+    keyFile     = flag.String("key", "", "Path to TLS key file")
+    authUser    = flag.String("authUser", "", "HTTP basic auth user")
+    authPass    = flag.String("authPass", "", "HTTP basic auth password")
+    aesKey      = flag.String("aesKey", "", "AES key for data encryption")
+    gossipInterval = flag.Int("gossipInterval", 10, "Gossip interval in seconds")
+)
 func main() {
- id := flag.Int("id", 1, "Node ID")
- address := flag.String("address", ":8080", "Address to bind to")
- otherNodes := flag.String("other-nodes", "", "Comma-separated list of other node addresses")
- shardId := flag.Int("shard-id", 1, "Shard ID")
- coordinatorAddress := flag.String("coordinator-address", "", "Coordinator address")
- tls := flag.Bool("tls", false, "Use TLS")
- serverCert := flag.String("server-cert", "certs/server.crt", "Path to server certificate")
- clientCert := flag.String("client-cert", "certs/client.crt", "Path to client certificate")
- authUser := flag.String("auth-user", "user", "Basic auth user")
- authPass := flag.String("auth-pass", "pass", "Basic auth password")
- encryptionKey := flag.String("encryption-key", "supersecretkey", "encryption key for local db")
+    flag.Parse()
+    logger := log.New(os.Stdout, "", log.LstdFlags)
+    var nodes []*node.Node
 
- flag.Parse()
+    if *id == 0 {
+        logger.Fatalf("Node id must be greater than 0")
+    }
 
- logger := log.New(os.Stdout, fmt.Sprintf("Node %d: ", *id), log.LstdFlags|log.Lshortfile)
+    if *shardCount <= 0 {
+        logger.Fatalf("Number of shards must be greater than 0")
+    }
 
- otherNodesList := make([]string, 0)
+    if *tlsEnabled {
+        if *certFile == "" || *keyFile == "" {
+            logger.Fatalf("TLS enabled, but cert and key files are not provided")
+        }
+    }
+    if *authUser != "" && *authPass == ""{
+        logger.Fatalf("Auth user provided, but auth pass not provided")
+    }
+    if *authUser == "" && *authPass != ""{
+        logger.Fatalf("Auth pass provided, but auth user not provided")
+    }
 
- if *otherNodes != "" {
-  for _, n := range  split(*otherNodes, ",") {
-   otherNodesList = append(otherNodesList, n)
-  }
- }
- node := node.NewNode(*id, *address, len(otherNodesList)+1, otherNodesList, *shardId, *coordinatorAddress, logger, *tls, *serverCert, *clientCert, *authUser, *authPass, *encryptionKey)
- nodes := []*node.Node{node}
-    for _, addr := range otherNodesList {
-  n := node.NewNode(len(nodes)+1, addr, len(otherNodesList)+1, otherNodesList, *shardId, *coordinatorAddress, logger, *tls, *serverCert, *clientCert, *authUser, *authPass, *encryptionKey)
-  nodes = append(nodes, n)
- }
+    hashedPassword, err := bcrypt.GenerateFromPassword([]byte(*authPass), bcrypt.DefaultCost)
+    if err != nil {
+        logger.Fatalf("Failed to hash password: %v", err)
+    }
 
- node.StartServer(nodes)
-    for _, n := range nodes {
-  if n.id != *id {
-   n.StartServer(nodes)
-  }
- }
- signalChan := make(chan os.Signal, 1)
- signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
- <-signalChan
- node.cancel()
- node.log(node.LevelInfo,"Gracefully shutting down application")
- os.Exit(0)
+    node := node.NewNode(*id, *address, *shardCount, *port, logger, *tlsEnabled, *certFile, *keyFile, *authUser, string(hashedPassword))
 
+    if *aesKey != "" {
+        node.SetAesKey(*aesKey)
+    }
+
+    node.SetGossipInterval(*gossipInterval)
+
+
+    nodes = append(nodes, node)
+    for i := 1; i <= 3; i++ {
+        if i == *id {
+            continue
+        }
+        newNodeAddress := fmt.Sprintf("localhost:5005%v", i)
+        newNodePort := fmt.Sprintf("808%v", i)
+        newNode := node.NewNode(i, newNodeAddress, *shardCount, newNodePort, logger, *tlsEnabled, *certFile, *keyFile, "", "")
+        nodes = append(nodes, newNode)
+    }
+    node.Start(nodes)
+
+    http.Handle("/metrics", promhttp.Handler())
+
+    go func() {
+        err := http.ListenAndServe(":9090", nil)
+        if err != nil {
+            logger.Fatalf("Failed to start metrics server: %v", err)
+        }
+    }()
+    logger.Printf("Metrics server started on port 9090")
+
+    signalChan := make(chan os.Signal, 1)
+    signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+    <-signalChan
+
+    logger.Println("Shutdown signal received, shutting down...")
+    node.Shutdown()
+    for _, node := range nodes{
+        node.Shutdown()
+    }
+    logger.Println("Shutdown complete")
+    os.Exit(0)
 }
-func split(s string, sep string) []string {
- res := make([]string,0)
- current := ""
- for _, char := range s {
-  if string(char) == sep {
-   res = append(res, current)
-   current = ""
-  } else {
-   current += string(char)
-  }
- }
- res = append(res, current)
- return res
+func printMemUsage() {
+    var m runtime.MemStats
+    runtime.ReadMemStats(&m)
+    fmt.Printf("Alloc = %v MiB", bToMb(m.Alloc))
+    fmt.Printf("\tTotalAlloc = %v MiB", bToMb(m.TotalAlloc))
+    fmt.Printf("\tSys = %v MiB", bToMb(m.Sys))
+    fmt.Printf("\tNumGC = %v\n", m.NumGC)
+}
+func bToMb(b uint64) uint64 {
+    return b / 1024 / 1024
 }
