@@ -557,8 +557,8 @@ func TestErrorsKeepConnectionUsable(t *testing.T) {
 		t.Fatalf("missing table messages = %v, want E Z", msgTypes(msgs))
 	}
 	fields = errorFields(msgs[0].body)
-	if fields['C'] != "XX000" {
-		t.Fatalf("missing table SQLSTATE = %q, want XX000", fields['C'])
+	if fields['C'] != "42P01" {
+		t.Fatalf("missing table SQLSTATE = %q, want 42P01", fields['C'])
 	}
 	if !strings.Contains(fields['M'], "table not found") {
 		t.Fatalf("missing table message = %q, want it to mention table not found", fields['M'])
@@ -583,8 +583,8 @@ func TestUnknownMessageGetsErrorAndReady(t *testing.T) {
 	c := dialTestConn(t, addr)
 	c.startup(map[string]string{"user": "alice"})
 
-	// 'P' (Parse) belongs to the extended protocol, which is not supported.
-	if err := writeMessage(c.conn, 'P', []byte{0, 0, 0, 0}); err != nil {
+	// 'Y' is not a PostgreSQL frontend message type.
+	if err := writeMessage(c.conn, 'Y', []byte{0, 0, 0, 0}); err != nil {
 		t.Fatalf("send unknown message: %v", err)
 	}
 	msgs, err := readUntilReady(c.conn)

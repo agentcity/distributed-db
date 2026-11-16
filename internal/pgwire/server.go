@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -212,6 +211,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	s.logger.Debug("pgwire: client connected",
 		"remote", remote, "user", params["user"], "database", params["database"])
 
+	sess := newConnSession(s, bw)
 	for {
 		typ, body, err := readMessage(br)
 		if err != nil {
@@ -224,11 +224,52 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 
+		// After an extended-protocol error, PostgreSQL ignores everything
+		// except Terminate until the client sends Sync.
+		if sess.extendedError {
+			switch typ {
+			case msgSync:
+				var syncErr error
+				if len(body) != 0 {
+					syncErr = sess.fail("08P01", "pgwire: malformed Sync: trailing bytes")
+				} else {
+					syncErr = sess.handleSync()
+				}
+				if syncErr != nil {
+					s.logger.Debug("pgwire: write failed", "remote", remote, "err", syncErr)
+					return
+				}
+			case msgTerminate:
+				return
+			}
+			continue
+		}
+
+		var handleErr error
 		switch typ {
 		case msgQuery:
-			if err := s.simpleQuery(bw, body); err != nil {
-				s.logger.Debug("pgwire: write failed", "remote", remote, "err", err)
-				return
+			handleErr = sess.handleSimpleQuery(body)
+		case msgParse:
+			handleErr = sess.handleParse(body)
+		case msgBind:
+			handleErr = sess.handleBind(body)
+		case msgDescribe:
+			handleErr = sess.handleDescribe(body)
+		case msgExecute:
+			handleErr = sess.handleExecute(body)
+		case msgSync:
+			if len(body) != 0 {
+				handleErr = sess.fail("08P01", "pgwire: malformed Sync: trailing bytes")
+			} else {
+				handleErr = sess.handleSync()
+			}
+		case msgClose:
+			handleErr = sess.handleClose(body)
+		case msgFlush:
+			if len(body) != 0 {
+				handleErr = sess.fail("08P01", "pgwire: malformed Flush: trailing bytes")
+			} else {
+				handleErr = sess.handleFlush()
 			}
 		case msgTerminate:
 			return
@@ -239,9 +280,11 @@ func (s *Server) handleConn(conn net.Conn) {
 			if err := writeReadyForQuery(bw, 'I'); err != nil {
 				return
 			}
-			if err := bw.Flush(); err != nil {
-				return
-			}
+			handleErr = bw.Flush()
+		}
+		if handleErr != nil {
+			s.logger.Debug("pgwire: write failed", "remote", remote, "err", handleErr)
+			return
 		}
 	}
 }
@@ -326,33 +369,9 @@ func (s *Server) sendStartupResponses(w io.Writer) error {
 	return writeReadyForQuery(w, 'I')
 }
 
-// simpleQuery executes one SQL statement and writes its full response,
-// including ReadyForQuery, then flushes the buffer.
+// simpleQuery keeps the pre-extended-protocol helper available for in-package
+// tests. Production connections use a connSession so prepared statements and
+// portals persist across messages.
 func (s *Server) simpleQuery(w *bufio.Writer, body []byte) error {
-	query := strings.TrimSpace(strings.TrimRight(string(body), "\x00"))
-	if query == "" {
-		if err := writeMessage(w, msgEmptyQueryResponse, nil); err != nil {
-			return err
-		}
-	} else {
-		res, err := s.engine.Execute(s.ctx, query)
-		switch {
-		case err != nil:
-			if werr := writeError(w, sqlState(err), err.Error()); werr != nil {
-				return werr
-			}
-		case res == nil:
-			if werr := writeError(w, "XX000", "pgwire: engine returned a nil result"); werr != nil {
-				return werr
-			}
-		default:
-			if werr := writeResult(w, query, res); werr != nil {
-				return werr
-			}
-		}
-	}
-	if err := writeReadyForQuery(w, 'I'); err != nil {
-		return err
-	}
-	return w.Flush()
+	return newConnSession(s, w).handleSimpleQuery(body)
 }

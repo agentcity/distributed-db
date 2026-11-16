@@ -1,5 +1,7 @@
-// Command pgsrv runs a minimal PostgreSQL wire-protocol front end for the P0
-// SQL engine over the v2 transactional KV cluster.
+// Command pgsrv runs a PostgreSQL wire-protocol front end for the P0 SQL
+// engine over the v2 transactional KV cluster. It supports simple Query and
+// the extended query protocol (Parse/Bind/Describe/Execute/Sync/Close/Flush)
+// with INT/TEXT parameters and text/binary row formats.
 package main
 
 import (
