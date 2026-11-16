@@ -92,6 +92,8 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 - Stage 1 speed: group commit, TSO batch, range cache, 1PC `CommitSingle`.
 - Stage 2.1: `StreamRange` + batched split/merge; `RangeStats`/`AutoSplit`
   по размеру range (без загрузки range в RAM).
+- Stage 2.2a: один shared Pebble на узел, range-префиксы
+  `'R'|rangeID|0x00`; потоковый Raft snapshot ещё нет.
 - Замеры на M1 Pro/loopback: 3 узла sequential ~40 мс/транзакция,
   parallel ~28 мс/op (~350 tx/s), Get ~0.15–1 мс; Raft group commit
   ~7.8× throughput на конкурентных proposal’ах.

@@ -94,5 +94,11 @@
     "title": "Stage 2 — потоковый split и авто-split",
     "status": "done",
     "file": "0016-stage2-volume.md"
+  },
+  {
+    "id": "0017",
+    "title": "Stage 2.2a — shared Pebble и prefix-диапазоны",
+    "status": "done",
+    "file": "0017-stage2-shared-pebble.md"
   }
 ]

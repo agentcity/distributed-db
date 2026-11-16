@@ -249,7 +249,8 @@ pgwire → parse → bind catalog → logical plan → optimize
 - [x] `RangeHost` держит 2+ группы в одном процессе; gRPC `range_id`.
 - [x] Split: freeze → copy → new group → commit map; e2e обеих половин, распределённо.
 - [x] Потоковый split/merge (батчи, без range в RAM).
-- [ ] Потоковый Raft snapshot/InstallSnapshot и shared Pebble на узел.
+- [x] Shared Pebble на узел (range-префиксы).
+- [ ] Потоковый Raft snapshot/InstallSnapshot.
 - [x] Merge: freeze right → copy → drop group; e2e распределённо.
 - [x] Partial-merge retry идемпотентен.
 - [ ] Kill meta/range во время split/merge.
