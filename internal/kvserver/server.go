@@ -21,6 +21,19 @@ import (
 	"google.golang.org/grpc"
 )
 
+// Durability modes accepted by Config.DurabilityMode. Values are matched
+// exactly (case-sensitive).
+const (
+	// DurabilitySync fsyncs every state-machine batch. It is the default and
+	// the only production-safe profile.
+	DurabilitySync = "sync"
+	// DurabilityFast skips the per-batch state-machine fsync and relies on
+	// replaying the durable Raft log after a crash. It is opt-in and not
+	// production-safe until crash tests prove that replay always recovers the
+	// state machine (see docs/PRODUCTION-PLAN.md, gate G1).
+	DurabilityFast = "fast"
+)
+
 // Config configures one v2 KV node.
 type Config struct {
 	ID       string // defaults to RaftAddr
@@ -41,7 +54,12 @@ type Config struct {
 
 	// Legacy single-range configuration. These fields remain supported and are
 	// ignored when Ranges is non-empty.
-	Peers      []string // other Raft members (their RaftAddr)
+	Peers []string // other Raft members (their RaftAddr)
+	// PeerAddrs optionally maps a logical Raft peer ID to the address the
+	// transport should dial. When a peer is missing, its ID is used as the
+	// address. Production normally leaves this nil; tests use it to keep
+	// stable voter identities while routing Raft traffic through proxies.
+	PeerAddrs  map[string]string
 	RangeID    uint64
 	RangeStart []byte
 	RangeEnd   []byte
@@ -66,12 +84,50 @@ type Config struct {
 	// error through one SLO tracker.
 	Metrics *metrics.SLO
 
-	// SyncStateMachine forces a Pebble fsync on every state-machine batch.
-	// The default (false) relies on the durable Raft log: committed entries
-	// are replayed on restart, so a second fsync per transaction is redundant.
-	// Set true only when the state machine must survive independently of the
-	// Raft log (for example, a custom log store that truncates aggressively).
+	// DurabilityMode selects how the state machine persists committed writes.
+	// Accepted values are case-sensitive:
+	//
+	//   - "" or "sync": fsync every state-machine batch. This is the default
+	//     and the production profile.
+	//   - "fast": skip the per-batch state-machine fsync and rebuild committed
+	//     state from the durable Raft log on restart. Opt-in only; it is not
+	//     production-safe until crash tests prove that replay always recovers
+	//     the state machine.
+	//
+	// Any other value makes New return an error, even when SyncStateMachine
+	// is true, so a typo never silently changes durability.
+	DurabilityMode string
+
+	// SyncStateMachine forces a Pebble fsync on every state-machine batch,
+	// independent of DurabilityMode. It is a backwards-compatible override:
+	// true wins over DurabilityMode:"fast" (the node runs in sync mode), while
+	// false (the zero value) leaves the choice to DurabilityMode, whose
+	// default is sync.
+	//
+	// New code should prefer DurabilityMode; this field remains for existing
+	// callers.
 	SyncStateMachine bool
+}
+
+// resolveSyncWrites maps DurabilityMode and the SyncStateMachine override to
+// the Pebble SyncWrites setting:
+//
+//	"" / "sync"          -> true
+//	"fast"               -> false (unless SyncStateMachine is true)
+//	anything else        -> error
+//
+// SyncStateMachine=true forces sync for every valid mode; its zero value never
+// overrides the mode, so the default Config is sync.
+func (c Config) resolveSyncWrites() (bool, error) {
+	switch c.DurabilityMode {
+	case "", DurabilitySync:
+		return true, nil
+	case DurabilityFast:
+		return c.SyncStateMachine, nil
+	default:
+		return false, fmt.Errorf("kvserver: unknown durability mode %q (want %q or %q)",
+			c.DurabilityMode, DurabilitySync, DurabilityFast)
+	}
 }
 
 // Server is one v2 KV node: a RangeHost owning one or more independently
@@ -85,6 +141,10 @@ type Server struct {
 	// engine is the one Pebble engine shared by every group. It is opened in
 	// New and closed in Stop after all groups have stopped.
 	engine storage.Engine
+
+	// syncWrites is the resolved state-machine durability: true in sync mode
+	// (the default) and false only for the explicit fast opt-in.
+	syncWrites bool
 
 	groups    map[uint64]*rangeGroup
 	groupIDs  []uint64 // range order (ascending start key)
@@ -118,6 +178,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.DataDir == "" {
 		return nil, errors.New("kvserver: DataDir is required")
 	}
+	// Resolve durability before touching the filesystem so a bad mode fails
+	// fast without creating or opening a data directory.
+	syncWrites, err := cfg.resolveSyncWrites()
+	if err != nil {
+		return nil, err
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -147,22 +213,26 @@ func New(cfg Config) (*Server, error) {
 		CacheSize:    cfg.CacheSize,
 		MemTableSize: cfg.MemTableSize,
 		Compression:  "snappy",
-		// State-machine durability comes from the Raft log: entries are
-		// replayed after a crash. Syncing every Pebble batch would double the
-		// per-commit fsync cost. Snapshot creation still fsyncs its files.
-		SyncWrites: cfg.SyncStateMachine,
+		// SyncWrites is the resolved durability profile. It is true by
+		// default (production): every state-machine batch is fsynced in
+		// addition to the Raft log, so committed writes survive a crash even
+		// if the log is unreadable. It is false only for the explicit
+		// DurabilityMode:"fast" opt-in, where committed entries are replayed
+		// from the durable Raft log on restart.
+		SyncWrites: syncWrites,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kvserver: open shared storage: %w", err)
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		log:       cfg.Logger.With("node", cfg.ID),
-		engine:    shared,
-		groups:    make(map[uint64]*rangeGroup, len(ranges)),
-		groupIDs:  make([]uint64, 0, len(ranges)),
-		defaultID: 0,
+		cfg:        cfg,
+		log:        cfg.Logger.With("node", cfg.ID),
+		engine:     shared,
+		syncWrites: syncWrites,
+		groups:     make(map[uint64]*rangeGroup, len(ranges)),
+		groupIDs:   make([]uint64, 0, len(ranges)),
+		defaultID:  0,
 	}
 	if len(ranges) > 0 {
 		s.defaultID = ranges[0].ID
@@ -245,7 +315,8 @@ func (s *Server) Start(ctx context.Context) error {
 	s.mu.Unlock()
 	go s.resolveLocksLoop(resolverCtx)
 	s.log.Info("kvserver started",
-		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID)
+		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID,
+		"sync_writes", s.syncWrites)
 	return nil
 }
 

@@ -26,10 +26,11 @@ type peerTransport struct {
 	mu      sync.Mutex
 	clients map[string]pbv2.RaftServiceClient
 	conns   map[string]*grpc.ClientConn
+	addrs   map[string]string
 	closed  bool
 }
 
-func newPeerTransport(log *slog.Logger, rangeID uint64) *peerTransport {
+func newPeerTransport(log *slog.Logger, rangeID uint64, peerAddrs map[string]string) *peerTransport {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -38,6 +39,7 @@ func newPeerTransport(log *slog.Logger, rangeID uint64) *peerTransport {
 		rangeID: rangeID,
 		clients: make(map[string]pbv2.RaftServiceClient),
 		conns:   make(map[string]*grpc.ClientConn),
+		addrs:   peerAddrs,
 	}
 }
 
@@ -50,7 +52,11 @@ func (t *peerTransport) client(peer string) (pbv2.RaftServiceClient, error) {
 	if c, ok := t.clients[peer]; ok {
 		return c, nil
 	}
-	cc, err := grpc.NewClient(peer,
+	addr := peer
+	if mapped := t.addrs[peer]; mapped != "" {
+		addr = mapped
+	}
+	cc, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(16<<20),

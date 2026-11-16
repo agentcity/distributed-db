@@ -368,10 +368,15 @@ func jepStartClusterN(t *testing.T, specs []jepRangeSpec, n int) *jepCluster {
 
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
+		// Voter identities are stable client-facing addresses. Raft traffic is
+		// routed through per-source directed link proxies via PeerAddrs, so an
+		// asymmetric partition does not require per-source voter IDs.
 		peers := make([]string, 0, n-1)
+		peerAddrs := make(map[string]string, n-1)
 		for j := 0; j < n; j++ {
 			if i != j {
-				peers = append(peers, c.links[[2]int{i, j}].addr())
+				peers = append(peers, c.clientAddrs[j])
+				peerAddrs[c.clientAddrs[j]] = c.links[[2]int{i, j}].addr()
 			}
 		}
 		rcs := make([]kvserver.RangeConfig, 0, len(specs))
@@ -386,10 +391,11 @@ func jepStartClusterN(t *testing.T, specs []jepRangeSpec, n int) *jepCluster {
 		cfg := kvserver.Config{
 			// The node ID must be a dialable address because Status leader
 			// hints are fed back into v2client as dial targets.
-			ID:       c.clientAddrs[i],
-			RaftAddr: c.realAddrs[i],
-			DataDir:  dataDirs[i],
-			Ranges:   rcs,
+			ID:        c.clientAddrs[i],
+			RaftAddr:  c.realAddrs[i],
+			DataDir:   dataDirs[i],
+			Ranges:    rcs,
+			PeerAddrs: peerAddrs,
 			// Conservative timings: the test cluster shares a machine with
 			// the rest of the suite and syncs every Raft batch, so aggressive
 			// elections would produce spurious leader changes.

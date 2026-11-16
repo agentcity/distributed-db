@@ -83,7 +83,7 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig) (*rangeGro
 
 	store := mvcc.New(engine)
 	sm := &stateMachine{store: store, engine: engine}
-	tr := newPeerTransport(cfg.Logger, rc.ID)
+	tr := newPeerTransport(cfg.Logger, rc.ID, cfg.PeerAddrs)
 	node, err := raft.New(raft.Config{
 		ID:                 cfg.ID,
 		Peers:              append([]string(nil), rc.Peers...),

@@ -114,6 +114,9 @@ func newSpeedCluster(tb testing.TB) *speedCluster {
 			CacheSize:          speedCacheSize,
 			MemTableSize:       speedMemTableSize,
 			Logger:             v2Logger(),
+			// Benchmarks measure the explicit fast profile; the production
+			// default is sync and is intentionally slower.
+			DurabilityMode: kvserver.DurabilityFast,
 		}
 		srv, err := kvserver.New(cfg)
 		if err != nil {

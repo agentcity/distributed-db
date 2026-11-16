@@ -31,6 +31,10 @@ func main() {
 	metaPeers := flag.String("meta-peers", "", "comma-separated other meta gRPC addresses")
 	metaDataDir := flag.String("meta-data-dir", "./data/meta", "meta Raft WAL/snapshot directory")
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
+	durability := flag.String("durability", kvserver.DurabilitySync,
+		`state-machine durability for -mode=node: "sync" (fsync every batch; production default) `+
+			`or "fast" (skip state-machine fsyncs and rely on Raft log replay; `+
+			`NOT production-safe until crash tests pass)`)
 	flag.Parse()
 
 	log := newLogger(*logLevel)
@@ -65,12 +69,17 @@ func main() {
 		if *id == "" {
 			*id = *raftAddr
 		}
+		if *durability == kvserver.DurabilityFast {
+			log.Warn("durability=fast: state-machine batches are not fsynced; " +
+				"not production-safe until crash tests pass")
+		}
 		srv, err := kvserver.New(kvserver.Config{
-			ID:       *id,
-			RaftAddr: *raftAddr,
-			DataDir:  *dataDir,
-			Peers:    splitList(*peers),
-			Logger:   log,
+			ID:             *id,
+			RaftAddr:       *raftAddr,
+			DataDir:        *dataDir,
+			Peers:          splitList(*peers),
+			DurabilityMode: *durability,
+			Logger:         log,
 		})
 		if err != nil {
 			fatal(err)
