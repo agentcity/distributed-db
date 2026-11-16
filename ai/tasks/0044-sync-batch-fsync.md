@@ -26,4 +26,6 @@ Raft-батча: 64 команды = 64 fsync. Sync 10 клиентов: ~151 м
 
 - sync 1 клиент: ~22.6 мс / ~44 tx/s;
 - sync 10 клиентов: ~5.4 мс/op / ~185 tx/s;
+- 10 workstations + pipeline 256: sync ~8.6k tx/s, fast ~19.5k tx/s;
+- `maxBatch` поднят 64 → 256;
 - быстрый профиль не затронут.
