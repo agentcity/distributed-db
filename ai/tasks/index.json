@@ -232,5 +232,11 @@
     "title": "Практическое руководство по запуску и работе",
     "status": "done",
     "file": "0039-user-guide.md"
+  },
+  {
+    "id": "0040",
+    "title": "kvctl — терминальный CLI",
+    "status": "done",
+    "file": "0040-kvctl.md"
   }
 ]
