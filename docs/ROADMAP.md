@@ -196,11 +196,11 @@ SQL не начинается, пока KV не даёт стабильные т
   транзакционный SDK;
 - e2e 3 узла: prewrite/commit/get/scan, kill лидера, новая транзакция и
   клиентский commit после failover;
-- InstallSnapshot по gRPC, state-machine snapshot MVCC и restart из snapshot.
+- InstallSnapshot по gRPC, state-machine snapshot MVCC и restart из snapshot;
+- e2e catch-up отставшей реплики через InstallSnapshot;
+- adapter `multiraft` → `raft.Node`;
+- benchmark v2 на реальном gRPC (~20 ms/op для 4-RPC транзакции на одном узле).
 
-Осталось до закрытия 0006/M1:
-
-- adapter `internal/multiraft` → `raft.Node` (сейчас одна группа напрямую);
-- e2e catch-up отставшей реплики через InstallSnapshot (транспорт и
-  snapshot/restart уже есть);
-- benchmark v2 на реальном gRPC (сейчас bench меряет in-memory engine).
+M1/0006 закрыт. Следующий этап — M2: подключить Multi-Raft host к kvserver,
+range routing, split/merge и meta-карта. SQL остаётся после стабильного
+транзакционного KV.

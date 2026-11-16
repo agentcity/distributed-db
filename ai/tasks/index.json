@@ -32,7 +32,7 @@
   {
     "id": "0006",
     "title": "M1 — single-range KV server и end-to-end",
-    "status": "in_progress",
+    "status": "done",
     "file": "0006-single-range-kv-server.md"
   }
 ]

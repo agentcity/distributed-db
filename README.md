@@ -68,8 +68,9 @@ go build -o bin/kv2 ./cmd/kv2
 go test -race ./test -run TestV2SingleRangeCluster -v
 ```
 
-Пока нет: Multi-Raft по range, e2e catch-up через snapshot и бенчмарка
-на реальном gRPC. InstallSnapshot по сети и snapshot/restart уже есть.
+Пока нет: Multi-Raft host внутри kvserver (сейчас один range на процесс),
+range split/merge и SQL-слой. Snapshot catch-up, restart из snapshot и
+gRPC-бенчмарк уже есть.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
