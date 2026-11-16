@@ -34,6 +34,15 @@
   координатор повторяет запрос у лидера. Прямой записи в локальный KV в обход
   Raft нет.
 
+## Куда развивается проект (v2)
+
+Текущий кластер — **v1**: рабочий CP-KV для демо и проверки Raft. Рядом
+строится **v2**: Pebble LSM, MVCC/2PC, Multi-Raft, range-шардирование,
+metadata/TSO и smart client; поверх него — SQL-слой. План, SLO и границы
+этапов: [docs/ROADMAP.md](docs/ROADMAP.md), контракты пакетов:
+[docs/CONTRACTS-V2.md](docs/CONTRACTS-V2.md), решения:
+[docs/adr/](docs/adr/README.md).
+
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
 ```bash
