@@ -34,5 +34,11 @@
     "title": "M1 — single-range KV server и end-to-end",
     "status": "done",
     "file": "0006-single-range-kv-server.md"
+  },
+  {
+    "id": "0007",
+    "title": "M2 — range map, routing и два диапазона",
+    "status": "in_progress",
+    "file": "0007-m2-range-routing.md"
   }
 ]
