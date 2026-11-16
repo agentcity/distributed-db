@@ -43,12 +43,16 @@ type Client struct {
 	metaCC *grpc.ClientConn
 	addrs  []string
 
-	mu          sync.Mutex
-	clients     map[string]pbv2.KVServiceClient
-	conns       map[string]*grpc.ClientConn
-	leader      string
-	leaderUntil time.Time
-	closed      bool
+	mu      sync.Mutex
+	clients map[string]pbv2.KVServiceClient
+	conns   map[string]*grpc.ClientConn
+	leaders map[uint64]leaderEntry // range ID -> cached leader
+	closed  bool
+}
+
+type leaderEntry struct {
+	addr  string
+	until time.Time
 }
 
 // New connects to the meta service and one or more KV nodes. It does not dial
@@ -70,6 +74,7 @@ func New(metaAddr string, addrs []string) (*Client, error) {
 		addrs:   append([]string(nil), addrs...),
 		clients: make(map[string]pbv2.KVServiceClient),
 		conns:   make(map[string]*grpc.ClientConn),
+		leaders: make(map[uint64]leaderEntry),
 	}, nil
 }
 
@@ -116,33 +121,63 @@ func (c *Client) node(addr string) (pbv2.KVServiceClient, error) {
 	return cl, nil
 }
 
-func (c *Client) cachedLeader() string {
+func (c *Client) cachedLeader(rangeID uint64) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.leader != "" && time.Now().Before(c.leaderUntil) {
-		return c.leader
+	if e, ok := c.leaders[rangeID]; ok && e.addr != "" && time.Now().Before(e.until) {
+		return e.addr
 	}
 	return ""
 }
 
-func (c *Client) setLeader(addr string) {
+func (c *Client) setLeader(rangeID uint64, addr string) {
 	c.mu.Lock()
-	c.leader = addr
-	c.leaderUntil = time.Now().Add(leaderTTL)
+	c.leaders[rangeID] = leaderEntry{addr: addr, until: time.Now().Add(leaderTTL)}
 	c.mu.Unlock()
 }
 
-func (c *Client) invalidateLeader() {
+func (c *Client) invalidateLeader(rangeID uint64) {
 	c.mu.Lock()
-	c.leader = ""
-	c.leaderUntil = time.Time{}
+	delete(c.leaders, rangeID)
 	c.mu.Unlock()
 }
 
-// discoverLeader asks every node for Status and returns the first leader.
-func (c *Client) discoverLeader(ctx context.Context) (string, error) {
+// rangeFor asks the meta service which range owns key. A meta failure is not
+// fatal: the client falls back to probing every configured node.
+func (c *Client) rangeFor(ctx context.Context, key []byte) (*pbv2.RangeInfo, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	r, err := c.meta.GetRange(probeCtx, &pbv2.GetRangeRequest{Key: key})
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// discoverLeader probes the meta range's replicas (leader hint first) and
+// returns the first node that reports leadership.
+func (c *Client) discoverLeader(ctx context.Context, key []byte) (string, uint64, error) {
+	var candidates []string
+	var rangeID uint64
+	if r, err := c.rangeFor(ctx, key); err == nil {
+		rangeID = r.GetId()
+		if r.GetLeader() != "" {
+			candidates = append(candidates, r.GetLeader())
+		}
+		candidates = append(candidates, r.GetReplicas()...)
+	}
+	candidates = append(candidates, c.addrs...)
+
+	seen := make(map[string]struct{}, len(candidates))
 	var lastErr error
-	for _, addr := range c.addrs {
+	for _, addr := range candidates {
+		if addr == "" {
+			continue
+		}
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
 		cl, err := c.node(addr)
 		if err != nil {
 			lastErr = err
@@ -156,27 +191,31 @@ func (c *Client) discoverLeader(ctx context.Context) (string, error) {
 			continue
 		}
 		if resp.GetLeader() != "" {
-			c.setLeader(resp.GetLeader())
-			return resp.GetLeader(), nil
+			c.setLeader(rangeID, resp.GetLeader())
+			return resp.GetLeader(), rangeID, nil
 		}
 		if resp.GetRole() == "leader" {
-			c.setLeader(addr)
-			return addr, nil
+			c.setLeader(rangeID, addr)
+			return addr, rangeID, nil
 		}
 	}
 	if lastErr == nil {
 		lastErr = ErrNotLeader
 	}
-	return "", fmt.Errorf("v2client: discover leader: %w", lastErr)
+	return "", rangeID, fmt.Errorf("v2client: discover leader: %w", lastErr)
 }
 
 type callFunc func(ctx context.Context, cl pbv2.KVServiceClient) (leaderHint, errMsg string, err error)
 
-func (c *Client) retry(ctx context.Context, call callFunc) error {
+func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
 		defer cancel()
+	}
+	var rangeID uint64
+	if r, err := c.rangeFor(ctx, key); err == nil {
+		rangeID = r.GetId()
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -187,10 +226,10 @@ func (c *Client) retry(ctx context.Context, call callFunc) error {
 			case <-time.After(time.Duration(attempt) * backoff):
 			}
 		}
-		addr := c.cachedLeader()
+		addr := c.cachedLeader(rangeID)
 		if addr == "" {
 			var err error
-			addr, err = c.discoverLeader(ctx)
+			addr, _, err = c.discoverLeader(ctx, key)
 			if err != nil {
 				lastErr = err
 				continue
@@ -204,14 +243,14 @@ func (c *Client) retry(ctx context.Context, call callFunc) error {
 		hint, msg, err := call(ctx, cl)
 		if err != nil {
 			lastErr = err
-			c.invalidateLeader()
+			c.invalidateLeader(rangeID)
 			continue
 		}
 		if msg == "not leader" {
-			c.invalidateLeader()
+			c.invalidateLeader(rangeID)
 			lastErr = ErrNotLeader
 			if hint != "" {
-				c.setLeader(hint)
+				c.setLeader(rangeID, hint)
 			}
 			continue
 		}
@@ -286,7 +325,7 @@ func (t *Txn) Get(ctx context.Context, key []byte) ([]byte, error) {
 	var out []byte
 	var found bool
 	var msg string
-	err := t.c.retry(ctx, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+	err := t.c.retry(ctx, key, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 		resp, err := cl.Get(ctx, &pbv2.GetRequest{Key: key, Ts: t.startTS})
 		if err != nil {
 			return "", "", err
@@ -326,8 +365,23 @@ func (t *Txn) Commit(ctx context.Context) error {
 		mutations = append(mutations, t.writes[k])
 	}
 
+	// M2 supports a single range per transaction. Verify before writing.
+	ri, err := t.c.rangeFor(ctx, primary)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		other, err := t.c.rangeFor(ctx, []byte(k))
+		if err != nil {
+			return err
+		}
+		if other.GetId() != ri.GetId() {
+			return fmt.Errorf("v2client: cross-range transaction %d != %d", ri.GetId(), other.GetId())
+		}
+	}
+
 	var prewriteMsg string
-	if err := t.c.retry(ctx, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+	if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 		resp, err := cl.Prewrite(ctx, &pbv2.PrewriteRequest{
 			StartTs: t.startTS, Primary: primary, Mutations: mutations,
 		})
@@ -358,7 +412,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 		keyBytes = append(keyBytes, []byte(k))
 	}
 	var commitMsg string
-	if err := t.c.retry(ctx, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+	if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 		resp, err := cl.Commit(ctx, &pbv2.CommitRequest{
 			StartTs: t.startTS, CommitTs: commitTS, Keys: keyBytes,
 		})
@@ -388,7 +442,7 @@ func (t *Txn) Rollback(ctx context.Context) error {
 		keys = append(keys, []byte(k))
 	}
 	var msg string
-	if err := t.c.retry(ctx, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+	if err := t.c.retry(ctx, keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 		resp, err := cl.Rollback(ctx, &pbv2.RollbackRequest{StartTs: t.startTS, Keys: keys})
 		if err != nil {
 			return "", "", err

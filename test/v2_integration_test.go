@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"distributed-db/internal/kvserver"
+	"distributed-db/internal/meta"
 	"distributed-db/internal/metaserver"
 	pbv2 "distributed-db/internal/pb/v2"
 	"distributed-db/internal/v2client"
@@ -525,4 +526,138 @@ func TestV2SnapshotCatchUp(t *testing.T) {
 	if !gr.GetFound() || string(gr.GetValue()) != "snap-value" {
 		t.Fatalf("snapshot catch-up lost value: found=%v value=%q err=%q", gr.GetFound(), gr.GetValue(), gr.GetError())
 	}
+}
+
+func TestV2TwoRangesRouting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	addrs := []string{
+		v2FreeAddr(t), v2FreeAddr(t), v2FreeAddr(t),
+		v2FreeAddr(t), v2FreeAddr(t), v2FreeAddr(t),
+	}
+	ranges := []meta.Range{
+		{ID: 1, Start: nil, End: []byte("m"), Replicas: addrs[0:3], Version: 1},
+		{ID: 2, Start: []byte("m"), End: nil, Replicas: addrs[3:6], Version: 1},
+	}
+	metaAddr := v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{Addr: metaAddr, Ranges: ranges, Logger: v2Logger()})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+
+	// Two independent Raft groups, one range each, in one process.
+	nodes := make([]*v2Node, 0, len(addrs))
+	for i, addr := range addrs {
+		groupStart := 0
+		if i >= 3 {
+			groupStart = 3
+		}
+		peers := make([]string, 0, 2)
+		for j := groupStart; j < groupStart+3; j++ {
+			if j != i {
+				peers = append(peers, addrs[j])
+			}
+		}
+		cfg := kvserver.Config{
+			ID: addr, RaftAddr: addr, DataDir: t.TempDir(), Peers: peers,
+			RangeID:            uint64(1 + i/3),
+			ElectionTimeoutMin: 150 * time.Millisecond,
+			ElectionTimeoutMax: 300 * time.Millisecond,
+			HeartbeatInterval:  30 * time.Millisecond,
+			CacheSize:          8 << 20, MemTableSize: 4 << 20,
+			Logger: v2Logger(),
+		}
+		if i < 3 {
+			cfg.RangeEnd = []byte("m")
+		} else {
+			cfg.RangeStart = []byte("m")
+		}
+		srv, err := kvserver.New(cfg)
+		if err != nil {
+			t.Fatalf("new %s: %v", addr, err)
+		}
+		if err := srv.Start(ctx); err != nil {
+			t.Fatalf("start %s: %v", addr, err)
+		}
+		n := &v2Node{srv: srv, addr: addr, cfg: cfg}
+		n.client = v2Dial(t, addr)
+		nodes = append(nodes, n)
+		t.Cleanup(func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = srv.Stop(sctx)
+		})
+	}
+
+	waitRangeLeader := func(group []*v2Node, rangeID uint64) *v2Node {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, n := range group {
+				st := v2Status(t, n.client)
+				if st != nil && strings.EqualFold(st.Role, "leader") && st.GetRangeId() == rangeID {
+					return n
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("no leader for range %d", rangeID)
+		return nil
+	}
+	r1 := nodes[0:3]
+	r2 := nodes[3:6]
+	waitRangeLeader(r1, 1)
+	waitRangeLeader(r2, 2)
+
+	vc, err := v2client.New(metaAddr, addrs)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = vc.Close() })
+
+	put := func(key, value string) {
+		t.Helper()
+		txn, err := vc.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		txn.Set([]byte(key), []byte(value))
+		if err := txn.Commit(ctx); err != nil {
+			t.Fatalf("commit %s: %v", key, err)
+		}
+		read, err := vc.Begin(ctx)
+		if err != nil {
+			t.Fatalf("read begin: %v", err)
+		}
+		got, err := read.Get(ctx, []byte(key))
+		if err != nil || string(got) != value {
+			t.Fatalf("get %s = %q, %v", key, got, err)
+		}
+	}
+
+	put("alpha", "one")
+	put("zulu", "two")
+
+	// Kill range-1 leader and verify a new transaction routes to the new leader.
+	old := waitRangeLeader(r1, 1)
+	if err := old.srv.Stop(context.Background()); err != nil {
+		t.Fatalf("stop range-1 leader: %v", err)
+	}
+	var survivors []*v2Node
+	for _, n := range r1 {
+		if n != old {
+			survivors = append(survivors, n)
+		}
+	}
+	waitRangeLeader(survivors, 1)
+	put("bravo", "three")
+
+	// Range 1 needs two replicas; the failed node is gone, so the transaction
+	// above proves the client refreshed its leader cache and routing.
 }
