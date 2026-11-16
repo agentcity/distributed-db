@@ -55,7 +55,7 @@ SDK — scaffold, не production.
 | ORDER BY/LIMIT, index selection, CBO по row count, plan cache | есть, базовый |
 | Cross-range SQL после split | есть |
 | pgwire simple + extended (Parse/Bind/Execute) | есть |
-| JDBC/pgx, TLS/auth, pg_catalog | нет |
+| JDBC/pgx, pg_catalog | нет (pgwire TLS/password есть) |
 | AND/OR, >2 JOIN, parallel/distributed join | нет |
 | NULL/DECIMAL/JSON, FK, online DDL | нет |
 
@@ -130,10 +130,10 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
    - нет проверки backup на больших объёмах.
 
 3. **Безопасность**
-   - нет TLS/mTLS, authn/authz, RBAC;
-   - нет audit log;
+   - gRPC TLS/mTLS есть опционально, plaintext default;
+   - нет RBAC/authz на уровне запросов и audit log;
    - нет encryption at rest;
-   - pgwire без TLS/паролей;
+   - SQL HTTP без TLS/auth; pgwire — TLS/password есть;
    - нет tenant isolation и квот.
 
 4. **Lifecycle**

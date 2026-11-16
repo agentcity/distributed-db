@@ -270,7 +270,7 @@ pgwire → parse → bind catalog → logical plan → optimize
 ### M5
 
 - [x] pgwire simple query (psql).
-- [x] Extended protocol/prepared statements; TLS/auth — нет.
+- [x] Extended protocol/prepared statements; pgwire TLS/password, cluster gRPC TLS/mTLS opt-in; RBAC/audit — нет.
 - [x] Planner: range predicates, index selection, cost-based join order, plan cache.
 - [x] Hash join + GROUP BY + COUNT/SUM/AVG/MIN/MAX.
 - [x] Cross-range SQL txn через 2PC; SQL после split (0023).

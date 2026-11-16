@@ -340,5 +340,5 @@ func (*Server) MergeRanges(ctx context.Context, leftID, rightID uint64) ([]Range
 `internal/sqlparser` + `internal/sqlengine` + `internal/sqlhttp` +
 `internal/pgwire` + `cmd/sqlsrv`/`cmd/pgsrv`: каталог/строки/индексы в KV,
 P0 subset (CREATE/INSERT/SELECT/UPDATE/DELETE, indexes, aggregates,
-GROUP BY, INNER JOIN), HTTP и simple pgwire. CBO/planner, extended protocol
-и cross-range 2PC не реализованы.
+GROUP BY, INNER JOIN), HTTP и pgwire simple+extended. CBO/planner, plan cache
+и cross-range 2PC реализованы.
