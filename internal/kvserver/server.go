@@ -140,7 +140,10 @@ func New(cfg Config) (*Server, error) {
 		CacheSize:    cfg.CacheSize,
 		MemTableSize: cfg.MemTableSize,
 		Compression:  "snappy",
-		SyncWrites:   true,
+		// State-machine durability comes from the Raft log: entries are
+		// replayed after a crash. Syncing every Pebble batch would double the
+		// per-commit fsync cost. Snapshot creation still fsyncs its files.
+		SyncWrites: false,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kvserver: open shared storage: %w", err)
