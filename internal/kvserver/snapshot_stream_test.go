@@ -22,7 +22,7 @@ type streamKV struct {
 	value []byte
 }
 
-func openStreamTestEngine(t *testing.T) storage.Engine {
+func openStreamTestEngine(t testing.TB) storage.Engine {
 	t.Helper()
 	engine, err := storage.Open(t.TempDir(), storage.Options{
 		CacheSize:    8 << 20,
@@ -39,13 +39,13 @@ func openStreamTestEngine(t *testing.T) storage.Engine {
 	return engine
 }
 
-func newStreamTestSM(t *testing.T, shared storage.Engine, rangeID uint64) (*stateMachine, storage.Engine) {
+func newStreamTestSM(t testing.TB, shared storage.Engine, rangeID uint64) (*stateMachine, storage.Engine) {
 	t.Helper()
 	engine := storage.Prefix(shared, rangePrefix(rangeID))
 	return &stateMachine{store: mvcc.New(engine), engine: engine}, engine
 }
 
-func seedStreamTest(t *testing.T, engine storage.Engine, pairs []streamKV) {
+func seedStreamTest(t testing.TB, engine storage.Engine, pairs []streamKV) {
 	t.Helper()
 	batch := engine.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -125,13 +125,21 @@ func assertStreamContents(t *testing.T, engine storage.Engine, want []streamKV) 
 	}
 }
 
-// captureStream snapshots sm into memory and returns the bytes and index.
+// captureStream snapshots sm into memory with an explicit uncompressed body so
+// the legacy wire format remains directly inspectable by the format and
+// round-trip tests. Compression-specific tests call captureStreamWith.
 func captureStream(t *testing.T, sm *stateMachine) ([]byte, uint64) {
 	t.Helper()
+	return captureStreamWith(t, sm, SnapshotStreamOptions{Compression: SnapshotCompressionNone})
+}
+
+// captureStreamWith snapshots sm into memory using opts.
+func captureStreamWith(t *testing.T, sm *stateMachine, opts SnapshotStreamOptions) ([]byte, uint64) {
+	t.Helper()
 	var buf bytes.Buffer
-	index, err := sm.StreamSnapshot(&buf)
+	index, err := sm.StreamSnapshotWithOptions(&buf, opts)
 	if err != nil {
-		t.Fatalf("StreamSnapshot: %v", err)
+		t.Fatalf("StreamSnapshotWithOptions(%+v): %v", opts, err)
 	}
 	return append([]byte(nil), buf.Bytes()...), index
 }
@@ -472,7 +480,10 @@ func TestSnapshotStreamManyEntriesToDiscard(t *testing.T) {
 	var counter countingDiscardWriter
 	writer := io.MultiWriter(io.Discard, &counter)
 	start := time.Now()
-	index, err := src.StreamSnapshot(writer)
+	// Keep this test on the legacy raw path so it pins the bounded-write
+	// guarantee independently of compression; the compressed path has its own
+	// incremental-write test.
+	index, err := src.StreamSnapshotWithOptions(writer, SnapshotStreamOptions{Compression: SnapshotCompressionNone})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("StreamSnapshot: %v", err)
@@ -612,6 +623,9 @@ func TestSnapshotStreamFormat(t *testing.T) {
 	}
 	if header["index"] != float64(9) {
 		t.Fatalf("header index = %v, want 9", header["index"])
+	}
+	if header["comp"] != snapshotCompressionNone {
+		t.Fatalf("header comp = %v, want %q", header["comp"], snapshotCompressionNone)
 	}
 
 	var entry map[string]any
