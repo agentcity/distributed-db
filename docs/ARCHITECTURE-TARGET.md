@@ -245,7 +245,7 @@ pgwire → parse → bind catalog → logical plan → optimize
 
 ### M2
 
-- [ ] Meta Raft 3 узла; `AllocTS` монотонен после failover.
+- [x] Meta Raft 3 узла; `AllocTS` монотонен после failover.
 - [ ] `RangeHost` держит 2+ группы в одном процессе; gRPC `range_id`.
 - [ ] Split: freeze → copy → new group → commit map; e2e чтение обеих половин.
 - [ ] Merge: freeze right → copy → drop group; e2e.

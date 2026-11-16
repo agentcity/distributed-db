@@ -69,7 +69,8 @@ go test -race ./test -run TestV2SingleRangeCluster -v
 ```
 
 Есть 2 диапазона × 3 реплики: meta отдаёт `GetRange/ListRanges`, клиент
-маршрутизирует ключ по range ID и обновляет лидера при failover. Транзакции
+маршрутизирует ключ по range ID и обновляет лидера при failover. Meta/TSO
+теперь можно запустить как Raft-кластер из 3 узлов (`-mode=meta` + peers). Транзакции
 поддерживают `CheckTxnStatus/ResolveLock`, а `Get` сам разрешает
 committed/rolled-back/expired locks.
 

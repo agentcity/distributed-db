@@ -203,10 +203,11 @@ SQL не начинается, пока KV не даёт стабильные т
 
 M1/0006 закрыт. В M2 сделано: `meta.SetRanges`, `GetRange/ListRanges`,
 range identity в Status, клиентский routing по range ID и e2e
-2 диапазона × 3 реплики с failover.
+2 диапазона × 3 реплики с failover. M2.1/0011: meta Raft 3 узла,
+replicated TSO, `Leader`, клиентский redirect и failover.
 
 Осталось в M2/0007: split/merge с реальным переносом данных и Raft-групп,
-Multi-Raft host внутри одного процесса, переезд meta/TSO в Raft.
+Multi-Raft host внутри одного процесса; meta/TSO уже реплицированы.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
