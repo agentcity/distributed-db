@@ -537,6 +537,18 @@ func TestSQLJoin(t *testing.T) {
 			rows: [][]any{},
 		},
 		{
+			name: "where range on right side",
+			sql:  "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE o.total > 120",
+			cols: []string{"name"},
+			rows: [][]any{{"alice"}, {"bob"}},
+		},
+		{
+			name: "where range on left side",
+			sql:  "SELECT u.name, o.total FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE u.id BETWEEN 1 AND 2",
+			cols: []string{"name", "total"},
+			rows: [][]any{{"alice", int64(100)}, {"alice", int64(150)}, {"bob", int64(200)}},
+		},
+		{
 			name: "limit after join",
 			sql:  "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id LIMIT 2",
 			cols: []string{"name"},

@@ -1,13 +1,15 @@
-// Package sqlengine executes the P0 SQL subset on top of the transactional KV
-// client. Tables are stored in the same KV keyspace:
+// Package sqlengine executes the small SQL subset on top of the transactional
+// KV client. Tables are stored in the same KV keyspace:
 //
-//	catalog: 0x01 | tableName        -> JSON schema
+//	catalog: 0x01 | tableName        -> JSON schema (version + approximate row count)
 //	row:     0x02 | tableID(8 BE) | pk -> JSON row
+//	index:   0x03 | tableID(8 BE) | indexID(8 BE) | len(4 BE) | value | pk
 //
-// P0 supports a single-column primary key (INT or TEXT), point lookups by
-// primary key, full-table scans and one INNER JOIN with an equality predicate.
-// It deliberately has no join planner, multiple joins or non-equality join
-// conditions.
+// The executor supports a single-column primary key (INT or TEXT), point and
+// range predicates, secondary-index equality and range selection, ORDER BY /
+// LIMIT pushdown, aggregates, and one INNER join with an equality predicate.
+// A small cost-based planner picks the access path and the build side of the
+// join; plans are cached by normalized SQL plus schema version.
 package sqlengine
 
 import "context"
@@ -26,6 +28,15 @@ type Txn interface {
 	Scan(ctx context.Context, start, end []byte, limit int) ([]KV, error)
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
+}
+
+// RangeScanner is an optional Txn extension. ScanRanges returns every visible
+// row in [start, end) in key order even when the interval spans several
+// ranges, applying limit globally (limit <= 0 means unlimited). A Txn that
+// does not implement it is still supported but its Scan only covers the range
+// that owns start.
+type RangeScanner interface {
+	ScanRanges(ctx context.Context, start, end []byte, limit int) ([]KV, error)
 }
 
 // Client begins transactions.
@@ -56,10 +67,12 @@ type Index struct {
 
 // Schema is the persisted table descriptor.
 type Schema struct {
-	ID      uint64   `json:"id"`
-	Name    string   `json:"name"`
-	Columns []Column `json:"columns"`
-	Indexes []Index  `json:"indexes,omitempty"`
+	ID       uint64   `json:"id"`
+	Name     string   `json:"name"`
+	Version  uint64   `json:"version"`
+	RowCount uint64   `json:"row_count"`
+	Columns  []Column `json:"columns"`
+	Indexes  []Index  `json:"indexes,omitempty"`
 }
 
 // PrimaryKeyIndex returns the index of the primary-key column.

@@ -21,6 +21,11 @@ const (
 	tokenSemicolon
 	tokenStar
 	tokenEq
+	tokenLt
+	tokenLe
+	tokenGt
+	tokenGe
+	tokenNe
 	tokenPlus
 	tokenMinus
 	tokenDot
@@ -83,6 +88,7 @@ func lex(sql string) ([]token, *ParseError) {
 			toks = append(toks, token{kind: tokenString, text: sb.String(), pos: start})
 
 		default:
+			start := i
 			kind := tokenEOF
 			switch c {
 			case '(':
@@ -97,6 +103,31 @@ func lex(sql string) ([]token, *ParseError) {
 				kind = tokenStar
 			case '=':
 				kind = tokenEq
+			case '<':
+				kind = tokenLt
+				if i+1 < len(sql) {
+					switch sql[i+1] {
+					case '=':
+						kind = tokenLe
+						i++
+					case '>':
+						kind = tokenNe
+						i++
+					}
+				}
+			case '>':
+				kind = tokenGt
+				if i+1 < len(sql) && sql[i+1] == '=' {
+					kind = tokenGe
+					i++
+				}
+			case '!':
+				if i+1 < len(sql) && sql[i+1] == '=' {
+					kind = tokenNe
+					i++
+				} else {
+					return nil, &ParseError{Pos: i, Msg: "unexpected character '!'"}
+				}
 			case '+':
 				kind = tokenPlus
 			case '-':
@@ -106,7 +137,7 @@ func lex(sql string) ([]token, *ParseError) {
 			default:
 				return nil, &ParseError{Pos: i, Msg: fmt.Sprintf("unexpected character %q", c)}
 			}
-			toks = append(toks, token{kind: kind, text: string(c), pos: i})
+			toks = append(toks, token{kind: kind, text: string(sql[start : i+1]), pos: start})
 			i++
 		}
 	}

@@ -443,6 +443,25 @@ func (p *parser) parseSelect() (Statement, error) {
 			return nil, p.errorf(p.peek().pos, "GROUP BY supports exactly one column")
 		}
 	}
+	if orderTok := p.peek(); isKeyword(orderTok, "ORDER") {
+		p.next()
+		if err := p.expectKeyword("BY", " after ORDER"); err != nil {
+			return nil, err
+		}
+		col, err := p.parseColumnRef("column name in ORDER BY")
+		if err != nil {
+			return nil, err
+		}
+		sel.OrderBy = col
+		if p.matchKeyword("DESC") {
+			sel.OrderDesc = true
+		} else {
+			_ = p.matchKeyword("ASC")
+		}
+		if p.peek().kind == tokenComma {
+			return nil, p.errorf(p.peek().pos, "ORDER BY supports exactly one column")
+		}
+	}
 	if p.matchKeyword("LIMIT") {
 		limit, err := p.parseLimit()
 		if err != nil {
@@ -602,20 +621,69 @@ func (p *parser) parseColumnRef(what string) (string, *ParseError) {
 	return first.text + "." + second.text, nil
 }
 
-// parseCondition parses the only supported WHERE form: col = literal.
+// parseCondition parses the supported WHERE predicates:
+//
+//	column = literal
+//	column != literal
+//	column < literal | <= | > | >=
+//	column BETWEEN low AND high
+//
+// Only one predicate is supported; there is no AND/OR combination.
 func (p *parser) parseCondition() (*Condition, error) {
 	col, err := p.parseColumnRef("column name in WHERE")
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expectKind(tokenEq, "'=' in WHERE condition"); err != nil {
+	if p.matchKeyword("BETWEEN") {
+		low, litErr := p.parseLiteral()
+		if litErr != nil {
+			return nil, litErr
+		}
+		if err := p.expectKeyword("AND", " in BETWEEN"); err != nil {
+			return nil, err
+		}
+		high, litErr := p.parseLiteral()
+		if litErr != nil {
+			return nil, litErr
+		}
+		return &Condition{Column: col, Op: OpBetween, Value: low, High: high}, nil
+	}
+	op, err := p.parseComparisonOp()
+	if err != nil {
 		return nil, err
 	}
 	v, litErr := p.parseLiteral()
 	if litErr != nil {
 		return nil, litErr
 	}
-	return &Condition{Column: col, Value: v}, nil
+	return &Condition{Column: col, Op: op, Value: v}, nil
+}
+
+// parseComparisonOp consumes one comparison operator token.
+func (p *parser) parseComparisonOp() (ComparisonOp, *ParseError) {
+	t := p.peek()
+	switch t.kind {
+	case tokenEq:
+		p.next()
+		return OpEQ, nil
+	case tokenNe:
+		p.next()
+		return OpNE, nil
+	case tokenLt:
+		p.next()
+		return OpLT, nil
+	case tokenLe:
+		p.next()
+		return OpLE, nil
+	case tokenGt:
+		p.next()
+		return OpGT, nil
+	case tokenGe:
+		p.next()
+		return OpGE, nil
+	default:
+		return OpEQ, p.errorf(t.pos, "expected comparison operator in WHERE condition, found %s", describeToken(t))
+	}
 }
 
 // parseLiteral parses a signed decimal integer or a single-quoted string.
@@ -685,6 +753,16 @@ func describeToken(t token) string {
 		return "'*'"
 	case tokenEq:
 		return "'='"
+	case tokenNe:
+		return "'!='"
+	case tokenLt:
+		return "'<'"
+	case tokenLe:
+		return "'<='"
+	case tokenGt:
+		return "'>'"
+	case tokenGe:
+		return "'>='"
 	case tokenPlus:
 		return "'+'"
 	case tokenMinus:

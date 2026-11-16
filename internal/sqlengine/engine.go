@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"distributed-db/internal/sqlparser"
 
@@ -41,13 +43,22 @@ const (
 	indexPrefix   byte = 0x03
 )
 
-// Engine executes the P0 SQL subset over a transactional KV client.
+// Engine executes the SQL subset over a transactional KV client.
 type Engine struct {
 	client Client
+
+	// Plan cache: normalized SQL + schema version -> chosen plan.
+	planMu            sync.Mutex
+	plans             map[string]*Plan
+	planHits          int64
+	planMisses        int64
+	planInvalidations int64
 }
 
 // New returns an engine backed by client.
-func New(client Client) *Engine { return &Engine{client: client} }
+func New(client Client) *Engine {
+	return &Engine{client: client, plans: make(map[string]*Plan)}
+}
 
 // Execute parses and executes exactly one SQL statement.
 func (e *Engine) Execute(ctx context.Context, sql string) (*Result, error) {
@@ -109,6 +120,14 @@ func (e *Engine) execute(ctx context.Context, stmt sqlparser.Statement) (*Result
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	// Schema-changing statements make every cached plan stale. Schema version
+	// keys already prevent reuse; clearing the map also reclaims memory and
+	// makes the invalidation observable through PlanCacheStats.
+	switch stmt.(type) {
+	case *sqlparser.CreateTable, *sqlparser.DropTable, *sqlparser.CreateIndex, *sqlparser.DropIndex,
+		sqlparser.CreateTable, sqlparser.DropTable, sqlparser.CreateIndex, sqlparser.DropIndex:
+		e.invalidatePlans()
+	}
 	return res, nil
 }
 
@@ -146,7 +165,7 @@ func (e *Engine) createTable(ctx context.Context, tx Txn, s sqlparser.CreateTabl
 	} else if !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
-	schema := Schema{ID: xxhash.Sum64String(name), Name: name, Columns: cols}
+	schema := Schema{ID: xxhash.Sum64String(name), Name: name, Version: 1, Columns: cols}
 	data, err := json.Marshal(schema)
 	if err != nil {
 		return nil, err
@@ -162,7 +181,7 @@ func (e *Engine) dropTable(ctx context.Context, tx Txn, s sqlparser.DropTable) (
 	}
 	for _, idx := range schema.Indexes {
 		idxID := indexID(idx.Name)
-		indexRows, err := tx.Scan(ctx, indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), 0)
+		indexRows, err := scanRows(ctx, tx, indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), 0)
 		if err != nil {
 			return nil, err
 		}
@@ -170,7 +189,7 @@ func (e *Engine) dropTable(ctx context.Context, tx Txn, s sqlparser.DropTable) (
 			tx.Delete(row.Key)
 		}
 	}
-	rows, err := tx.Scan(ctx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
+	rows, err := scanRows(ctx, tx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +220,7 @@ func (e *Engine) createIndex(ctx context.Context, tx Txn, s sqlparser.CreateInde
 	if col.PrimaryKey {
 		return nil, fmt.Errorf("%w: index on primary key", ErrUnsupported)
 	}
-	rows, err := tx.Scan(ctx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
+	rows, err := scanRows(ctx, tx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -228,6 +247,7 @@ func (e *Engine) createIndex(ctx context.Context, tx Txn, s sqlparser.CreateInde
 		tx.Set(indexEntryKey(schema.ID, idxID, encoded, pk), nil)
 	}
 	schema.Indexes = append(schema.Indexes, Index{Name: name, Column: col.Name})
+	bumpSchemaVersion(schema)
 	data, err := json.Marshal(schema)
 	if err != nil {
 		return nil, err
@@ -253,7 +273,7 @@ func (e *Engine) dropIndex(ctx context.Context, tx Txn, s sqlparser.DropIndex) (
 		return nil, ErrIndexNotFound
 	}
 	idxID := indexID(name)
-	rows, err := tx.Scan(ctx, indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), 0)
+	rows, err := scanRows(ctx, tx, indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -261,6 +281,7 @@ func (e *Engine) dropIndex(ctx context.Context, tx Txn, s sqlparser.DropIndex) (
 		tx.Delete(row.Key)
 	}
 	schema.Indexes = append(schema.Indexes[:pos], schema.Indexes[pos+1:]...)
+	bumpSchemaVersion(schema)
 	data, err := json.Marshal(schema)
 	if err != nil {
 		return nil, err
@@ -350,6 +371,9 @@ func (e *Engine) insert(ctx context.Context, tx Txn, s sqlparser.Insert) (*Resul
 		}
 		tx.Set(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk), nil)
 	}
+	if err := e.saveStats(tx, schema, 1); err != nil {
+		return nil, err
+	}
 	return &Result{RowsAffected: 1, Message: "row inserted"}, nil
 }
 
@@ -368,9 +392,25 @@ func (e *Engine) selectRows(ctx context.Context, tx Txn, s sqlparser.Select) (*R
 	if err != nil {
 		return nil, err
 	}
-	rows, err := e.readRows(ctx, tx, schema, s.Where, s.Limit)
+	plan, err := e.planFor(&s, schema)
 	if err != nil {
 		return nil, err
+	}
+	rows, err := e.readRowsWithPlan(ctx, tx, schema, plan, s.Where, s.Limit)
+	if err != nil {
+		return nil, err
+	}
+	if plan.Sort {
+		col, ok := resolveTableColumn(schema, plan.OrderBy)
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown column %q in ORDER BY", ErrBadColumn, plan.OrderBy)
+		}
+		if err := sortRows(schema, rows, col, plan.OrderDesc); err != nil {
+			return nil, err
+		}
+	}
+	if s.Limit > 0 && len(rows) > s.Limit {
+		rows = rows[:s.Limit]
 	}
 	out := make([][]any, 0, len(rows))
 	for _, row := range rows {
@@ -399,6 +439,14 @@ const (
 	joinSideRight
 )
 
+// joinOutputRow is one joined row plus its sort keys, used when the hash-build
+// side is the left table and the left-driven order must be restored.
+type joinOutputRow struct {
+	line    []any
+	leftPK  sqlparser.Value
+	rightPK sqlparser.Value
+}
+
 // joinProjection is one output column of a join and the side it comes from.
 type joinProjection struct {
 	side   int
@@ -406,23 +454,29 @@ type joinProjection struct {
 	name   string
 }
 
-// joinCondition is a WHERE column = literal resolved against one join side.
+// joinCondition is a WHERE predicate resolved against one join side.
 type joinCondition struct {
 	side   int
 	column Column
+	op     sqlparser.ComparisonOp
 	value  sqlparser.Value
+	high   sqlparser.Value
 }
 
 // selectJoin executes one INNER JOIN with an equality predicate and an
-// optional single-column WHERE condition, followed by LIMIT. Both inputs are
-// scanned in primary-key order, so output order is deterministic: left rows in
-// key order, and for each left row its right matches in key order.
+// optional single-column WHERE condition, followed by LIMIT. The planner
+// chooses the smaller estimated input as the hash-build side, but the output
+// is kept in left-primary-key order (then right-primary-key order) so results
+// stay deterministic regardless of the chosen join order.
 func (e *Engine) selectJoin(ctx context.Context, tx Txn, leftSchema *Schema, s sqlparser.Select) (*Result, error) {
 	if s.Aggregate != nil {
 		return nil, fmt.Errorf("%w: aggregates with JOIN", ErrUnsupported)
 	}
 	if s.GroupBy != "" {
 		return nil, fmt.Errorf("%w: GROUP BY with JOIN", ErrUnsupported)
+	}
+	if s.OrderBy != "" {
+		return nil, fmt.Errorf("%w: ORDER BY with JOIN", ErrUnsupported)
 	}
 	join := s.Join
 	if join == nil {
@@ -463,6 +517,11 @@ func (e *Engine) selectJoin(ctx context.Context, tx Txn, leftSchema *Schema, s s
 		}
 	}
 
+	plan, err := e.planFor(&s, leftSchema, rightSchema)
+	if err != nil {
+		return nil, err
+	}
+
 	// Scan both sides bounded; the extra row lets us detect an oversized input.
 	leftRows, err := e.readRows(ctx, tx, leftSchema, nil, maxJoinScanRows+1)
 	if err != nil {
@@ -479,27 +538,59 @@ func (e *Engine) selectJoin(ctx context.Context, tx Txn, leftSchema *Schema, s s
 		return nil, fmt.Errorf("%w: JOIN input table %q exceeds %d rows", ErrUnsupported, rightSchema.Name, maxJoinScanRows)
 	}
 
-	// Hash the right side by join value, preserving scan order per value.
-	rightByKey := make(map[any][]map[string]any, len(rightRows))
-	for _, row := range rightRows {
-		key, err := joinKey(rightJoinCol, row)
+	// Push the WHERE filter into the side it references before hashing. This
+	// is what makes the join-order estimate and the build side meaningful.
+	if where != nil {
+		switch where.side {
+		case joinSideLeft:
+			leftRows, err = filterJoinRows(leftRows, where)
+		case joinSideRight:
+			rightRows, err = filterJoinRows(rightRows, where)
+		}
 		if err != nil {
 			return nil, err
 		}
-		rightByKey[key] = append(rightByKey[key], row)
 	}
 
+	buildLeft := plan.Join != nil && plan.Join.BuildSide == "left"
+	probeRows := leftRows
+	buildRows := rightRows
+	probeCol := leftJoinCol
+	buildCol := rightJoinCol
+	if buildLeft {
+		probeRows, buildRows = rightRows, leftRows
+		probeCol, buildCol = rightJoinCol, leftJoinCol
+	}
+
+	// Hash the build side by join value, preserving scan order per value.
+	buildByKey := make(map[any][]map[string]any, len(buildRows))
+	for _, row := range buildRows {
+		key, err := joinKey(buildCol, row)
+		if err != nil {
+			return nil, err
+		}
+		buildByKey[key] = append(buildByKey[key], row)
+	}
+
+	// Hash-build on the left makes output follow the probe (right) table; sort
+	// by left PK then right PK afterwards to restore left-driven order.
+	needSort := buildLeft
+	collected := make([]joinOutputRow, 0)
 	names := make([]string, len(projections))
 	for i, p := range projections {
 		names[i] = p.name
 	}
-	out := make([][]any, 0)
-	for _, leftRow := range leftRows {
-		key, err := joinKey(leftJoinCol, leftRow)
+
+	for _, probeRow := range probeRows {
+		key, err := joinKey(probeCol, probeRow)
 		if err != nil {
 			return nil, err
 		}
-		for _, rightRow := range rightByKey[key] {
+		for _, buildRow := range buildByKey[key] {
+			leftRow, rightRow := probeRow, buildRow
+			if buildLeft {
+				leftRow, rightRow = buildRow, probeRow
+			}
 			if where != nil {
 				ok, err := where.matches(leftRow, rightRow)
 				if err != nil {
@@ -509,8 +600,8 @@ func (e *Engine) selectJoin(ctx context.Context, tx Txn, leftSchema *Schema, s s
 					continue
 				}
 			}
-			if s.Limit > 0 && len(out) == s.Limit {
-				return &Result{Columns: names, Rows: out}, nil
+			if !needSort && s.Limit > 0 && len(collected) == s.Limit {
+				return &Result{Columns: names, Rows: joinLines(collected)}, nil
 			}
 			line := make([]any, len(projections))
 			for i, p := range projections {
@@ -520,13 +611,73 @@ func (e *Engine) selectJoin(ctx context.Context, tx Txn, leftSchema *Schema, s s
 					line[i] = rightRow[p.column.Name]
 				}
 			}
-			out = append(out, line)
-			if len(out) > maxJoinResultRows {
+			item := joinOutputRow{line: line}
+			if needSort {
+				item.leftPK, err = rowPrimaryKey(leftSchema, leftRow)
+				if err != nil {
+					return nil, err
+				}
+				item.rightPK, err = rowPrimaryKey(rightSchema, rightRow)
+				if err != nil {
+					return nil, err
+				}
+			}
+			collected = append(collected, item)
+			if len(collected) > maxJoinResultRows {
 				return nil, fmt.Errorf("%w: JOIN produces more than %d rows", ErrUnsupported, maxJoinResultRows)
 			}
 		}
 	}
-	return &Result{Columns: names, Rows: out}, nil
+
+	if needSort {
+		leftPKCol, _ := leftSchema.PrimaryKeyIndex()
+		rightPKCol, _ := rightSchema.PrimaryKeyIndex()
+		sort.SliceStable(collected, func(i, j int) bool {
+			c := compareLiteral(leftSchema.Columns[leftPKCol], collected[i].leftPK, collected[j].leftPK)
+			if c != 0 {
+				return c < 0
+			}
+			return compareLiteral(rightSchema.Columns[rightPKCol], collected[i].rightPK, collected[j].rightPK) < 0
+		})
+	}
+	if s.Limit > 0 && len(collected) > s.Limit {
+		collected = collected[:s.Limit]
+	}
+	return &Result{Columns: names, Rows: joinLines(collected)}, nil
+}
+
+func joinLines(items []joinOutputRow) [][]any {
+	out := make([][]any, len(items))
+	for i := range items {
+		out[i] = items[i].line
+	}
+	return out
+}
+
+// filterJoinRows keeps rows matching a resolved single-column WHERE
+// predicate. It runs before hashing so filtered input cardinality drives the
+// plan.
+func filterJoinRows(rows []map[string]any, c *joinCondition) ([]map[string]any, error) {
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		ok, err := c.matchesRow(row)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+// rowPrimaryKey returns the primary-key value of one row.
+func rowPrimaryKey(schema *Schema, row map[string]any) (sqlparser.Value, error) {
+	idx, ok := schema.PrimaryKeyIndex()
+	if !ok {
+		return sqlparser.Value{}, fmt.Errorf("%w: table has no primary key", ErrBadColumn)
+	}
+	return anyToLiteral(schema.Columns[idx], row[schema.Columns[idx].Name])
 }
 
 // joinQualifier returns the lower-case qualifier used for one join side.
@@ -629,10 +780,13 @@ func resolveJoinCondition(cond sqlparser.Condition, left, right *Schema, leftAli
 	if err != nil {
 		return nil, err
 	}
-	if err := checkLiteralType(col, cond.Value); err != nil {
+	if err := checkConditionTypes(col, &cond); err != nil {
 		return nil, err
 	}
-	return &joinCondition{side: side, column: col, value: cond.Value}, nil
+	return &joinCondition{
+		side: side, column: col, op: cond.Op,
+		value: cond.Value, high: cond.High,
+	}, nil
 }
 
 // matches reports whether the joined row satisfies the WHERE condition.
@@ -641,11 +795,35 @@ func (c *joinCondition) matches(leftRow, rightRow map[string]any) (bool, error) 
 	if c.side == joinSideRight {
 		row = rightRow
 	}
+	return c.matchesRow(row)
+}
+
+// matchesRow evaluates the predicate against one row from the predicate side.
+func (c *joinCondition) matchesRow(row map[string]any) (bool, error) {
 	lit, err := anyToLiteral(c.column, row[c.column.Name])
 	if err != nil {
 		return false, err
 	}
-	return lit.AsAny() == c.value.AsAny(), nil
+	if c.op == sqlparser.OpBetween {
+		return compareLiteral(c.column, lit, c.value) >= 0 && compareLiteral(c.column, lit, c.high) <= 0, nil
+	}
+	cmp := compareLiteral(c.column, lit, c.value)
+	switch c.op {
+	case sqlparser.OpEQ:
+		return cmp == 0, nil
+	case sqlparser.OpNE:
+		return cmp != 0, nil
+	case sqlparser.OpLT:
+		return cmp < 0, nil
+	case sqlparser.OpLE:
+		return cmp <= 0, nil
+	case sqlparser.OpGT:
+		return cmp > 0, nil
+	case sqlparser.OpGE:
+		return cmp >= 0, nil
+	default:
+		return false, nil
+	}
 }
 
 // joinKey returns the comparable hash key for a row's join column.
@@ -660,6 +838,9 @@ func joinKey(col Column, row map[string]any) (any, error) {
 func (e *Engine) aggregate(ctx context.Context, tx Txn, schema *Schema, s sqlparser.Select) (*Result, error) {
 	if s.GroupBy != "" {
 		return e.aggregateGroups(ctx, tx, schema, s)
+	}
+	if s.OrderBy != "" {
+		return nil, fmt.Errorf("%w: ORDER BY with a global aggregate", ErrUnsupported)
 	}
 	rows, err := e.readRows(ctx, tx, schema, s.Where, 0)
 	if err != nil {
@@ -798,6 +979,19 @@ func (e *Engine) aggregateGroups(ctx context.Context, tx Txn, schema *Schema, s 
 		}
 		out = append(out, []any{b.key, v})
 	}
+	if s.OrderBy != "" {
+		if !strings.EqualFold(s.OrderBy, groupCol.Name) {
+			return nil, fmt.Errorf("%w: ORDER BY %q with GROUP BY %q", ErrUnsupported, s.OrderBy, groupCol.Name)
+		}
+		if s.OrderDesc {
+			for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	if s.Limit > 0 && len(out) > s.Limit {
+		out = out[:s.Limit]
+	}
 	return &Result{Columns: cols, Rows: out}, nil
 }
 
@@ -852,7 +1046,11 @@ func (e *Engine) update(ctx context.Context, tx Txn, s sqlparser.Update) (*Resul
 	if len(s.Assignments) == 0 {
 		return nil, fmt.Errorf("%w: SET list is empty", ErrBadColumn)
 	}
-	pks, err := e.conditionPKs(ctx, tx, schema, s.Where)
+	plan, err := e.planFor(&s, schema)
+	if err != nil {
+		return nil, err
+	}
+	pks, err := e.conditionPKs(ctx, tx, schema, plan, s.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -872,6 +1070,13 @@ func (e *Engine) update(ctx context.Context, tx Txn, s sqlparser.Update) (*Resul
 			return nil, err
 		}
 		normalizeRow(schema, row)
+		ok, err := conditionMatches(schema, s.Where, row)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
 		oldRow := make(map[string]any, len(row))
 		for k, v := range row {
 			oldRow[k] = v
@@ -914,7 +1119,11 @@ func (e *Engine) delete(ctx context.Context, tx Txn, s sqlparser.Delete) (*Resul
 	if s.Where == nil {
 		return nil, fmt.Errorf("%w: DELETE requires WHERE", ErrUnsupported)
 	}
-	pks, err := e.conditionPKs(ctx, tx, schema, s.Where)
+	plan, err := e.planFor(&s, schema)
+	if err != nil {
+		return nil, err
+	}
+	pks, err := e.conditionPKs(ctx, tx, schema, plan, s.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -933,52 +1142,226 @@ func (e *Engine) delete(ctx context.Context, tx Txn, s sqlparser.Delete) (*Resul
 			return nil, err
 		}
 		normalizeRow(schema, row)
+		ok, err := conditionMatches(schema, s.Where, row)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
 		if err := e.deleteIndexEntries(tx, schema, row, pk); err != nil {
 			return nil, err
 		}
 		tx.Delete(key)
 		affected++
 	}
+	if affected > 0 {
+		if err := e.saveStats(tx, schema, -int64(affected)); err != nil {
+			return nil, err
+		}
+	}
 	return &Result{RowsAffected: affected, Message: "rows deleted"}, nil
 }
 
-// conditionPKs returns the primary keys matching the supported WHERE form:
-// primary key equality or an indexed-column equality.
-func (e *Engine) conditionPKs(ctx context.Context, tx Txn, schema *Schema, where *sqlparser.Condition) ([][]byte, error) {
-	pkIdx, _ := schema.PrimaryKeyIndex()
-	pkCol := schema.Columns[pkIdx]
-	if strings.EqualFold(where.Column, pkCol.Name) {
-		pk, err := encodePK(pkCol, where.Value)
+// conditionPKs returns the primary keys selected by the planner's access
+// path. Callers re-check the full predicate against each row, so access paths
+// that can only over-select (TEXT index ranges, !=) stay correct.
+func (e *Engine) conditionPKs(ctx context.Context, tx Txn, schema *Schema, plan *Plan, where *sqlparser.Condition) ([][]byte, error) {
+	switch plan.Access {
+	case AccessPKPoint:
+		col, ok := resolveTableColumn(schema, where.Column)
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, where.Column)
+		}
+		pk, err := encodePK(col, where.Value)
 		if err != nil {
 			return nil, err
 		}
 		return [][]byte{pk}, nil
+	case AccessPKRange:
+		start, end, err := rowRangeBounds(schema, where)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := scanRows(ctx, tx, start, end, 0)
+		if err != nil {
+			return nil, err
+		}
+		prefixLen := len(tablePrefix(schema.ID))
+		out := make([][]byte, 0, len(rows))
+		for _, row := range rows {
+			if len(row.Key) < prefixLen {
+				continue
+			}
+			out = append(out, append([]byte(nil), row.Key[prefixLen:]...))
+		}
+		return out, nil
+	case AccessTableScan:
+		rows, err := scanRows(ctx, tx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
+		if err != nil {
+			return nil, err
+		}
+		prefixLen := len(tablePrefix(schema.ID))
+		out := make([][]byte, 0, len(rows))
+		for _, row := range rows {
+			if len(row.Key) < prefixLen {
+				continue
+			}
+			out = append(out, append([]byte(nil), row.Key[prefixLen:]...))
+		}
+		return out, nil
+	case AccessIndexPoint, AccessIndexRange, AccessIndexFull:
+		start, end, err := indexRangeBounds(schema, plan.Index, where)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := scanRows(ctx, tx, start, end, 0)
+		if err != nil {
+			return nil, err
+		}
+		out := make([][]byte, 0, len(rows))
+		for _, row := range rows {
+			pk, ok := indexEntryPK(row.Key)
+			if ok {
+				out = append(out, pk)
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%w: access path %s", ErrUnsupported, plan.Access)
 	}
-	column := strings.ToLower(where.Column)
-	ci, ok := columnIndex(schema, column)
+}
+
+// inclusiveUserKeyEnd returns an exclusive scan bound that includes every
+// version of userKey. MVCC stores userKey||commitTS, so appending a single zero
+// byte is not enough: a version suffix starting with zero would sort after the
+// bound. Eight 0xff bytes exceed any timestamp; extensions of userKey that also
+// fall under the bound are removed by the predicate filter.
+func inclusiveUserKeyEnd(key []byte) []byte {
+	const maxVersionLen = 8
+	out := make([]byte, len(key)+maxVersionLen)
+	copy(out, key)
+	for i := len(key); i < len(out); i++ {
+		out[i] = 0xff
+	}
+	return out
+}
+
+// rowRangeBounds converts a primary-key predicate into a [start,end) scan over
+// row keys. Inclusive upper bounds extend past all MVCC versions of the key;
+// the executor re-checks the predicate, so TEXT keys that merely extend the
+// bound are filtered out.
+func rowRangeBounds(schema *Schema, cond *sqlparser.Condition) (start, end []byte, err error) {
+	col, ok := resolveTableColumn(schema, cond.Column)
 	if !ok {
-		return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, where.Column)
+		return nil, nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, cond.Column)
 	}
-	idx, ok := indexForColumn(schema, column)
+	pk, err := encodePK(col, cond.Value)
+	if err != nil {
+		return nil, nil, err
+	}
+	start = tablePrefix(schema.ID)
+	end = tablePrefixEnd(schema.ID)
+	switch cond.Op {
+	case sqlparser.OpEQ:
+		start = rowKey(schema.ID, pk)
+		end = append(append([]byte(nil), start...), 0)
+	case sqlparser.OpGT:
+		start = append(rowKey(schema.ID, pk), 0)
+	case sqlparser.OpGE:
+		start = rowKey(schema.ID, pk)
+	case sqlparser.OpLT:
+		end = rowKey(schema.ID, pk)
+	case sqlparser.OpLE:
+		end = inclusiveUserKeyEnd(rowKey(schema.ID, pk))
+	case sqlparser.OpBetween:
+		high, err := encodePK(col, cond.High)
+		if err != nil {
+			return nil, nil, err
+		}
+		if compareLiteral(col, cond.Value, cond.High) > 0 {
+			// Empty range: make start == end.
+			empty := tablePrefixEnd(schema.ID)
+			return empty, empty, nil
+		}
+		start = rowKey(schema.ID, pk)
+		end = inclusiveUserKeyEnd(rowKey(schema.ID, high))
+	default:
+		return nil, nil, fmt.Errorf("%w: predicate %s", ErrUnsupported, cond.Op)
+	}
+	return start, end, nil
+}
+
+// indexRangeBounds converts an indexed-column predicate into a [start,end)
+// scan over index entries. INT values are fixed-width and ordered inside the
+// index, so the bounds can be clipped; TEXT ranges fall back to a full index
+// scan because the index encodes the value length first.
+func indexRangeBounds(schema *Schema, indexName string, cond *sqlparser.Condition) (start, end []byte, err error) {
+	var idx Index
+	found := false
+	for _, candidate := range schema.Indexes {
+		if candidate.Name == indexName {
+			idx, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		return nil, nil, ErrIndexNotFound
+	}
+	ci, ok := columnIndex(schema, idx.Column)
 	if !ok {
-		return nil, fmt.Errorf("%w: WHERE must use the primary key or an indexed column", ErrUnsupported)
+		return nil, nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, idx.Column)
 	}
-	encoded, err := encodeValue(schema.Columns[ci], where.Value)
+	col := schema.Columns[ci]
+	idxID := indexID(idx.Name)
+	start = indexTableEnd(schema.ID, idxID)
+	end = indexTableEnd(schema.ID, idxID)
+	if cond.Op == sqlparser.OpNE {
+		return indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), nil
+	}
+	if col.Type != "INT" && cond.Op != sqlparser.OpEQ {
+		return indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), nil
+	}
+	encoded, err := encodeValue(col, cond.Value)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	start := indexValueKey(schema.ID, indexID(idx.Name), encoded)
-	end := indexValueEnd(schema.ID, indexID(idx.Name), encoded)
-	rows, err := tx.Scan(ctx, start, end, 0)
-	if err != nil {
-		return nil, err
+	switch cond.Op {
+	case sqlparser.OpEQ:
+		return indexValueKey(schema.ID, idxID, encoded), indexValueEnd(schema.ID, idxID, encoded), nil
+	case sqlparser.OpGT:
+		start = indexNextValueKey(schema, idxID, col, cond.Value.Int)
+		end = indexTableEnd(schema.ID, idxID)
+	case sqlparser.OpGE:
+		start = indexValueKey(schema.ID, idxID, encoded)
+		end = indexTableEnd(schema.ID, idxID)
+	case sqlparser.OpLT:
+		start = indexTablePrefix(schema.ID, idxID)
+		end = indexValueKey(schema.ID, idxID, encoded)
+	case sqlparser.OpLE:
+		start = indexTablePrefix(schema.ID, idxID)
+		end = indexNextValueKey(schema, idxID, col, cond.Value.Int)
+	case sqlparser.OpBetween:
+		if compareLiteral(col, cond.Value, cond.High) > 0 {
+			tblEnd := indexTableEnd(schema.ID, idxID)
+			return tblEnd, tblEnd, nil
+		}
+		start = indexValueKey(schema.ID, idxID, encoded)
+		end = indexNextValueKey(schema, idxID, col, cond.High.Int)
+	default:
+		return nil, nil, fmt.Errorf("%w: predicate %s", ErrUnsupported, cond.Op)
 	}
-	out := make([][]byte, 0, len(rows))
-	for _, row := range rows {
-		pk := append([]byte(nil), row.Key[len(start):]...)
-		out = append(out, pk)
+	return start, end, nil
+}
+
+// indexNextValueKey returns the first index key of value+1, or the end of the
+// index table when value is the maximum INT.
+func indexNextValueKey(schema *Schema, idxID uint64, col Column, value int64) []byte {
+	if value == math.MaxInt64 {
+		return indexTableEnd(schema.ID, idxID)
 	}
-	return out, nil
+	encoded, _ := encodeValue(col, sqlparser.Value{Kind: sqlparser.ValueInt, Int: value + 1})
+	return indexValueKey(schema.ID, idxID, encoded)
 }
 
 func (e *Engine) deleteIndexEntries(tx Txn, schema *Schema, row map[string]any, pk []byte) error {
@@ -1015,58 +1398,88 @@ func (e *Engine) putIndexEntries(tx Txn, schema *Schema, row map[string]any, pk 
 	return nil
 }
 
+// readRows is the uncached scan used by aggregates and join inputs.
 func (e *Engine) readRows(ctx context.Context, tx Txn, schema *Schema, where *sqlparser.Condition, limit int) ([]map[string]any, error) {
+	a, err := chooseAccess(schema, where)
+	if err != nil {
+		return nil, err
+	}
+	plan := &Plan{}
+	fillAccessPlan(plan, schema, a)
+	return e.readRowsWithPlan(ctx, tx, schema, plan, where, limit)
+}
+
+// readRowsWithPlan executes the chosen access path and returns rows in scan
+// order (primary-key order for row scans, index order for index scans).
+func (e *Engine) readRowsWithPlan(ctx context.Context, tx Txn, schema *Schema, plan *Plan, where *sqlparser.Condition, limit int) ([]map[string]any, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("%w: negative LIMIT", ErrBadColumn)
 	}
-	pkIdx, _ := schema.PrimaryKeyIndex()
-	pkCol := schema.Columns[pkIdx]
-	if where != nil {
-		if strings.EqualFold(where.Column, pkCol.Name) {
-			pk, err := encodePK(pkCol, where.Value)
-			if err != nil {
-				return nil, err
-			}
-			raw, err := tx.Get(ctx, rowKey(schema.ID, pk))
-			if errors.Is(err, ErrNotFound) {
-				return nil, nil
-			}
-			if err != nil {
-				return nil, err
-			}
-			var row map[string]any
-			if err := json.Unmarshal(raw, &row); err != nil {
-				return nil, err
-			}
-			normalizeRow(schema, row)
-			return []map[string]any{row}, nil
-		}
-
-		column := strings.ToLower(where.Column)
-		ci, ok := columnIndex(schema, column)
-		if !ok {
-			return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, where.Column)
-		}
-		idx, ok := indexForColumn(schema, column)
-		if !ok {
-			return nil, fmt.Errorf("%w: WHERE must use the primary key or an indexed column", ErrUnsupported)
-		}
-		col := schema.Columns[ci]
-		encoded, err := encodeValue(col, where.Value)
+	applyLimit := 0
+	if plan.LimitPushed {
+		applyLimit = limit
+	}
+	switch plan.Access {
+	case AccessTableScan:
+		rows, err := scanRows(ctx, tx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), applyLimit)
 		if err != nil {
 			return nil, err
 		}
-		idxID := indexID(idx.Name)
-		start := indexValueKey(schema.ID, idxID, encoded)
-		end := indexValueEnd(schema.ID, idxID, encoded)
-		indexRows, err := tx.Scan(ctx, start, end, limit)
+		return decodeAndFilterRows(schema, rows, where, applyLimit)
+	case AccessPKPoint:
+		col, ok := resolveTableColumn(schema, where.Column)
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, where.Column)
+		}
+		pk, err := encodePK(col, where.Value)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := tx.Get(ctx, rowKey(schema.ID, pk))
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var row map[string]any
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, err
+		}
+		normalizeRow(schema, row)
+		matches, matchErr := conditionMatches(schema, where, row)
+		if matchErr != nil {
+			return nil, matchErr
+		}
+		if !matches {
+			return nil, nil
+		}
+		return []map[string]any{row}, nil
+	case AccessPKRange:
+		rangeStart, rangeEnd, err := rowRangeBounds(schema, where)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := scanRows(ctx, tx, rangeStart, rangeEnd, applyLimit)
+		if err != nil {
+			return nil, err
+		}
+		return decodeAndFilterRows(schema, rows, where, applyLimit)
+	case AccessIndexPoint, AccessIndexRange, AccessIndexFull:
+		rangeStart, rangeEnd, err := indexRangeBounds(schema, plan.Index, where)
+		if err != nil {
+			return nil, err
+		}
+		indexRows, err := scanRows(ctx, tx, rangeStart, rangeEnd, applyLimit)
 		if err != nil {
 			return nil, err
 		}
 		out := make([]map[string]any, 0, len(indexRows))
-		valueKeyLen := len(start)
-		for _, ir := range indexRows {
-			pk := ir.Key[valueKeyLen:]
+		for _, entry := range indexRows {
+			pk, ok := indexEntryPK(entry.Key)
+			if !ok {
+				continue
+			}
 			raw, err := tx.Get(ctx, rowKey(schema.ID, pk))
 			if errors.Is(err, ErrNotFound) {
 				continue
@@ -1079,25 +1492,126 @@ func (e *Engine) readRows(ctx context.Context, tx Txn, schema *Schema, where *sq
 				return nil, err
 			}
 			normalizeRow(schema, row)
+			match, err := conditionMatches(schema, where, row)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
 			out = append(out, row)
+			if applyLimit > 0 && len(out) >= applyLimit {
+				return out, nil
+			}
 		}
 		return out, nil
+	default:
+		return nil, fmt.Errorf("%w: access path %s", ErrUnsupported, plan.Access)
 	}
+}
 
-	rows, err := tx.Scan(ctx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), limit)
-	if err != nil {
-		return nil, err
-	}
+func decodeAndFilterRows(schema *Schema, rows []KV, where *sqlparser.Condition, limit int) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(rows))
-	for _, r := range rows {
+	for _, raw := range rows {
 		var row map[string]any
-		if err := json.Unmarshal(r.Value, &row); err != nil {
+		if err := json.Unmarshal(raw.Value, &row); err != nil {
 			return nil, err
 		}
 		normalizeRow(schema, row)
+		if where != nil {
+			ok, err := conditionMatches(schema, where, row)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+		}
 		out = append(out, row)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 	}
 	return out, nil
+}
+
+// conditionMatches evaluates a condition against a decoded row.
+func conditionMatches(schema *Schema, cond *sqlparser.Condition, row map[string]any) (bool, error) {
+	col, ok := resolveTableColumn(schema, cond.Column)
+	if !ok {
+		return false, fmt.Errorf("%w: unknown column %q", ErrBadColumn, cond.Column)
+	}
+	current, err := anyToLiteral(col, row[col.Name])
+	if err != nil {
+		return false, err
+	}
+	// BETWEEN is inclusive on both ends.
+	if cond.Op == sqlparser.OpBetween {
+		return compareLiteral(col, current, cond.Value) >= 0 && compareLiteral(col, current, cond.High) <= 0, nil
+	}
+	cmp := compareLiteral(col, current, cond.Value)
+	switch cond.Op {
+	case sqlparser.OpEQ:
+		return cmp == 0, nil
+	case sqlparser.OpNE:
+		return cmp != 0, nil
+	case sqlparser.OpLT:
+		return cmp < 0, nil
+	case sqlparser.OpLE:
+		return cmp <= 0, nil
+	case sqlparser.OpGT:
+		return cmp > 0, nil
+	case sqlparser.OpGE:
+		return cmp >= 0, nil
+	default:
+		return false, fmt.Errorf("%w: predicate %s", ErrUnsupported, cond.Op)
+	}
+}
+
+// indexEntryPK extracts the primary key suffix from an index entry key.
+func indexEntryPK(key []byte) ([]byte, bool) {
+	const headerLen = 17 + 4 // index table prefix + value length
+	if len(key) < headerLen {
+		return nil, false
+	}
+	n := int(binary.BigEndian.Uint32(key[17:21]))
+	start := headerLen + n
+	if start > len(key) {
+		return nil, false
+	}
+	return append([]byte(nil), key[start:]...), true
+}
+
+// scanRows runs a scan through the optional cross-range extension, falling
+// back to a single-range Scan for simple Txn implementations.
+func scanRows(ctx context.Context, tx Txn, start, end []byte, limit int) ([]KV, error) {
+	if rs, ok := tx.(RangeScanner); ok {
+		return rs.ScanRanges(ctx, start, end, limit)
+	}
+	return tx.Scan(ctx, start, end, limit)
+}
+
+func bumpSchemaVersion(schema *Schema) {
+	schema.Version++
+	if schema.Version == 0 {
+		schema.Version = 1
+	}
+}
+
+// saveStats adjusts the approximate row count and rewrites the catalog entry
+// in the same transaction as the data change.
+func (e *Engine) saveStats(tx Txn, schema *Schema, delta int64) error {
+	n := int64(schema.RowCount) + delta
+	if n < 0 {
+		n = 0
+	}
+	schema.RowCount = uint64(n)
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	tx.Set(catalogKey(schema.Name), data)
+	return nil
 }
 
 func (e *Engine) loadSchema(ctx context.Context, tx Txn, table string) (*Schema, error) {
@@ -1131,13 +1645,7 @@ func tablePrefix(id uint64) []byte {
 }
 
 func tablePrefixEnd(id uint64) []byte {
-	prefix := tablePrefix(id)
-	end := make([]byte, len(prefix)+16)
-	copy(end, prefix)
-	for i := len(prefix); i < len(end); i++ {
-		end[i] = 0xff
-	}
-	return end
+	return keyPrefixEnd(tablePrefix(id))
 }
 
 func rowKey(id uint64, pk []byte) []byte {
@@ -1179,13 +1687,7 @@ func indexTablePrefix(tableID, idxID uint64) []byte {
 }
 
 func indexTableEnd(tableID, idxID uint64) []byte {
-	prefix := indexTablePrefix(tableID, idxID)
-	end := make([]byte, len(prefix)+16)
-	copy(end, prefix)
-	for i := len(prefix); i < len(end); i++ {
-		end[i] = 0xff
-	}
-	return end
+	return keyPrefixEnd(indexTablePrefix(tableID, idxID))
 }
 
 func indexValueKey(tableID, idxID uint64, value []byte) []byte {
@@ -1202,13 +1704,29 @@ func indexEntryKey(tableID, idxID uint64, value, pk []byte) []byte {
 }
 
 func indexValueEnd(tableID, idxID uint64, value []byte) []byte {
-	start := indexValueKey(tableID, idxID, value)
-	end := make([]byte, len(start)+16)
-	copy(end, start)
-	for i := len(start); i < len(end); i++ {
-		end[i] = 0xff
+	return keyPrefixEnd(indexValueKey(tableID, idxID, value))
+}
+
+// keyPrefixEnd returns the smallest key greater than every key that has prefix
+// as a prefix. It works for arbitrary suffix lengths (TEXT primary keys and
+// long index entries), unlike padding with a fixed number of 0xff bytes. A
+// prefix made only of 0xff bytes has no finite successor and falls back to the
+// padded form.
+func keyPrefixEnd(prefix []byte) []byte {
+	end := append([]byte(nil), prefix...)
+	for i := len(end) - 1; i >= 0; i-- {
+		if end[i] == 0xff {
+			continue
+		}
+		end[i]++
+		return end[:i+1]
 	}
-	return end
+	padded := make([]byte, len(prefix)+16)
+	copy(padded, prefix)
+	for i := len(prefix); i < len(padded); i++ {
+		padded[i] = 0xff
+	}
+	return padded
 }
 
 func indexForColumn(s *Schema, column string) (Index, bool) {

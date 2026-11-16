@@ -651,3 +651,122 @@ func TestParseJoinErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRangePredicates(t *testing.T) {
+	tests := []struct {
+		sql string
+		op  ComparisonOp
+		low Value
+		hi  Value
+	}{
+		{"SELECT * FROM t WHERE id > 5", OpGT, Value{Kind: ValueInt, Int: 5}, Value{}},
+		{"SELECT * FROM t WHERE id >= 5", OpGE, Value{Kind: ValueInt, Int: 5}, Value{}},
+		{"SELECT * FROM t WHERE id < -5", OpLT, Value{Kind: ValueInt, Int: -5}, Value{}},
+		{"SELECT * FROM t WHERE id <= 5", OpLE, Value{Kind: ValueInt, Int: 5}, Value{}},
+		{"SELECT * FROM t WHERE name <> 'x'", OpNE, Value{Kind: ValueText, Str: "x"}, Value{}},
+		{"SELECT * FROM t WHERE name != 'x'", OpNE, Value{Kind: ValueText, Str: "x"}, Value{}},
+		{"SELECT * FROM t WHERE id BETWEEN -2 AND 7", OpBetween, Value{Kind: ValueInt, Int: -2}, Value{Kind: ValueInt, Int: 7}},
+		{"SELECT * FROM t WHERE name BETWEEN 'a' AND 'm'", OpBetween, Value{Kind: ValueText, Str: "a"}, Value{Kind: ValueText, Str: "m"}},
+	}
+	for _, tc := range tests {
+		stmt, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.sql, err)
+		}
+		sel := stmt.(*Select)
+		if sel.Where == nil || sel.Where.Op != tc.op {
+			t.Fatalf("%q: condition = %+v", tc.sql, sel.Where)
+		}
+		if !reflect.DeepEqual(sel.Where.Value, tc.low) || !reflect.DeepEqual(sel.Where.High, tc.hi) {
+			t.Fatalf("%q: bounds = %+v / %+v", tc.sql, sel.Where.Value, sel.Where.High)
+		}
+	}
+
+	// Equality keeps the zero value so older AST literals stay valid.
+	stmt, err := Parse("SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stmt.(*Select).Where.Op; got != OpEQ {
+		t.Fatalf("equality op = %v, want OpEQ", got)
+	}
+
+	for _, sql := range []string{
+		"SELECT * FROM t WHERE id BETWEEN 1",
+		"SELECT * FROM t WHERE id BETWEEN 1 AND",
+		"SELECT * FROM t WHERE id >",
+		"SELECT * FROM t WHERE id >< 1",
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Errorf("%q: expected error", sql)
+		}
+	}
+}
+
+func TestParseOrderBy(t *testing.T) {
+	tests := []struct {
+		sql  string
+		col  string
+		desc bool
+	}{
+		{"SELECT * FROM t ORDER BY id", "id", false},
+		{"SELECT * FROM t ORDER BY id ASC", "id", false},
+		{"SELECT * FROM t ORDER BY id DESC", "id", true},
+		{"SELECT * FROM t WHERE id > 1 ORDER BY n.age DESC LIMIT 5", "n.age", true},
+	}
+	for _, tc := range tests {
+		stmt, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.sql, err)
+		}
+		sel := stmt.(*Select)
+		if sel.OrderBy != tc.col || sel.OrderDesc != tc.desc {
+			t.Fatalf("%q: OrderBy = %q/%v, want %q/%v", tc.sql, sel.OrderBy, sel.OrderDesc, tc.col, tc.desc)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT * FROM t ORDER BY",
+		"SELECT * FROM t ORDER id",
+		"SELECT * FROM t ORDER BY id, name",
+		"SELECT * FROM t ORDER BY id DESC ASC",
+		"SELECT * FROM t ORDER BY id LIMIT 1 WHERE id = 2",
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Errorf("%q: expected error", sql)
+		}
+	}
+}
+
+func TestNormalizeStatementShape(t *testing.T) {
+	cases := []struct{ a, b string }{
+		{"SELECT * FROM users WHERE id = 1", "select * from USERS where ID = 999"},
+		{"SELECT name FROM users ORDER BY id DESC LIMIT 5", "select NAME from users order by ID desc limit 5"},
+		{"UPDATE t SET a = 1, b = 'x' WHERE id = 3", "update T set A = 9, B = 'y' where ID = 4"},
+		{"DELETE FROM t WHERE id BETWEEN 1 AND 2", "delete from T where ID between 8 and 9"},
+	}
+	for _, tc := range cases {
+		sa, err := Parse(tc.a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb, err := Parse(tc.b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if na, nb := Normalize(sa), Normalize(sb); na != nb {
+			t.Errorf("normalize differs:\n%q\n%q", na, nb)
+		}
+	}
+	if got := Normalize(mustParse(t, "SELECT * FROM t WHERE name > 'x'")); got != "SELECT * FROM t WHERE name > ?" {
+		t.Fatalf("normalized = %q", got)
+	}
+}
+
+func mustParse(t *testing.T, sql string) Statement {
+	t.Helper()
+	stmt, err := Parse(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stmt
+}

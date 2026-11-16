@@ -1,8 +1,9 @@
 // Package sqlparser implements the small PostgreSQL-like SQL subset used by
 // the v2 SQL layer: CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT,
-// UPDATE and DELETE with a primary-key equality WHERE clause. SELECT also
-// supports one INNER JOIN with an equality ON predicate. It is intentionally
-// not a general parser.
+// UPDATE and DELETE. WHERE accepts equality, inequality and range predicates
+// (=, !=, <, <=, >, >=, BETWEEN) on one column. SELECT also supports a single
+// ORDER BY column, LIMIT, aggregates, GROUP BY and one INNER JOIN with an
+// equality ON predicate. It is intentionally not a general parser.
 package sqlparser
 
 import "fmt"
@@ -80,7 +81,52 @@ type JoinClause struct {
 	RightColumn string
 }
 
-// Select reads rows.
+// ComparisonOp is the comparison operator of a WHERE predicate. The zero
+// value is equality so Conditions built before range predicates existed keep
+// their meaning.
+type ComparisonOp int
+
+const (
+	OpEQ ComparisonOp = iota
+	OpNE
+	OpLT
+	OpLE
+	OpGT
+	OpGE
+	OpBetween
+)
+
+// String returns the SQL spelling of the operator.
+func (op ComparisonOp) String() string {
+	switch op {
+	case OpNE:
+		return "!="
+	case OpLT:
+		return "<"
+	case OpLE:
+		return "<="
+	case OpGT:
+		return ">"
+	case OpGE:
+		return ">="
+	case OpBetween:
+		return "BETWEEN"
+	default:
+		return "="
+	}
+}
+
+// IsRange reports whether op selects an open-ended or bounded value range.
+func (op ComparisonOp) IsRange() bool {
+	switch op {
+	case OpLT, OpLE, OpGT, OpGE, OpBetween:
+		return true
+	}
+	return false
+}
+
+// Select reads rows. ORDER BY supports a single column; LIMIT is applied after
+// ordering. A zero Limit means no LIMIT clause.
 type Select struct {
 	Table     string
 	Columns   []string // empty or ["*"] means all columns
@@ -88,6 +134,8 @@ type Select struct {
 	Join      *JoinClause // nil for a single-table SELECT
 	Where     *Condition
 	GroupBy   string // empty means no grouping
+	OrderBy   string // empty means no ORDER BY
+	OrderDesc bool   // ORDER BY ... DESC
 	Limit     int
 }
 
@@ -110,10 +158,13 @@ type Delete struct {
 
 func (Delete) isStatement() {}
 
-// Condition is the supported WHERE form: column = literal.
+// Condition is one supported WHERE predicate: column OP literal, or
+// column BETWEEN low AND high. High is only set for OpBetween.
 type Condition struct {
 	Column string
+	Op     ComparisonOp
 	Value  Value
+	High   Value
 }
 
 // Assignment is one SET column = literal.
