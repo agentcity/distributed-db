@@ -40,25 +40,30 @@ UPDATE bench SET v = v + 1 WHERE id = :id;
 До оптимизаций было: 3-node sequential ~33 мс, parallel ~24 мс/op (~420 tx/s).
 После atomic 1PC + parallel cross-range: sequential ~23 мс, parallel ~16 мс/op
 (~625 tx/s). После отказа от отдельного fsync state machine (durability —
-Raft-лог): **sequential ~11.6 мс, parallel ~1.8 мс/op (~5.5k tx/s)**.
+Raft-лог): **sequential ~11.6 мс, parallel ~1.2–2.1 мс/op (~480–820 tx/s)**.
 
 Итоговая таблица (5s benchmark, 2 прогона):
 
 | Сценарий | distributed-db | PostgreSQL 13 | Разрыв |
 |---|---:|---:|---:|
-| 1 клиент | ~11.6 мс / ~86 tx/s | ~0.68 мс / ~1 469 tx/s | ~17× |
-| 10 клиентов (parallel) | ~1.8 мс/op / ~5 500 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~1.2× |
-| batch 256 txns | ~0.15 мс/txn / ~6 600–6 900 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~1.0× |
+| 1 клиент (fast) | ~11.6 мс / ~86 tx/s | ~0.68 мс / ~1 469 tx/s | ~17× |
+| 10 клиентов (fast) | ~1.2–2.1 мс/op / ~480–820 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~8–11× |
+| batch 256 (fast) | ~0.14–0.20 мс/txn / ~5–7k tx/s; batch latency 36–51 мс | ~1.47 мс/op / ~6 835 tx/s | ~1.0× по throughput |
+| production sync, 1 клиент | ~25 мс / ~40 tx/s | ~0.68 мс / ~1 469 tx/s | ~37× |
+| production sync, 10 клиентов | p50 ~151 мс / ~70 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~98× |
 
 Batch-режим (`CommitBatch`, 256 транзакций в одном batch, серверный
-batch-entry 64 × 500 µs, 256 in-flight) выводит throughput на уровень
-PostgreSQL 13 на этом же железе. Это **не** atomic batch: каждая транзакция
-имеет свой commit point. Размер/окно — компромисс latency/throughput и
-настраиваются в `internal/kvserver/batch.go`.
+batch-entry 64 × 500 µs, 256 in-flight) достигает ~5–7k tx/s — на уровне
+PostgreSQL 13 на этом же железе, но это **амортизированная** величина:
+латентность всего batch 36–51 мс, а не 0.15 мс на пользователя. Это **не**
+atomic batch: каждая транзакция имеет свой commit point. Размер/окно —
+компромисс latency/throughput и настраиваются в `internal/kvserver/batch.go`.
 
 На одном клиенте всё ещё платим за Raft-консенсус и один fsync. Цифра
-~11.6 мс — путь без batch; `CommitBatch`/batch-window добавляет ~0.5–1 мс
-одиночному запросу.
+~11.6 мс — fast-профиль без batch; `CommitBatch`/batch-window добавляет
+~0.5–1 мс одиночному запросу. **Production default `sync`** добавляет fsync
+на state machine: ~25 мс на клиента и ~70 tx/s на 10 клиентах — это цена
+durability, а не регрессия.
 
 ## Почему мы медленнее
 
@@ -112,11 +117,13 @@ commit. Сравнение честно только в классе «расп�
 
 ## Вывод
 
-**На 10 клиентах мы почти догнали PostgreSQL** (~1.2× разрыв), но на одном
-клиенте всё ещё ~17×. Это ожидаемо: один Raft-commit платит за консенсус,
-PostgreSQL — нет.
+**На 10 клиентах fast-профиль всё ещё в ~8–11× медленнее PostgreSQL**, а
+production `sync` — примерно в ~100×. На одном клиенте fast ~17×, sync ~37×.
+Это ожидаемо: один Raft-commit платит за консенсус и fsync, PostgreSQL — нет.
 
-Batch-режим уже сравнялся с PostgreSQL по throughput на 10–256
-транзакциях, но single-client latency всё ещё ~17–20×. Правильная цель — не
-«быстрее PostgreSQL на одном узле», а **«лучше PostgreSQL+Patroni/Citus на
-шардированной записи и автоматическом размещении»**.
+Batch-режим достигает ~5–7k tx/s (на уровне PostgreSQL) только как
+амортизированный throughput: batch из 256 транзакций занимает 36–51 мс.
+Interactive latency и production `sync` не догнали PostgreSQL. Правильная
+цель — не «быстрее PostgreSQL на одном узле», а **«лучше
+PostgreSQL+Patroni/Citus на шардированной записи и автоматическом
+размещении»**.
