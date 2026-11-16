@@ -238,5 +238,17 @@
     "title": "kvctl — терминальный CLI",
     "status": "done",
     "file": "0040-kvctl.md"
+  },
+  {
+    "id": "0041",
+    "title": "kvctl admin + gRPC TLS",
+    "status": "done",
+    "file": "0041-kvctl-admin-grpc-tls.md"
+  },
+  {
+    "id": "0042",
+    "title": "Sprint 2 аудит",
+    "status": "done",
+    "file": "0042-sprint-2-audit.md"
   }
 ]
