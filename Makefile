@@ -4,13 +4,17 @@ BINARY := bin/db
 CHAOS_ROUNDS ?= 3
 CHAOS_TIMEOUT ?= 1200
 
-.PHONY: all build test test-short vet fmt proto compose-up compose-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean
+.PHONY: all build build-cli test test-short vet fmt proto compose-up compose-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean
 
 all: build
 
 build:
 	@mkdir -p bin
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $(BINARY) ./cmd/db
+
+build-cli:
+	@mkdir -p bin
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o bin/kvctl ./cmd/kvctl
 
 test:
 	$(GO) test -race ./...

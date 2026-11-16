@@ -15,6 +15,7 @@
 | Простой KV по HTTP, быстро попробовать | v1: `cmd/db` + coordinator | [v1](#3-v1-демо-kv-за-5-минут) |
 | SQL-таблица, `INSERT/SELECT` | v2: `sqlsrv` HTTP | [SQL HTTP](#6-sql-через-http) |
 | `psql` / PostgreSQL-клиент | v2: `pgsrv` pgwire | [psql](#7-psql-pgwire) |
+| Сырой KV v2 из терминала | `kvctl` | [kvctl](#8-kvctl-терминальный-клиент) |
 | Сырой KV v2 из Go | `internal/v2client` | [Go SDK](#8-сырой-kv-v2-из-go) |
 | Бэкап/восстановление | `cmd/kvbackup` | [backup](#9-backup-и-restore) |
 | Проверка огромного набора хешей | `cmd/edgehash` | [edgehash](#10-edgehash) |
@@ -141,6 +142,7 @@ go build -o bin/kv2 ./cmd/kv2
 go build -o bin/sqlsrv ./cmd/sqlsrv
 go build -o bin/pgsrv ./cmd/pgsrv
 go build -o bin/kvbackup ./cmd/kvbackup
+go build -o bin/kvctl ./cmd/kvctl
 ```
 
 ### 4.2 Meta/TSO: 3 узла
@@ -341,12 +343,146 @@ upgrade. Поэтому:
 
 Это известное ограничение; см. [PRODUCTION-PLAN.md](PRODUCTION-PLAN.md).
 
-## 8. Сырой KV v2 из Go
+## 8. kvctl: терминальный клиент
 
-Отдельного CLI для v2 KV пока нет. Используйте Go SDK внутри репозитория
-(пакет `internal/v2client`).
+`kvctl` — полноценный CLI для v2 KV: CRUD, scan, атомарные транзакции,
+interactive shell, JSON/hex/raw-вывод.
 
-Создайте `cmd/kvdemo/main.go`:
+### 8.1 Сборка и конфиг
+
+```bash
+go build -o bin/kvctl ./cmd/kvctl
+
+# адреса можно задать флагами
+./bin/kvctl -meta 127.0.0.1:9090 \
+  -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 get user:1
+
+# или через env
+export KVCTL_META=127.0.0.1:9090
+export KVCTL_NODES=127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+./bin/kvctl get user:1
+```
+
+Глобальные флаги ставятся **до** команды:
+
+```text
+-meta ADDR                meta/TSO gRPC
+-nodes A,B                KV node gRPC
+-timeout 10s              таймаут команды
+-format table|json|raw    вывод
+-hex                      ключи/значения в hex
+-quiet                    без OK
+```
+
+### 8.2 CRUD
+
+```bash
+./bin/kvctl put user:1 alice
+# OK
+
+./bin/kvctl get user:1
+# user:1	alice
+
+./bin/kvctl -format raw get user:1
+# alice
+
+./bin/kvctl delete user:1
+# OK
+```
+
+Значение с пробелами — в кавычках:
+
+```bash
+./bin/kvctl put greeting "hello world"
+```
+
+Значение из stdin или файла:
+
+```bash
+echo -n "hello" | ./bin/kvctl put greeting -
+./bin/kvctl put config @./config.json
+```
+
+### 8.3 Scan
+
+```bash
+# все ключи с префиксом
+./bin/kvctl scan -prefix user:
+
+# диапазон [start, end), лимит
+./bin/kvctl scan -start user: -end user; -limit 100
+
+# JSON для скриптов
+./bin/kvctl -format json scan -prefix user:
+# [{"key":"user:1","value":"alice"}, ...]
+```
+
+`-prefix` нельзя смешивать с `-start/-end`; `-limit` 1..10000.
+
+### 8.4 Атомарная транзакция
+
+`txn` читает операции со stdin или `-file` и коммитит их одной транзакцией:
+
+```bash
+printf 'put a 1\nput b 2\ndelete old\n' | ./bin/kvctl txn
+# committed 3 operations
+```
+
+Файл:
+
+```bash
+cat > ops.txt <<'OPS'
+put user:1 alice
+put user:2 bob
+delete user:3
+OPS
+./bin/kvctl txn -file ops.txt
+```
+
+Ошибка в любой строке → транзакция не коммитится. Поддерживаются `put`/`set`
+и `delete`/`del`; комментарии `#`.
+
+### 8.5 Shell
+
+```bash
+./bin/kvctl shell
+kvctl> put a 1
+OK
+kvctl> get a
+a	1
+kvctl> scan -prefix ""
+kvctl> quit
+```
+
+В shell команды те же (`put/get/delete/scan`), но без глобальных флагов.
+
+### 8.6 Hex и бинарные данные
+
+```bash
+./bin/kvctl -hex put 6b 76        # key "k", value "v"
+./bin/kvctl -hex -format raw get 6b
+# 76
+```
+
+Без `-hex` CLI печатает текст; управляющие байты escaped как `\xNN`.
+
+### 8.7 Ping и коды выхода
+
+```bash
+./bin/kvctl ping
+# pong
+```
+
+- `0` — успех;
+- `1` — операционная ошибка, ключ не найден;
+- `2` — ошибка использования/флагов.
+
+`get` отсутствующего ключа печатает `key ... not found` в stderr и возвращает 1.
+
+## 8a. Сырой KV v2 из Go (advanced)
+
+Если нужен доступ из кода, используйте `internal/v2client`. Программа должна
+лежать внутри репозитория (пакет internal).
 
 ```go
 package main
@@ -379,26 +515,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	read, err := c.Begin(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
+	read, _ := c.Begin(ctx)
 	v, err := read.Get(ctx, []byte("user:1"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	_ = read.Rollback(ctx)
 	fmt.Printf("user:1 = %s\n", v)
-
-	scan, _ := c.Begin(ctx)
-	items, err := scan.Scan(ctx, []byte("user:"), []byte("user;"), 100)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, kv := range items {
-		fmt.Printf("%s = %s\n", kv.Key, kv.Value)
-	}
-	_ = scan.Rollback(ctx)
 }
 ```
 
@@ -406,9 +529,6 @@ func main() {
 go run ./cmd/kvdemo
 # user:1 = alice
 ```
-
-`Txn` поддерживает `Set/Delete/Get/Scan/Commit/Rollback`; `Commit` делает
-1PC для одного range и 2PC для нескольких.
 
 ## 9. Backup и restore
 
@@ -611,9 +731,15 @@ curl -s localhost:8080/v1/status | jq .
 
 # v2 build
 go build -o bin/kv2 ./cmd/kv2
+go build -o bin/kvctl ./cmd/kvctl
 go build -o bin/sqlsrv ./cmd/sqlsrv
 go build -o bin/pgsrv ./cmd/pgsrv
 go build -o bin/kvbackup ./cmd/kvbackup
+go build -o bin/kvctl ./cmd/kvctl
+
+# kvctl
+./bin/kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put a 1
+./bin/kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 get a
 
 # SQL HTTP (таблица users должна существовать)
 curl -s -X POST localhost:8080/v1/sql \
