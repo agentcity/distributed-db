@@ -19,6 +19,6 @@ scope: {backend: true, console: false, mobile: false}
 
 ## Критерии
 
-- [ ] Resume с offset.
-- [ ] Per-chunk CRC.
-- [ ] E2E обрыва.
+- [x] Resume с next_offset.
+- [ ] Per-chunk CRC (whole-payload CRC).
+- [x] E2E обрыва/потери response.

@@ -262,8 +262,8 @@ pgwire → parse → bind catalog → logical plan → optimize
 - [x] Cross-range 2PC primary-first; distributed deadlock/recovery — нет.
 - [x] Background lock resolver + MVCC GC safe point.
 - [x] Jepsen kill/restart.
-- [ ] Network partitions, clock skew, longer soak.
-- [ ] Метрики: oldest lock, resolved locks, GC versions.
+- [x] Network partitions, clock skew (client-side); longer soak — нет.
+- [x] SLO-метрики KV/SQL/pgwire; lock/GC метрики — нет.
 
 ### M5
 

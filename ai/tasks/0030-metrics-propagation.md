@@ -18,6 +18,6 @@ scope: {backend: true, console: false, mobile: false}
 
 ## Критерии
 
-- [ ] SQL/pgwire SLO.
-- [ ] Встроенный endpoint.
-- [ ] SLO-прогон.
+- [x] SQL/pgwire SLO.
+- [x] Встроенный endpoint.
+- [ ] SLO-прогон p99 (не сделан).

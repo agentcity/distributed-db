@@ -20,7 +20,7 @@ scope: {backend: true, console: false, mobile: false}
 
 ## Критерии
 
-- [ ] Leader transfer.
-- [ ] Add/Remove replica.
-- [ ] Placement loop.
-- [ ] E2E 3 узла.
+- [x] Leader transfer (KVService.TransferLeader + TimeoutNow).
+- [ ] Add/Remove replica (не сделано).
+- [x] Leader rebalance loop (RebalanceLeaders/StartLeaderRebalance).
+- [x] E2E transfer/leader rebalance на 3 узлах.

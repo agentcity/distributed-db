@@ -219,8 +219,8 @@ Stage 2.1: потоковый `StreamRange`/split/merge и `AutoSplit` по ра
 Stage 2.2a: shared Pebble на узел. Stage 2.2b: потоковый state-machine
 snapshot и chunked InstallSnapshot. Stage 3.1: cross-range 2PC primary-first. Stage 3.2: SQL после split,
 planner/plan cache, extended pgwire, recovery, Jepsen partitions.
-Stage 2.3: auto-merge, backup/restore, gzip snapshot. Остались
-rebalancing/leader transfer (0028), snapshot resume (0029), SQL/pgwire-метрики (0030).
+Stage 2.3: auto-merge, backup/restore, gzip snapshot. Leader transfer/rebalance, snapshot resume и SQL/pgwire-метрики сделаны.
+Остались Add/Remove replica + joint consensus, per-chunk CRC, SLO p99.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.

@@ -100,14 +100,16 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
   CBO/plan cache), extended pgwire, 2PC recovery, Jepsen partitions.
 - Stage 2.3: auto-merge/lifecycle, backup/restore (`cmd/kvbackup`),
   gzip snapshot compression.
-- Stage 1.3: SLO-метрики (`internal/metrics`, `cmd/metricsrv`), KV interceptor.
+- Stage 1.3: SLO-метрики (`internal/metrics`, `cmd/metricsrv`), KV/SQL/pgwire
+  interceptor, `/metrics` и `/debug/slo`.
+- Stage 2.4: leader transfer и rebalance лидеров (без Add/Remove replica).
+- Stage 2.5: snapshot resume по `next_offset`.
 - Замеры на M1 Pro/loopback: 3 узла sequential ~40 мс/транзакция,
   parallel ~28 мс/op (~350 tx/s), Get ~0.15–1 мс; Raft group commit
   ~7.8× throughput на конкурентных proposal’ах.
 
-Пока нет: rebalancing/leader transfer (0028), snapshot resume (0029),
-SQL/pgwire-метрики и встроенный endpoint (0030), durable scheduler
-queue/leader lease, production TLS/auth.
+Пока нет: Add/Remove replica и joint consensus (0028), per-chunk CRC,
+durable scheduler queue/leader lease, production TLS/auth, SLO p99 прогон.
 
 ### SQL P0 поверх KV (experimental)
 

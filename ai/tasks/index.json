@@ -164,19 +164,19 @@
   {
     "id": "0028",
     "title": "Stage 2 — rebalancing и leader transfer",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0028-rebalancing.md"
   },
   {
     "id": "0029",
     "title": "Stage 2 — snapshot resume",
-    "status": "pending",
+    "status": "done",
     "file": "0029-snapshot-resume.md"
   },
   {
     "id": "0030",
     "title": "Stage 1/3 — метрики SQL/pgwire и экспорт",
-    "status": "pending",
+    "status": "done",
     "file": "0030-metrics-propagation.md"
   }
 ]
