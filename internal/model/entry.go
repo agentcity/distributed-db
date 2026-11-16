@@ -18,6 +18,9 @@ const (
 	CommandPrewrite CommandType = "prewrite"
 	CommandCommit   CommandType = "commit"
 	CommandRollback CommandType = "rollback"
+	// CommandPrewriteCommit applies both phases in one Raft entry for a
+	// single-range transaction (1PC).
+	CommandPrewriteCommit CommandType = "prewrite_commit"
 
 	// Meta control-plane commands. Payload lives in Entry.Value as JSON.
 	CommandMetaAllocTS  CommandType = "meta_alloc_ts"

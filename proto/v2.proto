@@ -10,6 +10,7 @@ service KVService {
   rpc Scan(ScanRequest) returns (ScanResponse);
   rpc Prewrite(PrewriteRequest) returns (PrewriteResponse);
   rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc CommitSingle(CommitSingleRequest) returns (CommitSingleResponse);
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   rpc CheckTxnStatus(CheckTxnStatusRequest) returns (CheckTxnStatusResponse);
   rpc ResolveLock(ResolveLockRequest) returns (ResolveLockResponse);
@@ -85,6 +86,18 @@ message CommitRequest {
   repeated bytes keys = 3;
 }
 message CommitResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+message CommitSingleRequest {
+  uint64 start_ts = 1;
+  uint64 commit_ts = 2;
+  bytes primary = 3;
+  repeated Mutation mutations = 4;
+}
+message CommitSingleResponse {
   bool success = 1;
   string leader = 2;
   string error = 3;

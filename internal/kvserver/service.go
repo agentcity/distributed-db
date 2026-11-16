@@ -65,6 +65,15 @@ func (m *stateMachine) apply(entry model.Entry) error {
 			return fmt.Errorf("kvserver: decode commit: %w", err)
 		}
 		return m.store.Commit(cmd.Keys, cmd.StartTS, cmd.CommitTS)
+	case model.CommandPrewriteCommit:
+		var cmd applyCommand
+		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
+			return fmt.Errorf("kvserver: decode prewrite_commit: %w", err)
+		}
+		if err := m.store.Prewrite(cmd.Mutations, cmd.Primary, cmd.StartTS); err != nil {
+			return err
+		}
+		return m.store.Commit(cmd.Keys, cmd.StartTS, cmd.CommitTS)
 	case model.CommandRollback:
 		var cmd applyCommand
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
@@ -322,6 +331,44 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	return &pbv2.PrewriteResponse{Success: true, Leader: g.node.Leader()}, nil
+}
+
+// CommitSingle applies prewrite+commit in one Raft entry. It is used for a
+// single-range transaction after the client has already obtained commitTS.
+func (k *kvService) CommitSingle(ctx context.Context, req *pbv2.CommitSingleRequest) (*pbv2.CommitSingleResponse, error) {
+	if len(req.GetMutations()) == 0 {
+		return &pbv2.CommitSingleResponse{Leader: k.s.defaultLeader(), Error: "empty mutations"}, nil
+	}
+	mutations := make([]mvcc.Mutation, 0, len(req.GetMutations()))
+	keys := make([][]byte, 0, len(req.GetMutations()))
+	for _, m := range req.GetMutations() {
+		if m == nil {
+			return &pbv2.CommitSingleResponse{Leader: k.s.defaultLeader(), Error: "nil mutation"}, nil
+		}
+		mutations = append(mutations, mvcc.Mutation{Key: m.GetKey(), Value: m.GetValue(), Delete: m.GetDelete()})
+		keys = append(keys, m.GetKey())
+	}
+	g, err := k.s.groupForKeys(keys)
+	if err != nil {
+		return &pbv2.CommitSingleResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
+	if g.isFrozen() {
+		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	}
+	payload, err := encodeCommand(applyCommand{
+		StartTS: req.GetStartTs(), CommitTS: req.GetCommitTs(),
+		Primary: req.GetPrimary(), Mutations: mutations, Keys: keys,
+	})
+	if err != nil {
+		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: "encode"}, nil
+	}
+	if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandPrewriteCommit, Value: payload}); err != nil {
+		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
+	return &pbv2.CommitSingleResponse{Success: true, Leader: g.node.Leader()}, nil
 }
 
 func (k *kvService) Commit(ctx context.Context, req *pbv2.CommitRequest) (*pbv2.CommitResponse, error) {

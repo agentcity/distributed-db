@@ -23,6 +23,7 @@ const (
 	KVService_Scan_FullMethodName           = "/dbv2.KVService/Scan"
 	KVService_Prewrite_FullMethodName       = "/dbv2.KVService/Prewrite"
 	KVService_Commit_FullMethodName         = "/dbv2.KVService/Commit"
+	KVService_CommitSingle_FullMethodName   = "/dbv2.KVService/CommitSingle"
 	KVService_Rollback_FullMethodName       = "/dbv2.KVService/Rollback"
 	KVService_CheckTxnStatus_FullMethodName = "/dbv2.KVService/CheckTxnStatus"
 	KVService_ResolveLock_FullMethodName    = "/dbv2.KVService/ResolveLock"
@@ -41,6 +42,7 @@ type KVServiceClient interface {
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error)
 	Prewrite(ctx context.Context, in *PrewriteRequest, opts ...grpc.CallOption) (*PrewriteResponse, error)
 	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
+	CommitSingle(ctx context.Context, in *CommitSingleRequest, opts ...grpc.CallOption) (*CommitSingleResponse, error)
 	Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error)
 	CheckTxnStatus(ctx context.Context, in *CheckTxnStatusRequest, opts ...grpc.CallOption) (*CheckTxnStatusResponse, error)
 	ResolveLock(ctx context.Context, in *ResolveLockRequest, opts ...grpc.CallOption) (*ResolveLockResponse, error)
@@ -91,6 +93,16 @@ func (c *kVServiceClient) Commit(ctx context.Context, in *CommitRequest, opts ..
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CommitResponse)
 	err := c.cc.Invoke(ctx, KVService_Commit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) CommitSingle(ctx context.Context, in *CommitSingleRequest, opts ...grpc.CallOption) (*CommitSingleResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CommitSingleResponse)
+	err := c.cc.Invoke(ctx, KVService_CommitSingle_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +179,7 @@ type KVServiceServer interface {
 	Scan(context.Context, *ScanRequest) (*ScanResponse, error)
 	Prewrite(context.Context, *PrewriteRequest) (*PrewriteResponse, error)
 	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
+	CommitSingle(context.Context, *CommitSingleRequest) (*CommitSingleResponse, error)
 	Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error)
 	CheckTxnStatus(context.Context, *CheckTxnStatusRequest) (*CheckTxnStatusResponse, error)
 	ResolveLock(context.Context, *ResolveLockRequest) (*ResolveLockResponse, error)
@@ -194,6 +207,9 @@ func (UnimplementedKVServiceServer) Prewrite(context.Context, *PrewriteRequest) 
 }
 func (UnimplementedKVServiceServer) Commit(context.Context, *CommitRequest) (*CommitResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Commit not implemented")
+}
+func (UnimplementedKVServiceServer) CommitSingle(context.Context, *CommitSingleRequest) (*CommitSingleResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CommitSingle not implemented")
 }
 func (UnimplementedKVServiceServer) Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Rollback not implemented")
@@ -302,6 +318,24 @@ func _KVService_Commit_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(KVServiceServer).Commit(ctx, req.(*CommitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_CommitSingle_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitSingleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).CommitSingle(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_CommitSingle_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).CommitSingle(ctx, req.(*CommitSingleRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -436,6 +470,10 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Commit",
 			Handler:    _KVService_Commit_Handler,
+		},
+		{
+			MethodName: "CommitSingle",
+			Handler:    _KVService_CommitSingle_Handler,
 		},
 		{
 			MethodName: "Rollback",
