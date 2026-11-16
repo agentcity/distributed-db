@@ -202,5 +202,11 @@
     "title": "Edge hash cache — Bloom + Merkle + manifest",
     "status": "done",
     "file": "0034-edge-hash-cache.md"
+  },
+  {
+    "id": "0035",
+    "title": "Edge hash cache — production hardening",
+    "status": "in_progress",
+    "file": "0035-edgehash-hardening.md"
   }
 ]
