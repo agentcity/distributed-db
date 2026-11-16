@@ -239,3 +239,35 @@ func TestSQLMultiRowUpdateDeleteByIndex(t *testing.T) {
 		t.Fatalf("second delete affected = %d, want 0", res.RowsAffected)
 	}
 }
+
+func TestSQLAggregates(t *testing.T) {
+	e := New(newFakeClient())
+	exec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT)")
+	exec(t, e, "INSERT INTO t VALUES (1, 'a', 10)")
+	exec(t, e, "INSERT INTO t VALUES (2, 'b', 20)")
+	exec(t, e, "INSERT INTO t VALUES (3, 'c', 30)")
+
+	cases := []struct {
+		sql  string
+		want any
+	}{
+		{"SELECT COUNT(*) FROM t", int64(3)},
+		{"SELECT COUNT(name) FROM t", int64(3)},
+		{"SELECT SUM(amount) FROM t", int64(60)},
+		{"SELECT AVG(amount) FROM t", int64(20)},
+		{"SELECT MIN(amount) FROM t", int64(10)},
+		{"SELECT MAX(amount) FROM t", int64(30)},
+		{"SELECT MIN(name) FROM t", "a"},
+		{"SELECT MAX(name) FROM t", "c"},
+		{"SELECT COUNT(*) FROM t WHERE id = 2", int64(1)},
+	}
+	for _, tc := range cases {
+		res, err := e.Execute(context.Background(), tc.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.sql, err)
+		}
+		if len(res.Rows) != 1 || len(res.Rows[0]) != 1 || res.Rows[0][0] != tc.want {
+			t.Fatalf("%q = %+v, want %v", tc.sql, res.Rows, tc.want)
+		}
+	}
+}

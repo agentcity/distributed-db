@@ -417,3 +417,36 @@ func TestParseIndexStatements(t *testing.T) {
 		t.Fatal("CREATE INDEX without column accepted")
 	}
 }
+
+func TestParseAggregates(t *testing.T) {
+	cases := []struct {
+		sql  string
+		fn   string
+		col  string
+		star bool
+	}{
+		{"SELECT COUNT(*) FROM users", "COUNT", "", true},
+		{"SELECT count(id) FROM users", "COUNT", "id", false},
+		{"SELECT SUM(amount) FROM orders WHERE id = 1", "SUM", "amount", false},
+		{"SELECT AVG(amount) FROM orders", "AVG", "amount", false},
+		{"SELECT MIN(name) FROM users", "MIN", "name", false},
+		{"SELECT MAX(name) FROM users", "MAX", "name", false},
+	}
+	for _, tc := range cases {
+		stmt, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.sql, err)
+		}
+		sel, ok := stmt.(*Select)
+		if !ok || sel.Aggregate == nil {
+			t.Fatalf("%q: aggregate not parsed: %#v", tc.sql, stmt)
+		}
+		a := sel.Aggregate
+		if a.Func != tc.fn || a.Column != tc.col || a.Star != tc.star {
+			t.Fatalf("%q: aggregate = %+v", tc.sql, a)
+		}
+	}
+	if _, err := Parse("SELECT SUM(*) FROM users"); err == nil {
+		t.Fatal("SUM(*) accepted")
+	}
+}

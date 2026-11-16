@@ -306,12 +306,57 @@ func (p *parser) parseInsert() (Statement, error) {
 	return &Insert{Table: table.text, Columns: columns, Values: values}, nil
 }
 
+// tryParseAggregate recognizes COUNT(*)/COUNT(col)/SUM/AVG/MIN/MAX(col).
+func (p *parser) tryParseAggregate() (*Aggregate, bool, error) {
+	t := p.peek()
+	if t.kind != tokenIdent {
+		return nil, false, nil
+	}
+	fn := strings.ToUpper(t.text)
+	switch fn {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+	default:
+		return nil, false, nil
+	}
+	// Only treat it as an aggregate when followed by '('; otherwise it is a
+	// normal column named count/sum/...
+	if p.pos+1 >= len(p.toks) || p.toks[p.pos+1].kind != tokenLParen {
+		return nil, false, nil
+	}
+	p.next() // function
+	if _, err := p.expectKind(tokenLParen, "'('"); err != nil {
+		return nil, false, err
+	}
+	agg := &Aggregate{Func: fn}
+	if p.peek().kind == tokenStar {
+		if fn != "COUNT" {
+			return nil, false, p.errorf(p.peek().pos, "%s(*) is not supported", fn)
+		}
+		p.next()
+		agg.Star = true
+	} else {
+		col, err := p.expectIdent("column name")
+		if err != nil {
+			return nil, false, err
+		}
+		agg.Column = col.text
+	}
+	if _, err := p.expectKind(tokenRParen, "')'"); err != nil {
+		return nil, false, err
+	}
+	return agg, true, nil
+}
+
 // parseSelect parses SELECT *|col[, ...] FROM name [WHERE ...] [LIMIT n].
 func (p *parser) parseSelect() (Statement, error) {
 	sel := &Select{}
 	if p.peek().kind == tokenStar {
 		p.next()
 		sel.Columns = []string{"*"}
+	} else if agg, ok, err := p.tryParseAggregate(); err != nil {
+		return nil, err
+	} else if ok {
+		sel.Aggregate = agg
 	} else {
 		for {
 			col, err := p.expectIdent("column name")

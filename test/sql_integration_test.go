@@ -77,6 +77,10 @@ func TestSQLP0OnKV(t *testing.T) {
 	if len(res.Rows) != 2 || res.Rows[0][1] != "alice" {
 		t.Fatalf("SQL select = %+v", res)
 	}
+	res = exec("SELECT COUNT(*) FROM users")
+	if len(res.Rows) != 1 || res.Rows[0][0] != int64(2) {
+		t.Fatalf("SQL count = %+v", res)
+	}
 	res = exec("SELECT name FROM users WHERE id = 2")
 	if len(res.Rows) != 1 || res.Rows[0][0] != "bob" {
 		t.Fatalf("SQL point select = %+v", res)

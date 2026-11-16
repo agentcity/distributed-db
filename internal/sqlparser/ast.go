@@ -54,12 +54,20 @@ type Insert struct {
 
 func (Insert) isStatement() {}
 
+// Aggregate is a single aggregate projection such as COUNT(*) or SUM(col).
+type Aggregate struct {
+	Func   string // COUNT, SUM, AVG, MIN, MAX
+	Column string // empty for COUNT(*)
+	Star   bool
+}
+
 // Select reads rows.
 type Select struct {
-	Table   string
-	Columns []string // empty or ["*"] means all columns
-	Where   *Condition
-	Limit   int
+	Table     string
+	Columns   []string // empty or ["*"] means all columns
+	Aggregate *Aggregate
+	Where     *Condition
+	Limit     int
 }
 
 func (Select) isStatement() {}

@@ -357,6 +357,9 @@ func (e *Engine) selectRows(ctx context.Context, tx Txn, s sqlparser.Select) (*R
 	if err != nil {
 		return nil, err
 	}
+	if s.Aggregate != nil {
+		return e.aggregate(ctx, tx, schema, s)
+	}
 	cols, err := selectColumns(schema, s.Columns)
 	if err != nil {
 		return nil, err
@@ -378,6 +381,68 @@ func (e *Engine) selectRows(ctx context.Context, tx Txn, s sqlparser.Select) (*R
 		names = append(names, col.Name)
 	}
 	return &Result{Columns: names, Rows: out}, nil
+}
+
+func (e *Engine) aggregate(ctx context.Context, tx Txn, schema *Schema, s sqlparser.Select) (*Result, error) {
+	rows, err := e.readRows(ctx, tx, schema, s.Where, 0)
+	if err != nil {
+		return nil, err
+	}
+	fn := strings.ToUpper(s.Aggregate.Func)
+	name := strings.ToLower(fn)
+	if s.Aggregate.Star {
+		if fn != "COUNT" {
+			return nil, fmt.Errorf("%w: %s(*)", ErrUnsupported, fn)
+		}
+		return &Result{Columns: []string{name}, Rows: [][]any{{int64(len(rows))}}}, nil
+	}
+	ci, ok := columnIndex(schema, strings.ToLower(s.Aggregate.Column))
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, s.Aggregate.Column)
+	}
+	col := schema.Columns[ci]
+	if (fn == "SUM" || fn == "AVG") && col.Type != "INT" {
+		return nil, fmt.Errorf("%w: %s requires INT", ErrBadColumn, fn)
+	}
+	if fn == "COUNT" {
+		return &Result{Columns: []string{name}, Rows: [][]any{{int64(len(rows))}}}, nil
+	}
+	if len(rows) == 0 {
+		return &Result{Columns: []string{name}, Rows: [][]any{{nil}}}, nil
+	}
+	switch fn {
+	case "SUM", "AVG":
+		var sum int64
+		for _, row := range rows {
+			n, _ := row[col.Name].(int64)
+			sum += n
+		}
+		if fn == "AVG" {
+			return &Result{Columns: []string{name}, Rows: [][]any{{sum / int64(len(rows))}}}, nil
+		}
+		return &Result{Columns: []string{name}, Rows: [][]any{{sum}}}, nil
+	case "MIN", "MAX":
+		if col.Type == "INT" {
+			best, _ := rows[0][col.Name].(int64)
+			for _, row := range rows[1:] {
+				n, _ := row[col.Name].(int64)
+				if (fn == "MIN" && n < best) || (fn == "MAX" && n > best) {
+					best = n
+				}
+			}
+			return &Result{Columns: []string{name}, Rows: [][]any{{best}}}, nil
+		}
+		best, _ := rows[0][col.Name].(string)
+		for _, row := range rows[1:] {
+			v, _ := row[col.Name].(string)
+			if (fn == "MIN" && v < best) || (fn == "MAX" && v > best) {
+				best = v
+			}
+		}
+		return &Result{Columns: []string{name}, Rows: [][]any{{best}}}, nil
+	default:
+		return nil, fmt.Errorf("%w: aggregate %s", ErrUnsupported, fn)
+	}
 }
 
 func (e *Engine) update(ctx context.Context, tx Txn, s sqlparser.Update) (*Result, error) {
