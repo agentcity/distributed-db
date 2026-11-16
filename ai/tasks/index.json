@@ -190,5 +190,11 @@
     "title": "Stage 4 — write path speed",
     "status": "done",
     "file": "0032-write-path-speed.md"
+  },
+  {
+    "id": "0033",
+    "title": "Stage 4 — batch entry и pipelining",
+    "status": "in_progress",
+    "file": "0033-batch-commit.md"
   }
 ]
