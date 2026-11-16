@@ -1,9 +1,11 @@
 # Продуктовая оценка и путь к production
 
 - Дата: 2026-11-16
-- Состояние кода: HEAD `4050504`
-- Область: v1 (`cmd/db`, координатор + hash-шардинг) и v2 (`cmd/kv2`,
-  `cmd/sqlsrv`, `cmd/pgsrv`, `cmd/kvbackup`, `cmd/metricsrv`).
+- Состояние кода: HEAD `13c03c2`
+- Область: v1 (`cmd/db`), v2 (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`,
+  `cmd/kvbackup`, `cmd/metricsrv`), edge hash cache (`cmd/edgehash`) и
+  mobile scaffold.
+- Полная оценка и применимость: [ASSESSMENT.md](ASSESSMENT.md).
 
 ## 1. Короткий вердикт
 
@@ -15,6 +17,10 @@ dynamic membership, chunked snapshots, SQL P0 и pgwire.
 По зрелости — **pre-alpha / internal prototype**. По архитектуре — mini-TiKV +
 mini-TiDB/CockroachDB. По применимости — private single-tenant хранилище для
 внутренних задач с низкими требованиями к SLA, а не публичный DBaaS.
+
+Отдельно: **edge hash cache** (`cmd/edgehash`) — более узкий, но более
+готовый продукт для read-only membership (Bloom + Merkle + Ed25519). Mobile
+SDK — scaffold, не production.
 
 ## 2. Что уже есть
 
@@ -35,6 +41,8 @@ mini-TiDB/CockroachDB. По применимости — private single-tenant �
 | Backup/restore | есть, логический | `cmd/kvbackup`, без PITR |
 | Read barrier / lease reads | есть | линеаризуемые чтения с лидера |
 | Follower reads | нет | |
+| Batch entry / `CommitBatch` | есть | несколько txn в одном Raft-entry; не atomic batch |
+| TLS/mTLS, auth, audit (v2) | **нет** | pgwire без TLS/паролей |
 
 ### SQL/API
 
@@ -57,8 +65,8 @@ mini-TiDB/CockroachDB. По применимости — private single-tenant �
 | Prometheus-метрики KV/SQL/pgwire, SLO p50/p95/p99 | есть |
 | `/metrics`, `/debug/slo` в sqlsrv/pgsrv | есть |
 | Jepsen kill/restart, partitions, clock skew (client-side) | есть, opt-in |
-| TLS/mTLS, authn/authz, audit | **нет** |
-| Multi-tenancy, quotas, rate limits | **нет** |
+| TLS/mTLS, authn/authz, audit | **нет** (v1 HTTP — Basic/TLS; v2 — нет; edgehash — TLS/Bearer) |
+| Multi-tenancy, quotas, rate limits | **нет** (edgehash — per-IP rate limit) |
 | PITR/continuous backup, restore drills | **нет** |
 | Helm/operator, rolling upgrade/rollback | **нет** |
 | Encryption at rest, secrets management | **нет** |
@@ -81,6 +89,14 @@ mini-TiDB/CockroachDB. По применимости — private single-tenant �
 6. **SQL-песочница** для небольших таблиц (10⁴–10⁵ строк), psql simple/extended,
    аналитика на маленьких данных.
 
+### Edge hash cache
+
+Подходит для read-only membership: дедупликация, blocklists, проверка
+«видели ли объект», content-addressed наборы. Есть Bloom, Merkle,
+non-membership proofs, Ed25519, zstd, TLS/Bearer/rate limit, CDN headers,
+crash-atomic cache. Mobile SDK — scaffold: не собран и не проверен на
+устройствах; нет zstd/absence/Bearer/Range.
+
 ### Не подходит
 
 - публичный DBaaS и multi-tenant;
@@ -90,7 +106,10 @@ mini-TiDB/CockroachDB. По применимости — private single-tenant �
 - нагрузка «10k–30k ops/s, p99 < 20 ms» без отдельного SLO-прогона;
 - данные, где потеря/частичная видимость недопустима: current membership и
   cross-range 2PC ещё MVP;
-- замена PostgreSQL/TiDB «из коробки».
+- замена PostgreSQL/TiDB «из коробки»;
+- хранение весов DeepSeek и инференс из БД;
+- телефоны как узлы консенсуса или source of truth;
+- динамический hash-set с удалениями без нового поколения сегментов.
 
 ## 4. Что мешает назвать это production
 
@@ -131,8 +150,10 @@ mini-TiDB/CockroachDB. По применимости — private single-tenant �
 
 6. **SLO/performance**
    - нет воспроизводимого p99-прогона на 3 узлах и 1 ТБ;
-   - текущие замеры: ~40 мс/транзакция sequential, ~350 tx/s parallel,
-     Get ~0.15–1 мс; целевые 10k–30k ops/s не подтверждены;
+   - текущие замеры (M1 Pro/loopback): ~11.6 мс single txn (~86 tx/s),
+     ~1.8 мс/op parallel (~5.5k tx/s), batch 256 ~0.15 мс/txn
+     (~6.6–6.9k tx/s); PostgreSQL 13 рядом — ~6.8k tx/s на 10 клиентах;
+   - это не SLO: нет реальной сети, p99, 1 ТБ soak;
    - нет follower reads и parallel query.
 
 ### P1 — продуктовая зрелость
@@ -228,6 +249,9 @@ Multi-tenancy, billing, quotas, compliance, geo, support, SLA-контракты
 
 ## 9. Ссылки
 
+- [ASSESSMENT.md](ASSESSMENT.md)
+- [EDGE-HASH-CACHE.md](EDGE-HASH-CACHE.md)
+- [PERFORMANCE.md](PERFORMANCE.md)
 - [ROADMAP.md](ROADMAP.md)
 - [ARCHITECTURE-TARGET.md](ARCHITECTURE-TARGET.md)
 - [CONTRACTS-V2.md](CONTRACTS-V2.md)
