@@ -250,5 +250,17 @@
     "title": "Sprint 2 аудит",
     "status": "done",
     "file": "0042-sprint-2-audit.md"
+  },
+  {
+    "id": "0043",
+    "title": "README status accuracy",
+    "status": "done",
+    "file": "0043-readme-status-accuracy.md"
+  },
+  {
+    "id": "0044",
+    "title": "Один Pebble batch/fsync на Raft-батч",
+    "status": "done",
+    "file": "0044-sync-batch-fsync.md"
   }
 ]
