@@ -18,35 +18,38 @@ import (
 // PostgreSQL protocol message types used by this server. Frontend and backend
 // messages share the same one-byte type space but travel in opposite
 // directions, so 'S' (Sync vs. ParameterStatus) and 'D' (Describe vs. DataRow)
-// intentionally appear twice.
+// intentionally appear twice. Authentication requests and AuthenticationOk
+// both use backend type 'R'; the four-byte body code distinguishes them.
 const (
 	// Frontend messages.
-	msgQuery     byte = 'Q'
-	msgParse     byte = 'P'
-	msgBind      byte = 'B'
-	msgDescribe  byte = 'D'
-	msgExecute   byte = 'E'
-	msgSync      byte = 'S'
-	msgClose     byte = 'C'
-	msgFlush     byte = 'H'
-	msgTerminate byte = 'X'
+	msgQuery           byte = 'Q'
+	msgParse           byte = 'P'
+	msgBind            byte = 'B'
+	msgDescribe        byte = 'D'
+	msgExecute         byte = 'E'
+	msgSync            byte = 'S'
+	msgClose           byte = 'C'
+	msgFlush           byte = 'H'
+	msgTerminate       byte = 'X'
+	msgPasswordMessage byte = 'p'
 
 	// Backend messages.
-	msgAuthenticationOk     byte = 'R'
-	msgParameterStatus      byte = 'S'
-	msgBackendKeyData       byte = 'K'
-	msgReadyForQuery        byte = 'Z'
-	msgRowDescription       byte = 'T'
-	msgDataRow              byte = 'D'
-	msgCommandComplete      byte = 'C'
-	msgErrorResponse        byte = 'E'
-	msgEmptyQueryResponse   byte = 'I'
-	msgParseComplete        byte = '1'
-	msgBindComplete         byte = '2'
-	msgCloseComplete        byte = '3'
-	msgParameterDescription byte = 't'
-	msgNoData               byte = 'n'
-	msgPortalSuspended      byte = 's'
+	msgAuthenticationRequest byte = 'R'
+	msgAuthenticationOk      byte = 'R'
+	msgParameterStatus       byte = 'S'
+	msgBackendKeyData        byte = 'K'
+	msgReadyForQuery         byte = 'Z'
+	msgRowDescription        byte = 'T'
+	msgDataRow               byte = 'D'
+	msgCommandComplete       byte = 'C'
+	msgErrorResponse         byte = 'E'
+	msgEmptyQueryResponse    byte = 'I'
+	msgParseComplete         byte = '1'
+	msgBindComplete          byte = '2'
+	msgCloseComplete         byte = '3'
+	msgParameterDescription  byte = 't'
+	msgNoData                byte = 'n'
+	msgPortalSuspended       byte = 's'
 )
 
 // columnDesc is the subset of a RowDescription field this server produces.

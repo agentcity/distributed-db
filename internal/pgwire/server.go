@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -52,6 +53,11 @@ type pgwireMetrics struct {
 type Server struct {
 	engine *sqlengine.Engine
 	logger *slog.Logger
+
+	// tlsConfig and auth are immutable after construction (NewWithConfig).
+	// A nil tlsConfig means plain TCP; a nil auth means no authentication.
+	tlsConfig *tls.Config
+	auth      *authenticator
 
 	metrics atomic.Pointer[pgwireMetrics]
 
@@ -179,8 +185,30 @@ func (s *Server) Start(addr string) (string, error) {
 	s.wg.Add(1)
 	s.mu.Unlock()
 
+	if s.tlsConfig != nil {
+		// TLS is terminated at the listener. Clients must begin the TLS
+		// handshake immediately (direct TLS); the PostgreSQL SSLRequest
+		// in-band upgrade is still declined with 'N' because the channel is
+		// already encrypted by the time protocol negotiation starts.
+		ln = tls.NewListener(ln, s.tlsConfig)
+	}
+
 	go s.acceptLoop(ln)
 	return actual, nil
+}
+
+// TLSConfig returns a clone of the active TLS configuration, or nil when the
+// server listens with plain TCP.
+func (s *Server) TLSConfig() *tls.Config {
+	if s == nil || s.tlsConfig == nil {
+		return nil
+	}
+	return s.tlsConfig.Clone()
+}
+
+// AuthEnabled reports whether the server requires password authentication.
+func (s *Server) AuthEnabled() bool {
+	return s != nil && s.auth != nil
 }
 
 // Addr returns the address the server is listening on, or an empty string if
@@ -264,6 +292,25 @@ func (s *Server) acceptLoop(ln net.Listener) {
 
 func (s *Server) handleConn(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
+
+	// Complete the TLS handshake explicitly so handshake failures are
+	// reported as such and the startup timeout applies to them. Without this,
+	// the failure would surface as a generic startup read error.
+	if tc, ok := conn.(*tls.Conn); ok {
+		_ = conn.SetDeadline(time.Now().Add(startupTimeout))
+		err := tc.HandshakeContext(s.ctx)
+		_ = conn.SetDeadline(time.Time{})
+		if err != nil {
+			s.logger.Debug("pgwire: TLS handshake failed", "remote", remote, "err", err)
+			return
+		}
+		state := tc.ConnectionState()
+		s.logger.Debug("pgwire: TLS established",
+			"remote", remote,
+			"version", tls.VersionName(state.Version),
+			"cipher", tls.CipherSuiteName(state.CipherSuite))
+	}
+
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
 
@@ -375,7 +422,10 @@ func (s *Server) startup(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (map
 		code := binary.BigEndian.Uint32(body[:4])
 		switch code {
 		case sslRequestCode, gssEncRequestCode:
-			// Decline encryption; the client then retries in plaintext.
+			// TLS, when configured, is already active at the listener: there
+			// is no in-band upgrade to negotiate, so decline and let the
+			// client continue on the current (possibly encrypted) channel.
+			// On plain-TCP listeners this is the historical "no TLS" reply.
 			if _, err := bw.Write([]byte{'N'}); err != nil {
 				return nil, err
 			}
@@ -389,6 +439,11 @@ func (s *Server) startup(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (map
 			params, err := parseStartupParams(body[4:])
 			if err != nil {
 				return nil, err
+			}
+			if s.auth != nil {
+				if err := s.authenticate(br, bw, params["user"]); err != nil {
+					return nil, err
+				}
 			}
 			if err := s.sendStartupResponses(bw); err != nil {
 				return nil, err
@@ -409,6 +464,64 @@ func (s *Server) startup(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (map
 		}
 	}
 	return nil, fmt.Errorf("%w: too many startup negotiation packets", errBadMessage)
+}
+
+// authCleartextPassword is the AuthenticationCleartextPassword request code
+// carried in an AuthenticationRequest ('R') message.
+const authCleartextPassword uint32 = 3
+
+var errAuthenticationFailed = errors.New("pgwire: password authentication failed")
+
+// authenticate asks the client for a cleartext password and verifies it. The
+// startup read deadline set by startup covers this exchange. It never logs or
+// includes the supplied password in errors.
+func (s *Server) authenticate(br *bufio.Reader, bw *bufio.Writer, user string) error {
+	var req [4]byte
+	binary.BigEndian.PutUint32(req[:], authCleartextPassword)
+	if err := writeMessage(bw, msgAuthenticationRequest, req[:]); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+
+	typ, body, err := readMessage(br)
+	if err != nil {
+		return err
+	}
+	if typ != msgPasswordMessage {
+		werr := writeError(bw, "08P01", "pgwire: expected PasswordMessage during authentication")
+		if werr != nil {
+			return werr
+		}
+		if werr := bw.Flush(); werr != nil {
+			return werr
+		}
+		return fmt.Errorf("%w: expected PasswordMessage, got %q", errBadMessage, typ)
+	}
+	password, rest, ok := readCString(body)
+	if !ok || len(rest) != 0 {
+		werr := writeError(bw, "08P01", "pgwire: malformed PasswordMessage")
+		if werr != nil {
+			return werr
+		}
+		if werr := bw.Flush(); werr != nil {
+			return werr
+		}
+		return fmt.Errorf("%w: malformed PasswordMessage", errBadMessage)
+	}
+
+	if !s.auth.verify(user, password) {
+		werr := writeError(bw, "28P01", fmt.Sprintf("password authentication failed for user %q", user))
+		if werr != nil {
+			return werr
+		}
+		if werr := bw.Flush(); werr != nil {
+			return werr
+		}
+		return errAuthenticationFailed
+	}
+	return nil
 }
 
 func (s *Server) sendStartupResponses(w io.Writer) error {

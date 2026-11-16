@@ -136,7 +136,28 @@ func makeStartupPacket(code uint32, params map[string]string) []byte {
 	return append(out, body...)
 }
 
+// startupError preserves the SQLSTATE from an ErrorResponse so tests can
+// assert both the code and the message.
+type startupError struct {
+	code    string
+	message string
+}
+
+func (e *startupError) Error() string {
+	return fmt.Sprintf("startup error: %s: %s", e.code, e.message)
+}
+
 func startupConn(conn net.Conn, params map[string]string) (map[string]string, error) {
+	return startupConnWithPassword(conn, params, "", false)
+}
+
+// startupConnAuthed performs startup and answers a cleartext password
+// AuthenticationRequest with password.
+func startupConnAuthed(conn net.Conn, params map[string]string, password string) (map[string]string, error) {
+	return startupConnWithPassword(conn, params, password, true)
+}
+
+func startupConnWithPassword(conn net.Conn, params map[string]string, password string, passwordAllowed bool) (map[string]string, error) {
 	for _, req := range []uint32{gssEncRequestCode, sslRequestCode} {
 		if _, err := conn.Write(makeStartupPacket(req, nil)); err != nil {
 			return nil, err
@@ -161,8 +182,21 @@ func startupConn(conn net.Conn, params map[string]string) (map[string]string, er
 		}
 		switch typ {
 		case msgAuthenticationOk:
-			if len(body) != 4 || binary.BigEndian.Uint32(body) != 0 {
-				return nil, fmt.Errorf("AuthenticationOk body = %x", body)
+			if len(body) != 4 {
+				return nil, fmt.Errorf("Authentication request body = %x, want 4 bytes", body)
+			}
+			switch code := binary.BigEndian.Uint32(body); code {
+			case 0:
+				// AuthenticationOk.
+			case authCleartextPassword:
+				if !passwordAllowed {
+					return nil, errors.New("server requested a cleartext password but no password was supplied")
+				}
+				if err := writeMessage(conn, msgPasswordMessage, appendCString(nil, password)); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, fmt.Errorf("unsupported authentication request code %d", code)
 			}
 		case msgParameterStatus:
 			key, rest, ok := readCString(body)
@@ -184,7 +218,8 @@ func startupConn(conn net.Conn, params map[string]string) (map[string]string, er
 			}
 			return statuses, nil
 		case msgErrorResponse:
-			return nil, fmt.Errorf("startup error: %s", errorFields(body)['M'])
+			fields := errorFields(body)
+			return nil, &startupError{code: fields['C'], message: fields['M']}
 		default:
 			return nil, fmt.Errorf("unexpected startup message %q", typ)
 		}
