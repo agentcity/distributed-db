@@ -79,9 +79,9 @@ committed/rolled-back/expired locks.
 
 ### SQL P0 поверх KV (experimental)
 
-Минимальный SQL-слой: `CREATE/DROP TABLE`, `INSERT`, `SELECT` (projection,
-`WHERE pk = ...`, `LIMIT`), `UPDATE`, `DELETE`. Каталог и строки лежат в KV,
-каждая команда — транзакция.
+Минимальный SQL-слой: `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, `INSERT`,
+`SELECT` (projection, `WHERE` по PK или indexed-колонке, `LIMIT`), `UPDATE`,
+`DELETE`. Каталог, строки и индексы лежат в KV, каждая команда — транзакция.
 
 ```bash
 go build -o bin/sqlsrv ./cmd/sqlsrv
@@ -96,8 +96,7 @@ curl -s -X POST localhost:8080/v1/sql \
   -d '{"sql":"SELECT * FROM users"}'
 ```
 
-P0 не умеет secondary indexes, JOIN, aggregates и pgwire; это следующие
-фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
+P0 не умеет JOIN, aggregates и pgwire; это следующие фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 

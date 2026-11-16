@@ -212,6 +212,7 @@ Multi-Raft host внутри одного процесса, переезд meta/
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
 Осталось: клиентские методы, фоновый GC locks, stress/Jepsen.
 
-В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV и
-HTTP `POST /v1/sql`; e2e CREATE/INSERT/SELECT/UPDATE/DELETE прошёл.
-Осталось: secondary indexes, JOIN/aggregates, pgwire, SQL на 3 узлах.
+В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV,
+HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
+колонке); e2e CREATE/INSERT/SELECT/UPDATE/DELETE прошёл.
+Осталось: JOIN/aggregates, pgwire, SQL на 3 узлах.
