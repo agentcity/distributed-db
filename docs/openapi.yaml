@@ -1,0 +1,173 @@
+openapi: 3.0.3
+info:
+  title: Distributed DB coordinator API
+  version: 0.2.0
+  description: |
+    HTTP API of the coordinator. The coordinator hashes the key to a shard,
+    finds the current Raft leader and proxies the request. Requests are
+    retried on leader changes.
+
+    Demo credentials: admin / admin. Configure real credentials with
+    `-auth-user` / `-auth-pass` and put TLS in front of the coordinator.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - basicAuth: []
+tags:
+  - name: kv
+  - name: ops
+paths:
+  /health:
+    get:
+      tags: [ops]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Coordinator is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /v1/status:
+    get:
+      tags: [ops]
+      summary: Shard map, cached leaders and reported loads
+      security: []
+      responses:
+        "200":
+          description: Coordinator status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+  /v1/kv/{key}:
+    parameters:
+      - $ref: "#/components/parameters/Key"
+    put:
+      tags: [kv]
+      summary: Store a value
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored
+        "201":
+          description: Stored
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Key or value is too large
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/NoLeader"
+    get:
+      tags: [kv]
+      summary: Read a value
+      responses:
+        "200":
+          description: Value
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Key not found
+        "503":
+          $ref: "#/components/responses/NoLeader"
+    delete:
+      tags: [kv]
+      summary: Delete a key
+      responses:
+        "200":
+          description: Deleted
+        "204":
+          description: Deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/NoLeader"
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+  parameters:
+    Key:
+      name: key
+      in: path
+      required: true
+      description: Key inside the shard; hashed with xxhash to select the shard.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+    RateLimited:
+      description: Rate limit exceeded
+    NoLeader:
+      description: No leader for the shard after retries
+      headers:
+        X-Leader:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        leader:
+          type: string
+    Status:
+      type: object
+      properties:
+        leaders:
+          type: object
+          additionalProperties:
+            type: string
+        shards:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        loads:
+          type: array
+          items:
+            type: object
+            properties:
+              node:
+                type: string
+              shard:
+                type: string
+              load:
+                type: number
+              ops:
+                type: integer
+              updated_at:
+                type: string
+                format: date-time

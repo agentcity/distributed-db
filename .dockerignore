@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+data
+bin
+*.md
+**/*.md
+.DS_Store
+**/.DS_Store
+*.out
+coverage.*
