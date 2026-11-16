@@ -35,6 +35,15 @@ type Config struct {
 	ElectionTimeoutMax time.Duration // e.g. 600ms
 	HeartbeatInterval  time.Duration // e.g. 100ms
 	Logger             *slog.Logger
+
+	// ProposeBatchWindow is how long the leader waits for more concurrent
+	// proposals before committing a batch to the LogStore. It bounds the
+	// added latency of a lone proposal. Zero or negative selects the default
+	// (1ms); the window never delays a batch that is already full.
+	ProposeBatchWindow time.Duration
+	// ProposeBatchMax is the maximum number of proposals coalesced into one
+	// durable append. Zero or negative selects the default (64).
+	ProposeBatchMax int
 }
 
 // Status is a point-in-time view of a node.
@@ -167,6 +176,19 @@ type LogStore interface {
 	SaveMeta(term uint64, votedFor string) error
 	Append(entries ...model.Entry) error
 	Truncate(fromIndex uint64) error
+}
+
+// BatchAppender is the optional LogStore capability used for group commit. A
+// store that implements it can persist a contiguous batch of entries with one
+// durable write (one fsync for FileStore) instead of one append per proposal.
+//
+// AppendBatch is all-or-nothing: on error the durable log must be unchanged
+// and the batch must not be retried by the caller; the caller fails every
+// proposal in that batch. Stores that do not implement BatchAppender keep
+// working through LogStore.Append, which Node falls back to one entry at a
+// time.
+type BatchAppender interface {
+	AppendBatch(entries []model.Entry) error
 }
 
 var (

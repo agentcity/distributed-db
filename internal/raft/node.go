@@ -13,11 +13,31 @@ import (
 	"distributed-db/internal/model"
 )
 
-// proposal tracks one client proposal until it is applied or abandoned.
+// proposal tracks one client proposal from enqueue until it is applied or
+// abandoned. done is closed exactly once, while holding Node.mu, after err and
+// index have been set; every other field is guarded by Node.mu.
 type proposal struct {
-	done chan struct{}
-	err  error
+	done  chan struct{}
+	err   error
+	index uint64
+	ctx   context.Context
+	cmd   model.Entry // Type/Key/Value only; Term/Index are assigned by Raft
+	// completed is set when done is closed, so callers that raced context
+	// cancellation or Stop can tell a finished proposal from a queued one.
+	completed bool
+	// canceled is set when the waiter gave up before its batch was assigned;
+	// the drain loop then drops it without consuming a log index.
+	canceled bool
 }
+
+const (
+	// defaultProposeBatchWindow bounds how long a lone proposal waits for
+	// concurrent proposals to coalesce with. It is deliberately tiny: every
+	// proposal pays it once.
+	defaultProposeBatchWindow = time.Millisecond
+	// defaultProposeBatchMax caps one durable append / replication batch.
+	defaultProposeBatchMax = 64
+)
 
 // Node is a single Raft replica.
 //
@@ -47,6 +67,13 @@ type Node struct {
 	lastAck          map[string]time.Time
 	triggers         map[string]chan struct{}
 	pending          map[uint64]*proposal
+
+	// proposeQueue and proposeSignal implement group commit. Both are guarded
+	// by mu. Propose enqueues under mu (no I/O) and then waits without mu; the
+	// single proposeLoop goroutine coalesces queued proposals and performs one
+	// durable batch append.
+	proposeQueue  []*proposal
+	proposeSignal chan struct{}
 
 	// applyMu serialises state-machine mutations (Apply) against snapshot
 	// creation and installation, so a snapshot can never interleave with an
@@ -90,6 +117,12 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 	if cfg.HeartbeatInterval <= 0 {
 		return nil, errors.New("raft: heartbeat interval must be positive")
 	}
+	if cfg.ProposeBatchWindow <= 0 {
+		cfg.ProposeBatchWindow = defaultProposeBatchWindow
+	}
+	if cfg.ProposeBatchMax <= 0 {
+		cfg.ProposeBatchMax = defaultProposeBatchMax
+	}
 
 	state, err := store.Load()
 	if err != nil {
@@ -123,25 +156,26 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	n := &Node{
-		cfg:         cfg,
-		store:       store,
-		sm:          sm,
-		tr:          tr,
-		logger:      logger,
-		term:        state.Term,
-		votedFor:    state.VotedFor,
-		entries:     cloneEntries(state.Entries),
-		snapshot:    cloneSnapshot(snap),
-		commitIndex: snap.Index,
-		lastApplied: snap.Index,
-		role:        Follower,
-		votes:       make(map[string]bool),
-		nextIndex:   make(map[string]uint64),
-		matchIndex:  make(map[string]uint64),
-		lastAck:     make(map[string]time.Time),
-		triggers:    make(map[string]chan struct{}),
-		pending:     make(map[uint64]*proposal),
-		stopCh:      make(chan struct{}),
+		cfg:           cfg,
+		store:         store,
+		sm:            sm,
+		tr:            tr,
+		logger:        logger,
+		term:          state.Term,
+		votedFor:      state.VotedFor,
+		entries:       cloneEntries(state.Entries),
+		snapshot:      cloneSnapshot(snap),
+		commitIndex:   snap.Index,
+		lastApplied:   snap.Index,
+		role:          Follower,
+		votes:         make(map[string]bool),
+		nextIndex:     make(map[string]uint64),
+		matchIndex:    make(map[string]uint64),
+		lastAck:       make(map[string]time.Time),
+		triggers:      make(map[string]chan struct{}),
+		pending:       make(map[uint64]*proposal),
+		stopCh:        make(chan struct{}),
+		proposeSignal: make(chan struct{}, 1),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	return n, nil
@@ -169,7 +203,7 @@ func (n *Node) Start(ctx context.Context) error {
 	n.resetElectionDeadlineLocked()
 	// Add before releasing mu: Stop sets stopped under mu before waiting, so
 	// no Add can race with Wait.
-	n.wg.Add(3)
+	n.wg.Add(4)
 	n.mu.Unlock()
 
 	go func() {
@@ -179,6 +213,10 @@ func (n *Node) Start(ctx context.Context) error {
 	go func() {
 		defer n.wg.Done()
 		n.applyLoop()
+	}()
+	go func() {
+		defer n.wg.Done()
+		n.proposeLoop()
 	}()
 	go func() {
 		defer n.wg.Done()
@@ -211,6 +249,7 @@ func (n *Node) stop() {
 	}
 	n.cancelLeaderLocked()
 	n.failPendingLocked(ErrStopped)
+	n.failQueuedLocked(ErrStopped)
 	n.applyCond.Broadcast()
 	n.mu.Unlock()
 	close(n.stopCh)
@@ -218,6 +257,11 @@ func (n *Node) stop() {
 
 // Propose appends cmd on the leader and returns only after the entry is
 // committed and applied. Term/Index are filled in by Raft.
+//
+// Propose itself performs no disk I/O: it validates leadership under mu, puts
+// the proposal on the group-commit queue and waits. A single drain goroutine
+// assigns contiguous indices and appends all proposals collected in the
+// batching window with one durable LogStore call.
 func (n *Node) Propose(ctx context.Context, cmd model.Entry) (uint64, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -231,23 +275,16 @@ func (n *Node) Propose(ctx context.Context, cmd model.Entry) (uint64, error) {
 		n.mu.Unlock()
 		return 0, ErrNotLeader
 	}
-	index := n.lastIndexLocked() + 1
-	entry := cloneEntry(model.Entry{
-		Term:  n.term,
-		Index: index,
-		Type:  cmd.Type,
-		Key:   cmd.Key,
-		Value: cmd.Value,
-	})
-	if err := n.store.Append(entry); err != nil {
-		n.mu.Unlock()
-		return 0, fmt.Errorf("raft: append proposal: %w", err)
+	p := &proposal{
+		done: make(chan struct{}),
+		ctx:  ctx,
+		cmd:  cloneEntry(cmd),
 	}
-	n.entries = append(n.entries, entry)
-	p := &proposal{done: make(chan struct{})}
-	n.pending[index] = p
-	n.signalAllLocked()
-	n.maybeCommitLocked()
+	n.proposeQueue = append(n.proposeQueue, p)
+	select {
+	case n.proposeSignal <- struct{}{}:
+	default:
+	}
 	n.mu.Unlock()
 
 	select {
@@ -255,35 +292,62 @@ func (n *Node) Propose(ctx context.Context, cmd model.Entry) (uint64, error) {
 		if p.err != nil {
 			return 0, p.err
 		}
-		return index, nil
+		return p.index, nil
 	case <-n.stopCh:
 		n.mu.Lock()
-		stillPending := n.pending[index] == p
+		completed, index, err := p.completed, p.index, p.err
 		n.mu.Unlock()
-		if stillPending {
-			return 0, ErrStopped
+		if completed {
+			if err != nil {
+				return 0, err
+			}
+			return index, nil
 		}
+		// Not durable yet; the drain loop will fail the queued/collected
+		// proposal. The caller must not receive an index.
+		return 0, ErrStopped
+	case <-ctx.Done():
+		return n.abandonProposal(p, ctx)
+	}
+}
+
+// abandonProposal removes one waiter from the pipeline after its context ended.
+// If the entry is already durable (pending) it leaves it in the log, matching
+// the pre-batching behavior: a timed-out proposal may still commit and apply.
+// If the proposal is still queued, it is marked canceled so the drain loop does
+// not assign it a log index.
+func (n *Node) abandonProposal(p *proposal, ctx context.Context) (uint64, error) {
+	waitErr := proposalContextError(ctx)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	switch {
+	case p.completed:
 		if p.err != nil {
 			return 0, p.err
 		}
-		return index, nil
-	case <-ctx.Done():
-		n.mu.Lock()
-		if n.pending[index] == p {
-			delete(n.pending, index)
-			n.mu.Unlock()
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return 0, ErrTimeout
-			}
-			return 0, ctx.Err()
-		}
-		err := p.err
-		n.mu.Unlock()
-		if err != nil {
-			return 0, err
-		}
-		return index, nil
+		return p.index, nil
+	case p.index != 0 && n.pending[p.index] == p:
+		delete(n.pending, p.index)
+		return 0, waitErr
+	default:
+		// Still queued, or collected but not yet assigned: the drain loop
+		// will drop it.
+		p.canceled = true
+		return 0, waitErr
 	}
+}
+
+// proposalContextError maps a waiter's context error to Propose's public
+// contract: deadlines become ErrTimeout, other cancellations stay untouched.
+func proposalContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return ErrTimeout
+		}
+		return err
+	}
+	return ErrTimeout
 }
 
 // ReadBarrier succeeds only while this node is leader, has heard from a strict
@@ -750,6 +814,196 @@ func (n *Node) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 // Background loops
 // ---------------------------------------------------------------------------
 
+// proposeLoop is the single leader-side group-commit drain goroutine. It waits
+// for queued proposals, coalesces them for at most ProposeBatchWindow (or until
+// ProposeBatchMax is reached) and hands the batch to commitProposalBatch.
+//
+// It runs for the whole node lifetime rather than per leadership term: while
+// this node is not leader it simply fails anything that was queued before a
+// step-down.
+func (n *Node) proposeLoop() {
+	for {
+		select {
+		case <-n.stopCh:
+			n.mu.Lock()
+			n.failQueuedLocked(ErrStopped)
+			n.mu.Unlock()
+			return
+		case <-n.proposeSignal:
+		}
+
+		batch := n.collectProposals()
+		if len(batch) > 0 {
+			n.commitProposalBatch(batch)
+		}
+	}
+}
+
+// collectProposals drains queued proposals and keeps the batching window open
+// for ProposeBatchWindow, adding proposals that arrive meanwhile. n.mu is never
+// held during the window, so replication and the apply loop keep running; it is
+// only taken briefly to move items off the queue.
+func (n *Node) collectProposals() []*proposal {
+	max := n.cfg.ProposeBatchMax
+	batch := make([]*proposal, 0, max)
+
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return batch
+	}
+	if n.role != Leader {
+		n.failQueuedLocked(ErrNotLeader)
+		n.mu.Unlock()
+		return batch
+	}
+	batch = n.drainQueueLocked(batch)
+	n.mu.Unlock()
+
+	if len(batch) >= max {
+		return batch
+	}
+
+	timer := time.NewTimer(n.cfg.ProposeBatchWindow)
+	defer timer.Stop()
+	for {
+		select {
+		case <-n.stopCh:
+			n.mu.Lock()
+			n.failQueuedLocked(ErrStopped)
+			n.mu.Unlock()
+			return batch
+		case <-n.proposeSignal:
+			// More proposals arrived; grow the batch. The timer is not
+			// reset, so continuous arrivals cannot extend latency forever.
+			n.mu.Lock()
+			if n.stopped {
+				n.mu.Unlock()
+				return batch
+			}
+			if n.role != Leader {
+				n.failQueuedLocked(ErrNotLeader)
+				n.mu.Unlock()
+				return batch
+			}
+			batch = n.drainQueueLocked(batch)
+			full := len(batch) >= max
+			n.mu.Unlock()
+			if full {
+				return batch
+			}
+		case <-timer.C:
+			n.mu.Lock()
+			batch = n.drainQueueLocked(batch)
+			n.mu.Unlock()
+			return batch
+		}
+	}
+}
+
+// drainQueueLocked moves up to ProposeBatchMax queued proposals into batch.
+// Caller must hold mu.
+func (n *Node) drainQueueLocked(batch []*proposal) []*proposal {
+	max := n.cfg.ProposeBatchMax
+	for len(n.proposeQueue) > 0 && len(batch) < max {
+		batch = append(batch, n.proposeQueue[0])
+		n.proposeQueue[0] = nil
+		n.proposeQueue = n.proposeQueue[1:]
+	}
+	if len(n.proposeQueue) == 0 {
+		n.proposeQueue = nil
+	}
+	return batch
+}
+
+// commitProposalBatch assigns contiguous term/index pairs, performs one durable
+// append and registers every waiter before replication is signalled.
+//
+// Locking: n.mu is held across the store call. That keeps log assignment and
+// persistence ordered as a single writer with HandleAppendEntries, the leader
+// no-op append and the snapshot/truncation paths, all of which already call the
+// LogStore while holding n.mu. The batching window is deliberately outside the
+// lock, and no path acquires a store lock before n.mu, so this cannot deadlock
+// with the store or with Propose waiters (which never hold n.mu while waiting).
+func (n *Node) commitProposalBatch(batch []*proposal) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	failAll := func(err error) {
+		for _, p := range batch {
+			n.completeLocked(p, err)
+		}
+	}
+	if n.stopped {
+		failAll(ErrStopped)
+		return
+	}
+	if n.role != Leader {
+		failAll(ErrNotLeader)
+		return
+	}
+
+	// Drop proposals whose waiters already gave up, so they do not consume log
+	// indices. Propose cannot change this state while mu is held.
+	active := batch[:0]
+	for _, p := range batch {
+		if p.completed {
+			continue
+		}
+		if p.canceled || p.ctx.Err() != nil {
+			n.completeLocked(p, proposalContextError(p.ctx))
+			continue
+		}
+		active = append(active, p)
+	}
+	batch = active
+	if len(batch) == 0 {
+		return
+	}
+
+	entries := make([]model.Entry, len(batch))
+	index := n.lastIndexLocked() + 1
+	for i, p := range batch {
+		e := cloneEntry(p.cmd)
+		e.Term = n.term
+		e.Index = index + uint64(i)
+		entries[i] = e
+	}
+
+	if bs, ok := n.store.(BatchAppender); ok {
+		if err := bs.AppendBatch(entries); err != nil {
+			failAll(fmt.Errorf("raft: append proposal batch: %w", err))
+			return
+		}
+		for i, p := range batch {
+			p.index = entries[i].Index
+			n.pending[p.index] = p
+		}
+		n.entries = append(n.entries, entries...)
+		n.signalAllLocked()
+		n.maybeCommitLocked()
+		return
+	}
+
+	// Fallback for stores without the batching capability: one Append per
+	// entry, preserving the old per-proposal failure semantics. A failed
+	// append fails only its own waiter and does not consume an index.
+	for _, p := range batch {
+		e := cloneEntry(p.cmd)
+		e.Term = n.term
+		e.Index = n.lastIndexLocked() + 1
+		if err := n.store.Append(e); err != nil {
+			n.completeLocked(p, fmt.Errorf("raft: append proposal: %w", err))
+			continue
+		}
+		p.index = e.Index
+		n.pending[e.Index] = p
+		n.entries = append(n.entries, e)
+	}
+	n.signalAllLocked()
+	n.maybeCommitLocked()
+}
+
 func (n *Node) electionLoop(ctx context.Context) {
 	interval := n.cfg.ElectionTimeoutMin / 4
 	if interval < 2*time.Millisecond {
@@ -910,6 +1164,7 @@ func (n *Node) becomeLeaderLocked() {
 		n.leaderID = ""
 		n.cancelLeaderLocked()
 		n.failPendingLocked(ErrNotLeader)
+		n.failQueuedLocked(ErrNotLeader)
 		n.resetElectionDeadlineLocked()
 		return
 	}
@@ -1157,9 +1412,8 @@ func (n *Node) applyLoop() {
 			n.logger.Error("raft: state machine apply failed", "id", n.cfg.ID, "index", index, "error", err)
 		}
 		if p := n.pending[index]; p != nil {
-			p.err = err
 			delete(n.pending, index)
-			close(p.done)
+			n.completeLocked(p, err)
 		}
 		n.mu.Unlock()
 		n.applyMu.Unlock()
@@ -1250,6 +1504,7 @@ func (n *Node) stepDownWithErrorLocked(leaderID string, pendingErr error) {
 	// Pending proposals can no longer be completed on this node. Failing them
 	// here prevents a caller using a background context from hanging forever.
 	n.failPendingLocked(pendingErr)
+	n.failQueuedLocked(pendingErr)
 	n.resetElectionDeadlineLocked()
 }
 
@@ -1269,18 +1524,18 @@ func (n *Node) adoptTermLocked(term uint64, leaderID string) error {
 	n.leaderID = leaderID
 	n.votes = nil
 	n.failPendingLocked(ErrNotLeader)
+	n.failQueuedLocked(ErrNotLeader)
 	n.resetElectionDeadlineLocked()
 	return nil
 }
 
 // failPendingLocked completes every pending proposal with err. Caller must
 // hold mu. Exactly-once completion is guaranteed by deleting the entry before
-// closing its done channel.
+// calling completeLocked, which also ignores an already-completed proposal.
 func (n *Node) failPendingLocked(err error) {
 	for index, p := range n.pending {
-		p.err = err
 		delete(n.pending, index)
-		close(p.done)
+		n.completeLocked(p, err)
 	}
 }
 
@@ -1291,10 +1546,33 @@ func (n *Node) failPendingFromLocked(fromIndex uint64, err error) {
 		if index < fromIndex {
 			continue
 		}
-		p.err = err
 		delete(n.pending, index)
-		close(p.done)
+		n.completeLocked(p, err)
 	}
+}
+
+// failQueuedLocked completes proposals that have not been assigned a log index
+// yet. Caller must hold mu.
+func (n *Node) failQueuedLocked(err error) {
+	for _, p := range n.proposeQueue {
+		if p.ctx != nil && p.ctx.Err() != nil {
+			n.completeLocked(p, proposalContextError(p.ctx))
+			continue
+		}
+		n.completeLocked(p, err)
+	}
+	n.proposeQueue = nil
+}
+
+// completeLocked publishes a proposal result and closes its done channel
+// exactly once. Caller must hold mu.
+func (n *Node) completeLocked(p *proposal, err error) {
+	if p.completed {
+		return
+	}
+	p.err = err
+	p.completed = true
+	close(p.done)
 }
 
 func (n *Node) hasQuorumLocked(now time.Time) bool {

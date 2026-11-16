@@ -79,6 +79,10 @@ type FileStore struct {
 
 var errStoreClosed = errors.New("raft: log store closed")
 
+// FileStore implements the base LogStore and the optional group-commit
+// BatchAppender capability.
+var _ BatchAppender = (*FileStore)(nil)
+
 // NewFileStore opens (creating if needed) the WAL in dir and replays it. A
 // partial or corrupt final record is discarded and the file is truncated back
 // to the last complete record.
@@ -294,6 +298,19 @@ func (s *FileStore) SaveMeta(term uint64, votedFor string) error {
 // Append durably appends contiguous entries. It is atomic with respect to the
 // in-memory view: on error nothing is added there.
 func (s *FileStore) Append(entries ...model.Entry) error {
+	return s.append(entries)
+}
+
+// AppendBatch durably appends a contiguous batch of entries as a single WAL
+// record: one write and one fsync cover the whole batch. It is atomic with
+// respect to both the durable and the in-memory log: on error neither is
+// changed. It implements the optional BatchAppender capability used for group
+// commit.
+func (s *FileStore) AppendBatch(entries []model.Entry) error {
+	return s.append(entries)
+}
+
+func (s *FileStore) append(entries []model.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
