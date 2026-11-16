@@ -326,16 +326,13 @@ func TestJepsenKillRestart(t *testing.T) {
 	t.Logf("jepsen: seed=%d rounds=%d nodes=%v meta=%s", seed, rounds, addrs, metaAddr)
 
 	for round := 0; round < rounds; round++ {
-		roundStart := time.Now()
 		// Keep a leader before writing; this discovers leadership via Status.
 		leader := v2WaitLeader(t, running)
-		tAfterLeader := time.Since(roundStart)
 
 		// Write on the healthy quorum before the fault.
 		for n := 1 + rng.Intn(2); n > 0; n-- {
 			rig.putNext()
 		}
-		tAfterPre := time.Since(roundStart)
 
 		// Pick one victim. Half the time target the discovered leader so the
 		// test exercises real leader failover as well as follower loss. Never
@@ -348,7 +345,6 @@ func TestJepsenKillRestart(t *testing.T) {
 		if err := stopServer(victim.srv); err != nil {
 			t.Fatalf("jepsen: stop node %s: %v", victim.addr, err)
 		}
-		tAfterStop := time.Since(roundStart)
 		rest := make([]*v2Node, 0, len(running)-1)
 		for _, n := range running {
 			if n != victim {
@@ -361,13 +357,10 @@ func TestJepsenKillRestart(t *testing.T) {
 
 		// Wait for the surviving quorum's leader, then write into the fault.
 		v2WaitLeader(t, rest)
-		tAfterWaitLeader := time.Since(roundStart)
 		for n := 2 + rng.Intn(2); n > 0; n-- {
 			rig.putNext()
 		}
-		tAfterPost := time.Since(roundStart)
 		target := maxIndex(rest)
-		tAfterMax := time.Since(roundStart)
 
 		// Restart the same node at the same address with the same DataDir.
 		restarted, err := kvserver.New(victim.cfg)
@@ -380,17 +373,13 @@ func TestJepsenKillRestart(t *testing.T) {
 		victim.srv = restarted
 		victim.client = v2Dial(t, victim.addr)
 		t.Cleanup(func() { _ = stopServer(restarted) })
-		tAfterRestart := time.Since(roundStart)
 
 		// A fresh client avoids any stale leader cache from before the fault.
 		rig.resetClient()
 		waitCaughtUp(victim, target)
-		tAfterCatchup := time.Since(roundStart)
 
 		// The invariant is checked after every restart, not only at the end.
 		rig.verifyAckedScan()
-		t.Logf("jepsen: round %d timings leader=%s pre=%s stop=%s waitLeader=%s post=%s max=%s restartStart=%s catchup=%s verify=%s victim=%s leaderTarget=%v",
-			round, tAfterLeader, tAfterPre, tAfterStop, tAfterWaitLeader, tAfterPost, tAfterMax, tAfterRestart, tAfterCatchup, time.Since(roundStart), victim.addr, victim == leader)
 
 		running = append(rest, victim)
 	}
