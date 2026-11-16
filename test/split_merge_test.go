@@ -1,0 +1,165 @@
+package test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"distributed-db/internal/kvserver"
+	"distributed-db/internal/meta"
+	"distributed-db/internal/metaserver"
+	"distributed-db/internal/raft"
+	"distributed-db/internal/v2client"
+)
+
+func TestV2RangeHostSplitMerge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr := v2FreeAddr(t)
+	addr := v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{
+		Addr: metaAddr,
+		Ranges: []meta.Range{{
+			ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 1,
+		}},
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+
+	srv, err := kvserver.New(kvserver.Config{
+		ID: addr, RaftAddr: addr, DataDir: t.TempDir(),
+		Ranges:             []kvserver.RangeConfig{{ID: 1, Start: nil, End: nil}},
+		ElectionTimeoutMin: 80 * time.Millisecond,
+		ElectionTimeoutMax: 160 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		CacheSize:          8 << 20, MemTableSize: 4 << 20,
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Stop(sctx)
+	})
+	if !waitGroupLeader(t, srv, 1) {
+		t.Fatal("range 1 did not become leader")
+	}
+
+	client, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	put := func(key, value string) {
+		t.Helper()
+		txn, err := client.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		txn.Set([]byte(key), []byte(value))
+		if err := txn.Commit(ctx); err != nil {
+			t.Fatalf("commit %s: %v", key, err)
+		}
+	}
+	get := func(c *v2client.Client, key, want string) {
+		t.Helper()
+		txn, err := c.Begin(ctx)
+		if err != nil {
+			t.Fatalf("read begin: %v", err)
+		}
+		got, err := txn.Get(ctx, []byte(key))
+		if err != nil || string(got) != want {
+			t.Fatalf("get %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	put("a", "left")
+	put("m", "middle")
+	put("z", "right")
+
+	ranges, err := srv.SplitRange(ctx, 1, []byte("m"), 2)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	if len(ranges) != 2 {
+		t.Fatalf("ranges after split = %+v", ranges)
+	}
+	if !waitGroupLeader(t, srv, 2) {
+		t.Fatal("range 2 did not become leader")
+	}
+	metaRanges := make([]meta.Range, 0, len(ranges))
+	for _, r := range ranges {
+		metaRanges = append(metaRanges, meta.Range{
+			ID: r.ID, Start: r.Start, End: r.End,
+			Replicas: []string{addr}, Version: 1,
+		})
+	}
+	if err := ms.ApplyRanges(ctx, metaRanges); err != nil {
+		t.Fatalf("meta ranges after split: %v", err)
+	}
+	client2, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("client2: %v", err)
+	}
+	t.Cleanup(func() { _ = client2.Close() })
+	get(client2, "a", "left")
+	get(client2, "m", "middle")
+	get(client2, "z", "right")
+
+	// A write to the right side must go to the new Raft group.
+	txn, err := client2.Begin(ctx)
+	if err != nil {
+		t.Fatalf("right begin: %v", err)
+	}
+	txn.Set([]byte("zz"), []byte("new"))
+	if err := txn.Commit(ctx); err != nil {
+		t.Fatalf("right commit: %v", err)
+	}
+	get(client2, "zz", "new")
+
+	merged, err := srv.MergeRanges(ctx, 1, 2)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("ranges after merge = %+v", merged)
+	}
+	if err := ms.ApplyRanges(ctx, []meta.Range{{
+		ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 2,
+	}}); err != nil {
+		t.Fatalf("meta range after merge: %v", err)
+	}
+	client3, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("client3: %v", err)
+	}
+	t.Cleanup(func() { _ = client3.Close() })
+	get(client3, "a", "left")
+	get(client3, "z", "right")
+	get(client3, "zz", "new")
+}
+
+func waitGroupLeader(t *testing.T, srv *kvserver.Server, rangeID uint64) bool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		node, err := srv.GroupForID(rangeID)
+		if err == nil && node.Status().Role == raft.Leader {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}

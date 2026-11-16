@@ -1,0 +1,155 @@
+package kvserver
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"sort"
+)
+
+// SplitRange creates a new Raft group for [splitKey, old.End) on this server
+// and moves the matching MVCC records from the old group into it.
+//
+// M2.3 scope: the split is performed on one RangeHost (one process). Every
+// replica of the old range must run the same operation before the meta range
+// map is updated; distributed split orchestration is the next layer.
+func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte, newID uint64) ([]RangeConfig, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return nil, fmt.Errorf("kvserver: stopped")
+	}
+	g, ok := s.groups[rangeID]
+	if !ok {
+		return nil, fmt.Errorf("%w: id %d", ErrRangeNotFound, rangeID)
+	}
+	if !g.node.IsLeader() {
+		return nil, fmt.Errorf("kvserver: split range %d: not leader", rangeID)
+	}
+	if _, ok := s.groups[newID]; ok || newID == 0 {
+		return nil, fmt.Errorf("kvserver: split range %d: new range id %d is invalid", rangeID, newID)
+	}
+	if len(splitKey) == 0 || !g.containsKey(splitKey) || bytes.Equal(splitKey, g.cfg.Start) {
+		return nil, fmt.Errorf("kvserver: split range %d: split key %q is not inside", rangeID, splitKey)
+	}
+	if !g.frozen.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("kvserver: split range %d: already frozen", rangeID)
+	}
+	defer g.frozen.Store(false)
+
+	oldEnd := cloneBytes(g.cfg.End)
+	records, err := g.store.ExportRange(splitKey, oldEnd)
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: split range %d: export: %w", rangeID, err)
+	}
+
+	newGroup, err := newRangeGroup(s.cfg, RangeConfig{
+		ID: newID, Start: cloneBytes(splitKey), End: oldEnd, Peers: cloneStrings(g.cfg.Peers),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: split range %d: create group: %w", rangeID, err)
+	}
+	cleanup := func() {
+		_ = newGroup.stop()
+	}
+	if err := newGroup.store.ImportRecords(records); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("kvserver: split range %d: import: %w", rangeID, err)
+	}
+	if err := newGroup.start(ctx); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("kvserver: split range %d: start new group: %w", rangeID, err)
+	}
+
+	// The new group owns the right side; the old one keeps only the left.
+	if err := g.store.DeleteRange(splitKey, oldEnd); err != nil {
+		_ = newGroup.stop()
+		return nil, fmt.Errorf("kvserver: split range %d: delete right: %w", rangeID, err)
+	}
+	g.cfg.End = cloneBytes(splitKey)
+	s.groups[newID] = newGroup
+	s.rebuildRangeOrder()
+
+	// Compact the old log so a restart cannot replay right-side writes that
+	// were removed by the split.
+	if _, err := g.node.Snapshot(); err != nil {
+		return nil, fmt.Errorf("kvserver: split range %d: snapshot old range: %w", rangeID, err)
+	}
+	return s.Ranges(), nil
+}
+
+// MergeRanges copies all data from right into left and removes the right Raft
+// group. Ranges must be adjacent and hosted in this process.
+func (s *Server) MergeRanges(ctx context.Context, leftID, rightID uint64) ([]RangeConfig, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return nil, fmt.Errorf("kvserver: stopped")
+	}
+	left, ok := s.groups[leftID]
+	if !ok {
+		return nil, fmt.Errorf("%w: left id %d", ErrRangeNotFound, leftID)
+	}
+	right, ok := s.groups[rightID]
+	if !ok {
+		return nil, fmt.Errorf("%w: right id %d", ErrRangeNotFound, rightID)
+	}
+	if !left.node.IsLeader() {
+		return nil, fmt.Errorf("kvserver: merge: left range %d is not leader", leftID)
+	}
+	if !bytes.Equal(left.cfg.End, right.cfg.Start) {
+		return nil, fmt.Errorf("kvserver: merge: ranges %d and %d are not adjacent", leftID, rightID)
+	}
+
+	right.frozen.Store(true)
+	records, err := right.store.ExportRange(nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: merge: export right: %w", err)
+	}
+	if err := left.store.ImportRecords(records); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: import left: %w", err)
+	}
+	left.cfg.End = cloneBytes(right.cfg.End)
+	if err := right.stop(); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: stop right: %w", err)
+	}
+	delete(s.groups, rightID)
+	s.rebuildRangeOrder()
+	return s.Ranges(), nil
+}
+
+// rebuildRangeOrder refreshes the sorted hosted range list. Caller holds s.mu.
+func (s *Server) rebuildRangeOrder() {
+	ids := make([]uint64, 0, len(s.groups))
+	for id := range s.groups {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := s.groups[ids[i]].cfg, s.groups[ids[j]].cfg
+		switch {
+		case a.Start == nil && b.Start == nil:
+			return a.ID < b.ID
+		case a.Start == nil:
+			return true
+		case b.Start == nil:
+			return false
+		default:
+			return bytes.Compare(a.Start, b.Start) < 0
+		}
+	})
+	s.groupIDs = ids
+	if len(ids) > 0 {
+		s.defaultID = ids[0]
+	}
+	s.cfg.Ranges = s.cfg.Ranges[:0]
+	for _, id := range ids {
+		g := s.groups[id]
+		s.cfg.Ranges = append(s.cfg.Ranges, g.cfg)
+	}
+}
