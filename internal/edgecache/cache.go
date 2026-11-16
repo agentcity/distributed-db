@@ -78,12 +78,16 @@ type Options struct {
 	Prefixes []uint16
 }
 
-// LookupResult is a verified answer to a remote or local lookup.
+// LookupResult is a verified answer to a remote lookup.
 type LookupResult struct {
+	// Present reports set membership.
 	Present bool
-	Proof   *edgeset.Proof
-	Root    edgeset.Hash
-	Prefix  uint16
+	// Proof is the verified Merkle inclusion proof; nil when absent.
+	Proof *edgeset.Proof
+	// Root is the verified segment Merkle root; zero when absent.
+	Root edgeset.Hash
+	// Prefix is the 16-bit segment routing prefix of the queried hash.
+	Prefix uint16
 }
 
 // Cache owns a materialized local store and its authoritative full manifest.
@@ -197,9 +201,11 @@ func (c *Cache) LoadError() error {
 // fully validated with edgeset.LoadStore before it becomes visible to
 // Contains.
 //
-// Sync serializes with other Sync calls. Contains may run concurrently; it
-// observes either the previous store or the fully validated new one, never a
-// partially installed manifest.
+// Sync serializes with other Sync calls. Contains may run concurrently: local
+// reads are serialized against file installation, and the new store becomes
+// visible only after full validation. A remote lookup that races with Sync can
+// observe a newer server generation and return ErrStaleManifest; retry after
+// Sync in that case.
 func (c *Cache) Sync(ctx context.Context) error {
 	if c == nil {
 		return fmt.Errorf("edgecache: nil cache")
