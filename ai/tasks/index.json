@@ -52,5 +52,11 @@
     "title": "SQL P0 — CREATE/INSERT/SELECT/UPDATE/DELETE поверх KV",
     "status": "in_progress",
     "file": "0009-sql-p0.md"
+  },
+  {
+    "id": "0010",
+    "title": "Целевая архитектура M2/M3/M5 + AI control plane",
+    "status": "in_progress",
+    "file": "0010-target-architecture.md"
   }
 ]

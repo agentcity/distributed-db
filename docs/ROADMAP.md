@@ -218,3 +218,8 @@ HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
 колонке), multi-row UPDATE/DELETE по индексу; e2e CREATE/INSERT/SELECT/
 UPDATE/DELETE прошёл.
 Осталось: JOIN/aggregates, pgwire. SQL на 3 узлах с kill лидера проверен.
+
+## Целевая архитектура
+
+См. [ARCHITECTURE-TARGET.md](ARCHITECTURE-TARGET.md) и
+[схему](diagrams/target-architecture.png): M2/M3/M5 и отдельный AI control plane.
