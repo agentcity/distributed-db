@@ -14,6 +14,11 @@
 // record and removes the lock. Rollback removes the lock and writes a rollback
 // record at startTS, which makes any provisional data invisible.
 //
+// A single-range transaction can also commit in one step with CommitSingle,
+// which validates conflicts and writes the committed data and write records at
+// commitTS (removing any existing locks) in a single engine batch, without
+// storing a provisional version at startTS.
+//
 // # Lock resolution
 //
 // Resolving a lock uses CheckTxnStatus/ResolveLock: the caller inspects the

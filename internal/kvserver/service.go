@@ -70,10 +70,7 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode prewrite_commit: %w", err)
 		}
-		if err := m.store.Prewrite(cmd.Mutations, cmd.Primary, cmd.StartTS); err != nil {
-			return err
-		}
-		return m.store.Commit(cmd.Keys, cmd.StartTS, cmd.CommitTS)
+		return m.store.CommitSingle(cmd.Mutations, cmd.Primary, cmd.StartTS, cmd.CommitTS)
 	case model.CommandRollback:
 		var cmd applyCommand
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
