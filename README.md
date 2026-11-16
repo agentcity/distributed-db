@@ -108,7 +108,17 @@ go build -o bin/kv2 ./cmd/kv2
   -data-dir=./data/v2/n3 -peers=127.0.0.1:7001,127.0.0.1:7002
 ```
 
-Клиент v2 — Go-пакет `internal/v2client`; e2e:
+Клиент v2 — Go-пакет `internal/v2client`, терминальный CLI `cmd/kvctl` и SQL/pgwire.
+CLI:
+
+```bash
+go build -o bin/kvctl ./cmd/kvctl
+./bin/kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put user:1 alice
+./bin/kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 get user:1
+./bin/kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 scan -prefix user:
+```
+
+E2E:
 
 ```bash
 go test -race ./test -run 'TestV2MetaSchedulerSplitMerge|TestV2RangeHostSplitMerge|TestV2LockResolution' -v
