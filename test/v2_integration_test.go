@@ -21,6 +21,7 @@ import (
 type v2Node struct {
 	srv    *kvserver.Server
 	addr   string
+	cfg    kvserver.Config
 	client pbv2.KVServiceClient
 }
 
@@ -107,7 +108,7 @@ func TestV2SingleRangeCluster(t *testing.T) {
 				peers = append(peers, p)
 			}
 		}
-		srv, err := kvserver.New(kvserver.Config{
+		cfg := kvserver.Config{
 			ID:                 addr,
 			RaftAddr:           addr,
 			DataDir:            t.TempDir(),
@@ -118,14 +119,15 @@ func TestV2SingleRangeCluster(t *testing.T) {
 			CacheSize:          8 << 20,
 			MemTableSize:       4 << 20,
 			Logger:             v2Logger(),
-		})
+		}
+		srv, err := kvserver.New(cfg)
 		if err != nil {
 			t.Fatalf("new node %s: %v", addr, err)
 		}
 		if err := srv.Start(ctx); err != nil {
 			t.Fatalf("start node %s: %v", addr, err)
 		}
-		n := &v2Node{srv: srv, addr: addr}
+		n := &v2Node{srv: srv, addr: addr, cfg: cfg}
 		n.client = v2Dial(t, addr)
 		nodes = append(nodes, n)
 		t.Cleanup(func() {
@@ -374,5 +376,153 @@ func TestV2SnapshotRestart(t *testing.T) {
 	}
 	if !gr.GetFound() || string(gr.GetValue()) != "value" {
 		t.Fatalf("snapshot restart lost value: found=%v value=%q err=%q", gr.GetFound(), gr.GetValue(), gr.GetError())
+	}
+}
+
+func TestV2SnapshotCatchUp(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr := v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{Addr: metaAddr, Logger: v2Logger()})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+	metaCC, err := grpc.NewClient(metaAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("meta dial: %v", err)
+	}
+	t.Cleanup(func() { _ = metaCC.Close() })
+	metaClient := pbv2.NewMetaServiceClient(metaCC)
+
+	addrs := []string{v2FreeAddr(t), v2FreeAddr(t), v2FreeAddr(t)}
+	nodes := make([]*v2Node, 0, 3)
+	for i, addr := range addrs {
+		peers := make([]string, 0, 2)
+		for j, p := range addrs {
+			if i != j {
+				peers = append(peers, p)
+			}
+		}
+		cfg := kvserver.Config{
+			ID: addr, RaftAddr: addr, DataDir: t.TempDir(), Peers: peers,
+			ElectionTimeoutMin: 150 * time.Millisecond,
+			ElectionTimeoutMax: 300 * time.Millisecond,
+			HeartbeatInterval:  30 * time.Millisecond,
+			CacheSize:          8 << 20, MemTableSize: 4 << 20,
+			Logger: v2Logger(),
+		}
+		srv, err := kvserver.New(cfg)
+		if err != nil {
+			t.Fatalf("new %s: %v", addr, err)
+		}
+		if err := srv.Start(ctx); err != nil {
+			t.Fatalf("start %s: %v", addr, err)
+		}
+		n := &v2Node{srv: srv, addr: addr, cfg: cfg}
+		n.client = v2Dial(t, addr)
+		nodes = append(nodes, n)
+	}
+
+	leader := v2WaitLeader(t, nodes)
+	var follower *v2Node
+	for _, n := range nodes {
+		if n != leader {
+			follower = n
+			break
+		}
+	}
+	if follower == nil {
+		t.Fatal("no follower")
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := follower.srv.Stop(stopCtx); err != nil {
+		t.Fatalf("stop follower: %v", err)
+	}
+
+	put := func(key, value string) uint64 {
+		t.Helper()
+		r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
+		if err != nil {
+			t.Fatalf("ts: %v", err)
+		}
+		pr, err := leader.client.Prewrite(ctx, &pbv2.PrewriteRequest{
+			StartTs: r.Start, Primary: []byte(key),
+			Mutations: []*pbv2.Mutation{{Key: []byte(key), Value: []byte(value)}},
+		})
+		if err != nil || !pr.GetSuccess() {
+			t.Fatalf("prewrite %s: %v %+v", key, err, pr)
+		}
+		cr, err := leader.client.Commit(ctx, &pbv2.CommitRequest{
+			StartTs: r.Start, CommitTs: r.Start + 1, Keys: [][]byte{[]byte(key)},
+		})
+		if err != nil || !cr.GetSuccess() {
+			t.Fatalf("commit %s: %v %+v", key, err, cr)
+		}
+		return r.Start + 1
+	}
+	commitTS := put("snap-key", "snap-value")
+	put("snap-key2", "snap-value2")
+
+	snap, err := leader.srv.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Index == 0 {
+		t.Fatal("snapshot index is zero")
+	}
+
+	// Restart the follower with its old log; the leader has compacted the
+	// prefix, so catch-up must use InstallSnapshot.
+	restarted, err := kvserver.New(follower.cfg)
+	if err != nil {
+		t.Fatalf("restart follower: %v", err)
+	}
+	if err := restarted.Start(ctx); err != nil {
+		t.Fatalf("start restarted follower: %v", err)
+	}
+	restartedNode := &v2Node{srv: restarted, addr: follower.addr, cfg: follower.cfg}
+	restartedNode.client = v2Dial(t, follower.addr)
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = restarted.Stop(sctx)
+	})
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		st := v2Status(t, restartedNode.client)
+		if st != nil && st.LastApplied >= snap.Index {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if st := v2Status(t, restartedNode.client); st == nil || st.LastApplied < snap.Index {
+		t.Fatalf("follower did not catch up through snapshot: %+v (snapshot index %d)", st, snap.Index)
+	}
+
+	// Kill the old leader and read the committed value from the new leader.
+	if err := leader.srv.Stop(stopCtx); err != nil {
+		t.Fatalf("stop leader: %v", err)
+	}
+	survivors := []*v2Node{restartedNode}
+	for _, n := range nodes {
+		if n != leader && n != follower {
+			survivors = append(survivors, n)
+		}
+	}
+	newLeader := v2WaitLeader(t, survivors)
+	gr, err := newLeader.client.Get(ctx, &pbv2.GetRequest{Key: []byte("snap-key"), Ts: commitTS})
+	if err != nil {
+		t.Fatalf("get after snapshot catch-up: %v", err)
+	}
+	if !gr.GetFound() || string(gr.GetValue()) != "snap-value" {
+		t.Fatalf("snapshot catch-up lost value: found=%v value=%q err=%q", gr.GetFound(), gr.GetValue(), gr.GetError())
 	}
 }
