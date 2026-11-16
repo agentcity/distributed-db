@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package dbv2;
+
+option go_package = "distributed-db/internal/pb/v2;pbv2";
+
+// KVService is the transactional KV API exposed by every v2 node.
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc Prewrite(PrewriteRequest) returns (PrewriteResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// RaftService is the Raft peer transport.
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+// MetaService owns the timestamp oracle for v2 transactions.
+service MetaService {
+  rpc AllocTS(AllocTSRequest) returns (AllocTSResponse);
+}
+
+message GetRequest {
+  bytes key = 1;
+  uint64 ts = 2;
+}
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+  string leader = 3;
+  string error = 4;
+}
+
+message ScanRequest {
+  bytes start = 1;
+  bytes end = 2;
+  uint64 ts = 3;
+  int32 limit = 4;
+}
+message KV {
+  bytes key = 1;
+  bytes value = 2;
+}
+message ScanResponse {
+  repeated KV kvs = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+message Mutation {
+  bytes key = 1;
+  bytes value = 2;
+  bool delete = 3;
+}
+message PrewriteRequest {
+  uint64 start_ts = 1;
+  bytes primary = 2;
+  repeated Mutation mutations = 3;
+}
+message PrewriteResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+message CommitRequest {
+  uint64 start_ts = 1;
+  uint64 commit_ts = 2;
+  repeated bytes keys = 3;
+}
+message CommitResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+message RollbackRequest {
+  uint64 start_ts = 1;
+  repeated bytes keys = 2;
+}
+message RollbackResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+message StatusRequest {}
+message StatusResponse {
+  string id = 1;
+  string role = 2;
+  uint64 term = 3;
+  string leader = 4;
+  uint64 commit_index = 5;
+  uint64 last_applied = 6;
+}
+
+message RequestVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  string type = 3;
+  bytes key = 4;
+  bytes value = 5;
+}
+message AppendEntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;
+  uint64 conflict_index = 4;
+}
+
+message AllocTSRequest { int32 count = 1; }
+message AllocTSResponse {
+  uint64 start = 1;
+  int32 count = 2;
+}
