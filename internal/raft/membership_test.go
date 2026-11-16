@@ -369,3 +369,61 @@ func TestFileStoreMembershipPersistence(t *testing.T) {
 		t.Fatalf("learners = %v", learners)
 	}
 }
+
+func TestMembershipForceLearnerOverridesStaleDiskState(t *testing.T) {
+	dir := t.TempDir()
+	store, err := raft.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	// A previous incarnation left this node as a voter of {n1,n2}.
+	if err := store.SaveMembership([]string{"n1", "n2"}, nil); err != nil {
+		t.Fatalf("SaveMembership: %v", err)
+	}
+
+	// Re-adding the range must make the node a learner of {n2} even though the
+	// persisted state still lists it as a voter, so it cannot campaign before
+	// the leader re-adds it.
+	cfg := raft.Config{
+		ID:                 "n1",
+		Peers:              []string{"n2"},
+		DataDir:            dir,
+		ElectionTimeoutMin: 100 * time.Millisecond,
+		ElectionTimeoutMax: 200 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		Learner:            true,
+		ForceLearner:       true,
+		Logger:             discardLogger(),
+	}
+	node, err := raft.New(cfg, store, newTestSM(), &testTransferTransport{cluster: &testCluster{nodes: map[string]*raft.Node{}}, id: "n1"})
+	if err != nil {
+		t.Fatalf("raft.New with ForceLearner: %v", err)
+	}
+	voters, learners := node.Membership()
+	if len(voters) != 1 || voters[0] != "n2" {
+		t.Fatalf("voters = %v, want [n2]", voters)
+	}
+	if len(learners) != 1 || learners[0] != "n1" {
+		t.Fatalf("learners = %v, want [n1]", learners)
+	}
+
+	node.Stop()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	// The forced state is durable: reopening without ForceLearner restores it.
+	reopened, err := raft.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	persistedVoters, persistedLearners, err := reopened.LoadMembership()
+	if err != nil {
+		t.Fatalf("LoadMembership: %v", err)
+	}
+	if len(persistedVoters) != 1 || persistedVoters[0] != "n2" ||
+		len(persistedLearners) != 1 || persistedLearners[0] != "n1" {
+		t.Fatalf("persisted membership = %v %v, want [n2] [n1]", persistedVoters, persistedLearners)
+	}
+}
