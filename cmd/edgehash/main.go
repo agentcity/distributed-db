@@ -550,6 +550,13 @@ func loadEd25519PublicKey(path string) (ed25519.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read Ed25519 public key: %w", err)
 	}
+	if key, _, _, _, err := ssh.ParseAuthorizedKey(raw); err == nil {
+		if cryptoKey, ok := key.(ssh.CryptoPublicKey); ok {
+			if publicKey, ok := cryptoKey.CryptoPublicKey().(ed25519.PublicKey); ok {
+				return append(ed25519.PublicKey(nil), publicKey...), nil
+			}
+		}
+	}
 	if block, _ := pem.Decode(raw); block != nil {
 		switch block.Type {
 		case "CERTIFICATE":
@@ -563,6 +570,13 @@ func loadEd25519PublicKey(path string) (ed25519.PublicKey, error) {
 			}
 			return append(ed25519.PublicKey(nil), publicKey...), nil
 		default:
+			if sshKey, err := ssh.ParsePublicKey(block.Bytes); err == nil {
+				if cryptoKey, ok := sshKey.(ssh.CryptoPublicKey); ok {
+					if publicKey, ok := cryptoKey.CryptoPublicKey().(ed25519.PublicKey); ok {
+						return append(ed25519.PublicKey(nil), publicKey...), nil
+					}
+				}
+			}
 			key, err := x509.ParsePKIXPublicKey(block.Bytes)
 			if err != nil {
 				if len(block.Bytes) == ed25519.PublicKeySize {

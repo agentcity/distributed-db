@@ -552,8 +552,8 @@ Consequences:
 
 | Server output | Mobile scaffold | Notes |
 |---|---|---|
-| Manifest v1 HMAC-SHA256, absent `signature_alg` | Supported with explicit `hmacLegacy` trust | Current Go default; development only |
-| Manifest v1 Ed25519, `signature_alg:"ed25519"` | Supported with pinned Ed25519 key | Go library/HTTP options support verify; CLI signing flags may lag |
+| Manifest v1 HMAC-SHA256, absent `signature_alg` | Supported with explicit `hmacLegacy` trust | Legacy; development only |
+| Manifest v1 Ed25519, `signature_alg:"ed25519"` | Supported with pinned Ed25519 key | Build with `-ed25519-key`, serve with `-verify-ed25519` |
 | Segment format v1 | Supported | Legacy stores |
 | Segment format v2, `compression:"none"` | Supported | Recommended for mobile offline cache |
 | Segment format v2, `compression:"zstd"` | Manifest accepted; segment skipped; remote proofs still work | No zstd dependency in mobile scaffold |
@@ -563,10 +563,10 @@ Consequences:
 | Capitalized proof keys | Supported | Current Go encoder |
 | Unknown manifest field/version | Rejected | Fail closed |
 
-At the time this scaffold was written, `cmd/edgehash` exposed HMAC `-key` but
-not Ed25519/compression flags, while `internal/edgehttp` already accepted a
-custom `Verifier`, optional auth/rate/TLS/range, and `?absence=1`. Check
-`edgehash build -h` and the served manifest: if it has no
-`signature_alg:"ed25519"`, do not ship the Ed25519 trust mode against that
-server. This is a server integration gap, not something the mobile client can
-fix.
+The current CLI exposes Ed25519 (`-ed25519-key`, `-verify-ed25519`),
+compression (`-compression auto|none|zstd`), optional TLS/auth/rate limits and
+`?absence=1`; the mobile scaffold consumes only the manifest/segment/lookup
+subset described here. Check `edgehash build -h` and the served manifest: if it
+has no `signature_alg:"ed25519"`, do not ship the Ed25519 trust mode against
+that server. This is an integration/configuration check, not something the
+mobile client can fix.

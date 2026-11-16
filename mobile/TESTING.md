@@ -14,11 +14,11 @@ and was not checked:
 | HTTP end-to-end, cache, policy, concurrency | **Not run.** |
 | zstd, absence proof, background sync, real devices | **Not run.** zstd/absence are not implemented in the mobile scaffold; the server has both. |
 
-The Go tree was being changed concurrently with this scaffold (Ed25519,
-segment v2/zstd, absence-proof helpers). The curl recipes describe the server
-as observed at scaffold time; verify flags with `-h` and inspect the served
-manifest. The temporary harnesses are not committed; the required tests below
-must live in a real Android/iOS test target.
+The Go server now exposes Ed25519, segment v2/zstd, absence proofs, and
+auth/rate/TLS/range options. The recipes below target that CLI; if your checkout
+differs, check `-h` and inspect the served manifest. The temporary harnesses are
+not committed; the required tests below must live in a real Android/iOS test
+target.
 
 `org.json` stubs only implement the methods this file calls. Android-specific
 behavior such as `JSONObject.keys()`, number coercion, and exception messages
@@ -26,45 +26,59 @@ still needs a real device/instrumentation test.
 
 Reference values live in [`tests/notes.md`](tests/notes.md).
 
-## 1. Build the server and a tiny fixture
+## 1. Build the server and an Ed25519 fixture
 
 From the repository root:
 
 ```sh
 go build -o /tmp/edgehash ./cmd/edgehash
 
-# Three hashes for a tiny segment. Use shasum(1) or sha256sum(1).
+# Three hashes. Use shasum(1) or sha256sum(1).
 printf 'edgehash-mobile-vector-a\n' | shasum -a 256 | awk '{print $1}' > /tmp/hashes.txt
 printf 'edgehash-mobile-vector-b\n' | shasum -a 256 | awk '{print $1}' >> /tmp/hashes.txt
 printf 'edgehash-mobile-vector-c\n' | shasum -a 256 | awk '{print $1}' >> /tmp/hashes.txt
 cat /tmp/hashes.txt
 
-KEY=00112233445566778899aabbccddeeff
-/tmp/edgehash build -in /tmp/hashes.txt -out /tmp/edge-store -key "$KEY"
+# Test-only Ed25519 key. Do not reuse it for anything real.
+openssl genpkey -algorithm ED25519 -out /tmp/edge-ed25519.pem
+openssl pkey -in /tmp/edge-ed25519.pem -pubout -out /tmp/edge-ed25519.pub.pem
+
+# The mobile SDK pins the raw 32-byte key, not the PEM file.
+openssl pkey -pubin -in /tmp/edge-ed25519.pub.pem -outform DER \
+  | tail -c 32 | xxd -p -c 32
 ```
 
-The build produces a manifest signed with HMAC-SHA256 (no `signature_alg`) and
-segments in the current format. A three-hash segment is well below the server's
-4 KiB auto-compression threshold, so it should be v2 `"compression":"none"`.
-Check:
+Build a store with uncompressed v2 segments and an Ed25519 manifest:
 
 ```sh
-jq '.segments[0] | {prefix,size,sha256,compression}' /tmp/edge-store/manifest.json
+/tmp/edgehash build -in /tmp/hashes.txt -out /tmp/edge-store \
+  -ed25519-key /tmp/edge-ed25519.pem -compression none
 ```
 
-If `compression` is `"zstd"`, the mobile scaffold can read the manifest but will
-skip that segment for offline caching (remote proofs still work). For a larger
-offline fixture, use a server build that exposes
-`BuildOptions.Compression = "none"`; do not assume the CLI has a `-compression`
-flag.
+`-compression none` is required for offline mobile caching in this scaffold;
+`auto`/`zstd` may produce segments the mobile client skips. Check the manifest:
+
+```sh
+jq '{version, signature_alg, segment: (.segments[0] | {prefix,size,sha256,compression})}' \
+  /tmp/edge-store/manifest.json
+```
+
+Expected: `signature_alg` is `"ed25519"`, `compression` is `"none"` (unless
+your build/service changed defaults). The signature is base64 in the current Go
+JSON; the mobile decoder accepts base64 or hex.
+
+For a larger store, `-prefix-bytes`, `-fp`, `-compression none|zstd|auto` and
+`-key` are available. HMAC remains supported for compatibility.
 
 ## 2. Serve and inspect with curl
 
 ```sh
-/tmp/edgehash serve -dir /tmp/edge-store -addr 127.0.0.1:8080 -key "$KEY"
+/tmp/edgehash serve -dir /tmp/edge-store -addr 127.0.0.1:8080 \
+  -verify-ed25519 /tmp/edge-ed25519.pub.pem
 ```
 
-In another shell:
+Do not pass `-key`; `-key` and `-verify-ed25519` are mutually exclusive. In
+another shell:
 
 ```sh
 # Health and schema version (version is unsigned/informational).
@@ -95,33 +109,48 @@ H1=$(sed -n '1p' /tmp/hashes.txt)
 curl -sS "http://127.0.0.1:8080/v1/lookup/$H1" | tee /tmp/lookup-present.json | jq .
 # Current Go encoder uses capitalized proof keys; the SDK accepts both cases.
 
-# Absent lookup inside the same segment (prefix 1234, not one of the three).
-ABSENT="123403$(printf '%058d' 0)"
+# Absent lookup inside the same segment: same routing prefix, different tail.
+ABSENT="${HEX}$(printf '%060d' 0)"
 curl -sS "http://127.0.0.1:8080/v1/lookup/$ABSENT" | jq .
 
-# Ask the current server for a non-membership proof as well.
+# Ask the current server for a non-membership proof.
 curl -sS "http://127.0.0.1:8080/v1/lookup/$ABSENT?absence=1" | jq .
-# The scaffold does not request/verify absence_proof yet; inspect it manually
-# and use the protocol §7.4 rules when implementing that feature.
+# The mobile scaffold does not request/verify absence_proof yet; inspect it
+# manually and use protocol §7.4 when implementing that feature.
 
 # A hash outside the signed manifest's prefixes yields the stronger
 # no-segment answer (present=false, no proof).
 ZERO=$(printf '%064d' 0)
 curl -sS "http://127.0.0.1:8080/v1/lookup/$ZERO" | jq .
 
-# The CLI verifies the manifest HMAC and the returned proof.
-/tmp/edgehash lookup -server http://127.0.0.1:8080 -hash "$H1" -key "$KEY"
+# The CLI verifies the Ed25519 manifest and any Merkle/absence proof.
+/tmp/edgehash lookup -server http://127.0.0.1:8080 -hash "$H1" \
+  -verify-ed25519 /tmp/edge-ed25519.pub.pem
 ```
 
 Expected: present lookup includes `"present":true`, `proof`, `root`, `prefix`;
-absent lookup has `"present":false` and no proof. The proof fields may be
-`Hash`/`Index`/`Path`/`Right` in the current server. `size`/`sha256` cover the
-stored segment bytes.
+absent lookup has `"present":false` and no proof unless `?absence=1` was asked.
+The proof fields may be `Hash`/`Index`/`Path`/`Right` in the current server.
+`size`/`sha256` cover the stored segment bytes.
 
-## 3. Test the mobile HMAC development path
+For local HTTP, the mobile client needs an explicit development cleartext/ATS
+exception (see §4). Do not add `-auth-token` yet: the scaffold has no Bearer
+token configuration. If you test auth, use curl/`httpie` and add the header to
+the transport first.
 
-The current server CLI exposes HMAC (`-key`) but may not expose Ed25519. Use HMAC
-**only for development**:
+## 3. HMAC development path
+
+Build and serve a separate HMAC store on port 8081:
+
+```sh
+KEY=00112233445566778899aabbccddeeff
+/tmp/edgehash build -in /tmp/hashes.txt -out /tmp/edge-store-hmac \
+  -key "$KEY" -compression none
+/tmp/edgehash serve -dir /tmp/edge-store-hmac -addr 127.0.0.1:8081 -key "$KEY"
+```
+
+The HMAC manifest has no `signature_alg` and a base64 tag. Configure mobile
+trust explicitly:
 
 ```kotlin
 // Android, dev only
@@ -137,74 +166,15 @@ let key = Data([0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
 let trust = TrustConfig.hmacLegacy(key: key)
 ```
 
-Then point the client at the server with `allowInsecureHTTP = true` for local
-testing and call `sync()`/`lookup()`.
+Then point the client at `http://127.0.0.1:8081` with
+`allowInsecureHTTP = true` for local testing and call `sync()`/`lookup()`.
 
-This validates JSON parsing, canonical HMAC bytes (which match the historical
-Go encoding), segment v1/v2 `"none"` parsing, cache install, and lookup proofs.
-It does **not** validate Ed25519, because the running server is HMAC-signed.
+This validates JSON parsing, canonical HMAC bytes (matching the historical Go
+encoding), segment v1/v2 `"none"` parsing, cache install, and lookup proofs. It
+does **not** validate Ed25519. Use the Ed25519 store in §1 for that; never ship
+a shared HMAC key in a mobile binary.
 
-## 4. Test Ed25519 and v2 uncompressed without an Ed25519 CLI
-
-If the CLI cannot sign with Ed25519 yet, serve the deterministic fixture from
-[`tests/notes.md`](tests/notes.md) with the current server (it accepts an
-unsigned/Ed25519 manifest when started without `-key`, but verifies every
-segment's size/checksum/root). This exercises the mobile Ed25519 verifier and
-v2 parser against real HTTP.
-
-```sh
-mkdir -p /tmp/edstore/segments
-
-# v2 segment hex from tests/notes.md (size 148, sha256 5b73...).
-printf '%s' '4544475345473031000000021234000000000003000000000000001d0000000700000000000000040000000000000064c78d6d04123400000000000000000000000000000000000000000000000000000000000012340100000000000000000000000000000000000000000000000000000000001234020000000000000000000000000000000000000000000000000000000000' | xxd -r -p > /tmp/edstore/segments/1234.seg
-shasum -a 256 /tmp/edstore/segments/1234.seg  # must be 5b731684...e2cc33
-
-cat > /tmp/edstore/manifest.json <<'EOF'
-{
-  "version": 1,
-  "prefix_bytes": 2,
-  "segments": [
-    {
-      "prefix": 4660,
-      "count": 3,
-      "bloom_bits": 29,
-      "bloom_k": 7,
-      "root": "f99ca0d8c620026f1e279fa659c10eb5d15cbddc7e58fada9d876d962467fb61",
-      "file": "segments/1234.seg",
-      "size": 148,
-      "sha256": "5b7316849c9966c7ad4d5d1b9fb30d056403b8774a7171e9cb890e7271e2cc33",
-      "compression": "none"
-    }
-  ],
-  "signature": "G2RsncOaG1fV6Cg7BFrAFSiyXKx1+YVc2fxCTzC29cHf0KghbYtia4UOIsqPgNmwzUj8z2XriJouTmaT6KbODg==",
-  "signature_alg": "ed25519"
-}
-EOF
-
-/tmp/edgehash serve -dir /tmp/edstore -addr 127.0.0.1:8080
-```
-
-Serve **without** `-key`. The server loads with the legacy verifier disabled:
-it still validates the manifest structure and all segment bytes, and serves the
-Ed25519 manifest. (If your server build rejects this, use a mock HTTP server; do
-not weaken the client.)
-
-App configuration:
-
-- Ed25519 public key (test only):
-  `03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8`
-- Queries:
-  - present: `1234000000000000000000000000000000000000000000000000000000000000`
-  - present: `12340100…` (second hash)
-  - absent: `12340000…0003` (same prefix, not in the list)
-  - absent/no-segment: a hash with a different prefix
-- The server's lookup response will have capitalized proof keys and base64
-  signature; the mobile decoder handles both.
-
-This is an integration fixture, not a substitute for server-side Ed25519
-signing/verification tests.
-
-## 5. Emulator / simulator / device networking
+## 4. Emulator / simulator / device networking
 
 - **Android emulator:** host loopback is `10.0.2.2`. Use
   `http://10.0.2.2:8080` (development cleartext exception required). Or run
@@ -222,7 +192,7 @@ signing/verification tests.
   mode, and process death. The scaffold's `DeviceConditions` are supplied by
   the app, so these are app-integration tests.
 
-## 6. Required tests before shipping
+## 5. Required tests before shipping
 
 At minimum, add these to a real Android test source set and an iOS XCTest target
 (and, where possible, a JVM/SwiftPM shared test harness). Use the vectors in
@@ -299,9 +269,10 @@ At minimum, add these to a real Android test source set and an iOS XCTest target
     index outside count, depth mismatch, malformed path/right: reject.
 30. Lower-case and capitalized proof keys both parse; unknown fields do not
     become security-relevant.
-31. Absent: local `NO_SEGMENT` from signed manifest is exact; remote
-    `present=false` is `verified=false`; a future absence field is not treated
-    as verified.
+31. Absent: local `NO_SEGMENT` from the signed manifest is exact; remote
+    `present=false` without a verified proof is `verified=false`; if
+    `absence_proof` support is added, verify the boundary/neighbour rules from
+    protocol §7.4 before marking it verified.
 32. 404 treated as absent (compatibility) with `verified=false`; 5xx and
     malformed JSON produce explicit errors.
 
@@ -339,7 +310,7 @@ At minimum, add these to a real Android test source set and an iOS XCTest target
 46. Device tests: API 26/33+, iOS 16/current; airplane mode; low storage;
     clock skew; OS cache purge; process death during sync.
 
-## 7. What remains untested in this repository
+## 6. What remains untested in this repository
 
 - Android compile, lint, unit tests, instrumentation, API 26 vs 33 behavior.
 - iOS build/link, simulator/device run, CryptoKit behavior, actor concurrency

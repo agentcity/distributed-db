@@ -247,6 +247,15 @@ func New(serverURL, cacheDir string, key []byte, opts Options) (*Cache, error) {
 	}
 	c.cleanupStaleStaging()
 	c.loadLocal()
+	// Enforce limits/TTL against a cache restored from disk and drop stale
+	// generations. This also makes a restart apply newly configured limits.
+	c.mu.Lock()
+	if c.store != nil {
+		_ = c.evictLocked(time.Now())
+	}
+	c.pruneGenerationsLocked(c.generation)
+	c.updateStatsLocked()
+	c.mu.Unlock()
 	if c.evictInterval > 0 {
 		c.wg.Add(1)
 		go c.evictLoop()
@@ -314,6 +323,16 @@ func (c *Cache) GenerationDir() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.generationPathLocked()
+}
+
+// RootDir is an alias for Dir.
+func (c *Cache) RootDir() string {
+	return c.Dir()
+}
+
+// CurrentDir is an alias for GenerationDir.
+func (c *Cache) CurrentDir() string {
+	return c.GenerationDir()
 }
 
 func (c *Cache) generationPathLocked() string {
@@ -560,7 +579,12 @@ func (c *Cache) Evict() error {
 	defer c.syncMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.evictLocked(time.Now())
+	err := c.evictLocked(time.Now())
+	if c.store != nil {
+		c.pruneGenerationsLocked(c.generation)
+		c.updateStatsLocked()
+	}
+	return err
 }
 
 // EvictNow runs Evict and returns the resulting stats.
@@ -979,8 +1003,13 @@ func (c *Cache) cleanupStaleStaging() {
 		return
 	}
 	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), cacheStagingPrefix) {
-			_ = os.RemoveAll(filepath.Join(c.dir, entry.Name()))
+		name := entry.Name()
+		if entry.IsDir() && strings.HasPrefix(name, cacheStagingPrefix) {
+			_ = os.RemoveAll(filepath.Join(c.dir, name))
+			continue
+		}
+		if strings.HasPrefix(name, ".CURRENT.tmp-") {
+			_ = os.Remove(filepath.Join(c.dir, name))
 		}
 	}
 }
@@ -1011,8 +1040,13 @@ func (c *Cache) pruneGenerationsLocked(active string) {
 		return
 	}
 	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), cacheStagingPrefix) {
-			_ = os.RemoveAll(filepath.Join(c.dir, entry.Name()))
+		name := entry.Name()
+		if entry.IsDir() && strings.HasPrefix(name, cacheStagingPrefix) {
+			_ = os.RemoveAll(filepath.Join(c.dir, name))
+			continue
+		}
+		if strings.HasPrefix(name, ".CURRENT.tmp-") {
+			_ = os.Remove(filepath.Join(c.dir, name))
 		}
 	}
 }

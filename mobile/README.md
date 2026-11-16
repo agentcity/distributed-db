@@ -320,12 +320,19 @@ scaffolding to adapt, not as a build verified in this repository.
 
 Serve an HTTPS endpoint whose manifest has `signature_alg:"ed25519"` and whose
 segments are v1 or v2 `"none"` if you want an offline mobile cache. The current
-Go tree has Ed25519 and v2 compression support in `internal/edgeset`, and
-`edgehttp.NewServerWithOptions` accepts an Ed25519 verifier, but the `edgehash`
-CLI may still expose only the HMAC path. Check `edgehash build -h`,
-`edgehash serve -h`, and the actual `/v1/manifest` body before choosing
-`TrustConfig.ed25519`. For development, use `hmacLegacy` and a
-tiny 3-hash store (small segments auto-select uncompressed v2).
+CLI exposes Ed25519 signing/verification and compression control:
+
+```sh
+/tmp/edgehash build -in hashes.txt -out /tmp/edge-store \
+  -ed25519-key /tmp/edge-ed25519.pem -compression none
+/tmp/edgehash serve -dir /tmp/edge-store -addr 127.0.0.1:8080 \
+  -verify-ed25519 /tmp/edge-ed25519.pub.pem
+```
+
+Check `edgehash build -h` / `serve -h` and the actual `/v1/manifest` body
+before choosing `TrustConfig.ed25519`. For development, HMAC (`-key`) is still
+available for exercising the cache/proof path without Ed25519; keep it out of
+production builds.
 
 See [`TESTING.md`](TESTING.md) for `curl` commands and emulator/simulator host
 mapping.
@@ -334,10 +341,10 @@ mapping.
 
 Protocol / server integration:
 
-- Ed25519 signing/verification exists in the Go library and
-  `edgehttp.NewServerWithOptions` accepts an Ed25519 verifier, but the
-  `edgehash` CLI flags may still expose only HMAC. Do not ship until
-  `signature_alg:"ed25519"` is actually served and tested end to end.
+- Ed25519 signing/verification exists in the Go library and CLI
+  (`-ed25519-key`, `-verify-ed25519`), but the mobile scaffold still needs an
+  end-to-end test against a deployed endpoint. Do not ship until
+  `signature_alg:"ed25519"` is actually served and tested on devices.
 - The current Go proof JSON uses capitalized keys; the SDK accepts both. New
   servers should emit lower-case keys.
 - `signature` is base64 in the current Go JSON; the SDK accepts base64 and hex.
@@ -356,7 +363,8 @@ Protocol / server integration:
 - No TLS certificate pinning or client-side rate limiting.
 - No zstd decoder in the mobile scaffold. zstd segments are skipped for local
   caching and resolved remotely. This means offline coverage is limited to v1
-  or v2 `"none"` segments.
+  or v2 `"none"` segments; build stores with `-compression none` for offline
+  mobile use.
 - `version` is schema version, not a data generation. Use the fingerprint.
 - No multi-server failover or CDN discovery.
 

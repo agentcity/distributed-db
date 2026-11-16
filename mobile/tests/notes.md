@@ -298,13 +298,12 @@ bytes.
 
 ## 9. Notes on the current server/client gap
 
-At scaffold time:
+Current server/client notes:
 
-- `internal/edgeset` had Ed25519, v2 compression, and absence-proof helpers,
-  but `cmd/edgehash` exposed only HMAC `-key` and `internal/edgehttp` loaded
-  stores with the legacy HMAC verifier. The mobile default (pinned Ed25519) can
-  only be tested end to end once the HTTP server serves an Ed25519-signed
-  manifest, or with the manual fixture in `TESTING.md`.
+- `cmd/edgehash` exposes Ed25519 (`-ed25519-key`, `-verify-ed25519`),
+  compression (`-compression auto|none|zstd`), TLS/auth/rate options and
+  `?absence=1`. The mobile default (pinned Ed25519) can be tested end to end
+  with an Ed25519-signed store (`TESTING.md` §1).
 - `internal/edgeset.Proof` has no JSON tags, so the server currently emits
   `Hash`, `Index`, `Path`, `Right`. The mobile decoders accept both cases; new
   servers should emit lower-case. `absence_proof` uses `Prefix`, `Root`,
@@ -318,8 +317,8 @@ At scaffold time:
 - `Manifest.Version` is schema version 1, not a content generation. Cache keys
   must use the canonical fingerprint.
 - The mobile scaffold has no zstd decoder. It skips zstd segments during sync
-  and can still answer online via remote proofs. Use v2 `"none"` for offline
-  tests.
+  and can still answer online via remote proofs. Build with `-compression none`
+  for offline tests.
 - Absence proofs are available from the current server via `?absence=1` but
   are not consumed by the scaffold. `present=false` without a verified
   `absence_proof` is not a client-verifiable answer; a missing segment in the
