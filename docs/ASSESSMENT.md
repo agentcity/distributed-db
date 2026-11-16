@@ -76,9 +76,11 @@ DBaaS и не замена PostgreSQL.
   Jepsen-подобные partitions/clock skew, SQL P0, pgwire, backup/restore,
   batch, edgehash FPR/proofs/tamper/cache.
 - Небольшие бенчмарки на M1 Pro/loopback:
-  - single txn ~11.6 мс (~86 tx/s);
-  - parallel 10 клиентов ~1.8 мс/op (~5.5k tx/s);
-  - batch 256 ~0.15 мс/txn (~6.6–6.9k tx/s);
+  - fast: single txn ~11.6 мс (~86 tx/s);
+  - fast: parallel 10 клиентов ~1.2–2.1 мс/op (~480–820 tx/s);
+  - fast: batch 256 ~0.14–0.20 мс/txn (~5–7k tx/s амортизированно,
+    batch latency 36–51 мс);
+  - production `sync`: ~25 мс single, ~40–70 tx/s на 10 клиентах;
   - PostgreSQL 13 на том же железе: ~0.68 мс / 1 469 tx/s (1 клиент),
     ~1.47 мс / 6 835 tx/s (10 клиентов).
 

@@ -157,9 +157,10 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 - Stage 2.6: Add/Remove replica (learner → voter), meta orchestration,
   membership persist; single-server change, без joint consensus.
 - Замеры на M1 Pro/loopback в **fast**-профиле: 3 узла single txn ~11.6 мс (~86 tx/s),
-  parallel ~1.8 мс/op (~5.5k tx/s), batch 256 ~0.15 мс/txn
-  (~6.6–6.9k tx/s); PostgreSQL 13 рядом — ~6.8k tx/s на 10 клиентах.
-  Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
+  parallel 10 клиентов ~1.2–2.1 мс/op (~480–820 tx/s), batch 256
+  ~0.14–0.20 мс/txn (~5–7k tx/s, но batch latency 36–51 мс); PostgreSQL 13
+  рядом — ~6.8k tx/s на 10 клиентах. Production default `sync`: ~40–70 tx/s,
+  разрыв ~100×. Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
 
 Пока нет: joint consensus/decommission, per-chunk CRC, durable scheduler
 queue/leader lease, production TLS/auth, SLO p99 прогон, расширенный SQL

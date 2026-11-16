@@ -223,8 +223,9 @@ Stage 2.3: auto-merge, backup/restore, gzip snapshot. Leader transfer/rebalance,
 Add/Remove replica (learner→voter) сделан; остались joint consensus/decommission,
 per-chunk CRC, SLO p99, TLS/auth.
 Stage 3.3: batch-entry (64 × 500 µs) + `CommitBatch` (256 in-flight) —
-throughput batch 256 на уровне PostgreSQL 13 на loopback; single-client
-latency всё ещё ~17×. `SyncWrites=false` для state machine: durability
+batch throughput ~5–7k tx/s на уровне PostgreSQL 13 на loopback, но batch
+latency 36–51 мс; interactive/parallel fast всё ещё ~8–11×, production sync
+~100× медленнее. `SyncWrites=false` для state machine: durability
 опирается на replay Raft-лога, нужен crash-soak.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
