@@ -100,7 +100,7 @@ committed/rolled-back locks, а фоновый resolver на лидере range
 
 Минимальный SQL-слой: `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, `INSERT`,
 `SELECT` (projection, `WHERE` по PK или indexed-колонке, `LIMIT`,
-`COUNT/SUM/AVG/MIN/MAX`), `UPDATE`,
+`COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`), `UPDATE`,
 `DELETE` (включая multi-row по indexed-колонке). Каталог, строки и индексы
 лежат в KV, каждая команда — транзакция.
 
@@ -117,7 +117,7 @@ curl -s -X POST localhost:8080/v1/sql \
   -d '{"sql":"SELECT * FROM users"}'
 ```
 
-P0 не умеет JOIN, GROUP BY и pgwire; это следующие фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
+P0 не умеет JOIN и pgwire; это следующие фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 

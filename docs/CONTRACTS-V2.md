@@ -90,8 +90,8 @@ Requirements:
   `startTS`; `ErrLocked` if another transaction holds the lock.
 - `Scan` merges visible versions in key order, deduplicates by user key,
   respects `limit`; skips locks/rollbacks.
-- `GC` removes data/write versions older than the safe point and expired locks
-  (basic implementation is fine; document what is left).
+- `GC` removes data/write versions older than the safe point; it never
+  deletes locks (the lock resolver owns expired locks).
 - Tests: snapshot isolation, read-your-writes via locks, prewrite/commit,
   rollback, write conflict, lock conflict, scan versions, GC, reopen.
 - Use a fake storage engine in tests? Prefer a temp Pebble engine via

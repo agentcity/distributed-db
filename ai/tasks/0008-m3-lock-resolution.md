@@ -36,6 +36,7 @@ Percolator-транзакция может оставить lock после па
 - [x] E2E: rollback path.
 - [x] Клиентские методы CheckTxnStatus/ResolveLock и retry на live lock.
 - [x] Фоновый resolver просроченных locks.
+- [x] MVCC GC safe point (locks не удаляются).
 - [ ] Stress/Jepsen-проверка.
 
 ## Ссылки

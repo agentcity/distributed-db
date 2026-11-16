@@ -16,11 +16,10 @@
 //
 // # Lock resolution
 //
-// Resolving a lock (looking at the primary lock, then committing or rolling
-// back the secondary) is intentionally deferred to a later milestone. Until
-// then reads that hit a lock with startTS <= read timestamp return ErrLocked;
-// callers are expected to retry or roll back. GC treats locks below its safe
-// point as abandoned, but does not attempt to resolve them.
+// Resolving a lock uses CheckTxnStatus/ResolveLock: the caller inspects the
+// primary, commits or rolls back the transaction, and retries the read. GC
+// never deletes lock records; the background lock resolver owns expired locks
+// and resolves them through Raft.
 //
 // # Timestamps
 //
@@ -64,9 +63,8 @@ const (
 	kindRollback byte = 3
 )
 
-// defaultLockTTLMillis is stored in every lock record. It is informational for
-// now: lock resolution (which will enforce it) is a later milestone, and GC
-// uses its safe point rather than wall-clock time to identify abandoned locks.
+// defaultLockTTLMillis is stored in every lock record. CheckTxnStatus and the
+// background lock resolver use it to identify expired transactions.
 const defaultLockTTLMillis uint64 = 3000
 
 // lockValueHeaderLen is version + kind + startTS + TTL + primary length.

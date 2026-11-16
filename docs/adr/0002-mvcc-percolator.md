@@ -30,7 +30,8 @@ MVCC + optimistic **Percolator-style 2PC**:
 - `Rollback` удаляет locks и пишет rollback-record.
 - Чтение: самая новая data-версия с `commitTS <= readTS`; lock с
   `startTS <= readTS` → `ErrLocked` (разрешение локов — следующий этап).
-- GC удаляет версии старше safe point и просроченные locks.
+- GC удаляет версии старше safe point; locks не удаляет — их разрешает
+  lock resolver через Raft.
 
 Транзакция optimistic: конфликт обнаруживается на prewrite/commit, клиент
 повторяет с новым `startTS`.
