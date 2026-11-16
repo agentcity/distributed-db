@@ -27,11 +27,11 @@ SQL executor не использует cross-range 2PC, нет CBO/plan cache.
 
 ## Критерии
 
-- [ ] SQL-таблица переживает split.
-- [ ] Cross-range UPDATE/DELETE/SELECT.
-- [ ] CBO выбирает индекс/join order.
-- [ ] Plan cache invalidation.
-- [ ] E2E 3 узла.
+- [x] SQL-таблица переживает split.
+- [x] Cross-range UPDATE/DELETE/SELECT.
+- [x] CBO выбирает индекс/join order.
+- [x] Plan cache invalidation.
+- [x] E2E 3 узла.
 
 ## Ограничения
 

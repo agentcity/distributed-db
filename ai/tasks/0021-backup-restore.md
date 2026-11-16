@@ -27,10 +27,10 @@ scope:
 
 ## Критерии
 
-- [ ] Backup всех range без O(range) памяти.
-- [ ] Restore с проверкой manifest.
-- [ ] Verify checksum.
-- [ ] E2E.
+- [x] Backup всех range без O(range) памяти.
+- [x] Restore с проверкой manifest.
+- [x] Verify checksum.
+- [x] E2E.
 
 ## Ограничения
 

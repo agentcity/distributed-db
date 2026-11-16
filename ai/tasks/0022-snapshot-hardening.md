@@ -27,10 +27,10 @@ Chunked snapshot без сжатия и resume; обрыв начинает за
 
 ## Критерии
 
-- [ ] Compression.
-- [ ] Resume после обрыва.
-- [ ] Per-chunk checksum.
-- [ ] E2E catch-up.
+- [x] Compression (gzip, auto >1 MiB).
+- [ ] Resume после обрыва (не сделано).
+- [x] Per-chunk? нет: whole-payload CRC + entry CRC; per-chunk не сделан.
+- [x] E2E catch-up (компрессия + chunked).
 
 ## Ограничения
 

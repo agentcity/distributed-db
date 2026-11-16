@@ -26,11 +26,11 @@ pgwire поддерживает только simple Query; JDBC/pgx не раб�
 
 ## Критерии
 
-- [ ] Parse/Bind/Execute.
-- [ ] Prepared statement с параметрами.
-- [ ] Binary format INT/TEXT.
-- [ ] Error recovery.
-- [ ] E2E.
+- [x] Parse/Bind/Execute.
+- [x] Prepared statement с параметрами.
+- [x] Binary format INT/TEXT.
+- [x] Error recovery.
+- [x] E2E.
 
 ## Ограничения
 

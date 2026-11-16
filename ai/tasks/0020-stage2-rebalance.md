@@ -27,11 +27,11 @@ AutoSplit есть, но нет auto-merge, переноса реплик и б�
 
 ## Критерии
 
-- [ ] AutoMerge по размеру.
-- [ ] Leader transfer.
-- [ ] Add/Remove replica с catch-up.
-- [ ] Фоновый lifecycle loop.
-- [ ] E2E на 3 KV.
+- [x] AutoMerge по размеру.
+- [ ] Leader transfer (не сделано).
+- [ ] Add/Remove replica с catch-up (не сделано).
+- [x] Фоновый lifecycle loop.
+- [x] E2E auto-merge/lifecycle на fake KV; реальный 3-node — в 0027.
 
 ## Ограничения
 

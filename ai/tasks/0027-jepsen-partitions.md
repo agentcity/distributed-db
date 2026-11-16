@@ -26,10 +26,10 @@ Jepsen проверяет только graceful kill/restart.
 
 ## Критерии
 
-- [ ] Partition majority/minority.
-- [ ] Heal и catch-up.
-- [ ] Clock skew сценарий.
-- [ ] Cross-range invariant.
+- [x] Partition majority/minority.
+- [x] Heal и catch-up.
+- [x] Clock skew сценарий.
+- [x] Cross-range invariant.
 
 ## Ограничения
 

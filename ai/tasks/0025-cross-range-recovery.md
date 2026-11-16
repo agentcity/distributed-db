@@ -26,10 +26,10 @@ Primary-first 2PC без fault injection и deadlock detection.
 
 ## Критерии
 
-- [ ] Тесты crash after primary commit.
-- [ ] Secondary locks разрешаются.
-- [ ] Deadlock detection/abort.
-- [ ] Нет lost/partial visibility.
+- [x] Тесты crash after primary commit.
+- [x] Secondary locks разрешаются.
+- [x] Deadlock: bounded timeout+abort с wait-for диагностикой (без графа).
+- [x] Нет lost/partial visibility.
 
 ## Ограничения
 

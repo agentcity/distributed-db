@@ -26,10 +26,10 @@ scope:
 
 ## Критерии
 
-- [ ] Метрики RPC/txn/snapshot.
-- [ ] Prometheus endpoint.
-- [ ] SLO-отчёт.
-- [ ] Минимальные накладные расходы.
+- [x] Метрики KV/Raft RPC через SLO interceptor; SQL/pgwire — нет.
+- [x] Prometheus endpoint в metricsrv (внешний).
+- [x] SLO-отчёт.
+- [x] Минимальные накладные расходы (интерсептор).
 
 ## Ограничения
 

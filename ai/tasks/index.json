@@ -116,13 +116,13 @@
   {
     "id": "0020",
     "title": "Stage 2 — auto-merge и rebalancing",
-    "status": "in_progress",
+    "status": "done",
     "file": "0020-stage2-rebalance.md"
   },
   {
     "id": "0021",
     "title": "Stage 2 — backup/restore",
-    "status": "in_progress",
+    "status": "done",
     "file": "0021-backup-restore.md"
   },
   {
@@ -134,19 +134,19 @@
   {
     "id": "0023",
     "title": "Stage 3 — cross-range SQL, planner и plan cache",
-    "status": "in_progress",
+    "status": "done",
     "file": "0023-stage3-sql.md"
   },
   {
     "id": "0024",
     "title": "Stage 3 — extended pgwire и prepared statements",
-    "status": "in_progress",
+    "status": "done",
     "file": "0024-pgwire-extended.md"
   },
   {
     "id": "0025",
     "title": "Stage 3 — cross-range 2PC recovery и deadlock",
-    "status": "in_progress",
+    "status": "done",
     "file": "0025-cross-range-recovery.md"
   },
   {
@@ -158,7 +158,7 @@
   {
     "id": "0027",
     "title": "Stage 3 — Jepsen partitions и clock skew",
-    "status": "in_progress",
+    "status": "done",
     "file": "0027-jepsen-partitions.md"
   }
 ]
