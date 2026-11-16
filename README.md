@@ -11,6 +11,7 @@
 > нет TLS/auth, PITR, joint consensus и подтверждённого SLO.
 > Продуктовая оценка и путь к production: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 Сравнение скорости с PostgreSQL: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Edge-кэш хешей (Bloom + Merkle): [docs/EDGE-HASH-CACHE.md](docs/EDGE-HASH-CACHE.md).
 
 ## Что внутри
 
