@@ -186,37 +186,38 @@ TLS/Bearer.
 Фазы можно частично параллелить, но **G1/G2 нельзя обходить**: это safety,
 а не фичи.
 
-## 6.1 Статус Sprint 1 (2026-11-16)
+## 6.1 Текущее состояние
 
-Сделано:
+Работает:
 
 - production-профиль `-durability=sync` по умолчанию; `fast` — opt-in;
 - crash-injection harness: SIGKILL + restart, fast и sync; подтверждённых
   потерь нет, fast восстанавливается replay Raft-лога;
-- ADR 0005 membership safety (joint consensus) и ADR 0006 PITR;
+- ADR 0005 membership safety и ADR 0006 PITR;
 - pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS/mTLS
-  интегрирован в KV/meta/Raft/v2client/CLI (опционально, plaintext default);
+  для KV/meta/Raft/v2client/CLI (опционально, plaintext default);
 - 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
-- nightly chaos CI + script; Jepsen partition harness исправлен
-  (stable voter IDs + PeerAddrs), 15/15 smoke-тестов проходят.
+- nightly chaos CI + script; Jepsen partitions проходят;
+- kvctl CRUD/txn/shell + admin ranges/status/split/merge/backup.
 
 Не закрыто:
 
 - joint consensus и membership snapshot (ADR, не код);
 - PITR (ADR, не код);
-- gRPC/meta TLS включён по умолчанию и admin-listener/RBAC;
+- TLS по умолчанию, admin-listener, RBAC, audit, encryption at rest;
 - libpq-compatible pgwire TLS (сейчас direct TLS, не SSLRequest upgrade);
-- 1 ТБ реальный прогон, real-network soak.
+- 1 ТБ реальный прогон, real-network soak;
+- multi-range throughput и parallel apply.
 
-## 7. Первый спринт (2–4 недели)
+## 7. Ближайшие 2–4 недели
 
-1. Включить `SyncStateMachine=true` в production-профиле; fast — opt-in.
-2. Написать crash-injection harness (kill -9 на стадиях commit/snapshot).
-3. RFC: joint consensus vs one-change; membership в snapshot.
-4. RFC: PITR (WAL archiving, restore, retention).
-5. TLS/mTLS для gRPC и pgwire (minimum viable).
-6. 1 ТБ benchmark harness + p99, real network.
-7. Nightly chaos CI: kill leader, partition, disk full.
+1. Membership config в snapshot + joint consensus.
+2. Атомарный реплицированный split/merge.
+3. Periodic snapshot + MVCC GC + ENOSPC guard.
+4. SQL HTTP TLS/auth, admin-listener/RBAC.
+5. Multi-range benchmark + parallel apply.
+6. 1 ТБ прогон на Linux/NVMe, real network.
+
 
 ## 8. Критерии, что «продакшен готов»
 

@@ -1,12 +1,12 @@
-# Sprint 2 — надёжность и корректность: аудит и классификация отказов
+# Надёжность и корректность: аудит и классификация отказов
 
-- Дата: 2026-11-17; снимок кода `b588e24` + post-fix примечания
+- Дата: 2026-11-17
 - Область: только анализ. Код и существующие документы не менялись.
 - Прочитано: `internal/raft` (membership, snapshot, leader transfer, node),
   `internal/mvcc` (2PC, recovery, GC), `internal/kvserver`, `internal/metaserver`,
   `internal/v2client`, `internal/backup`, `test/jepsen*`,
   `test/crash_consistency_test.go`, `test/cross_range_*`, `test/split_merge_test.go`,
-  ADR 0005/0006, `docs/SPRINT-1-REPORT.md`, `docs/PRODUCTION-PLAN.md`.
+  ADR 0005/0006, `docs/PRODUCTION-PLAN.md`.
 
 ## 1. Вердикт
 
@@ -26,8 +26,7 @@ snapshot, детерминированные split/merge prep, Raft-лог с fs
 4. **Backup не является согласованным срезом**, PITR нет: `Scan` игнорирует
    локи, а commitTS мог быть выдан до скана.
 
-Оценка Sprint 1 («главный блокер — G2») подтверждается, но блокеров четыре:
-split/merge и lifecycle в отчёте Sprint 1 не были названы.
+Блокеров четыре: membership, split/merge, storage lifecycle, backup.
 
 ## 2. Классификация отказов
 

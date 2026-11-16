@@ -2,7 +2,7 @@
 
 - Статус: proposed (blocking production)
 - Дата: 2026-11-16
-- Контекст: Sprint 1 / production gate G2 (`docs/PRODUCTION-PLAN.md`)
+- Контекст: production gate G2 (`docs/PRODUCTION-PLAN.md`)
 - Связанные документы: `docs/PRODUCTION-PLAN.md`, `docs/ASSESSMENT.md`,
   `docs/PRODUCT-READINESS.md`, ADR 0003 (Multi-Raft)
 - Реализация: не начата. Этот документ фиксирует решение и план; кода он не
@@ -24,7 +24,8 @@
 > survive a leader failover between commit and apply and does not repair stale
 > snapshot configuration; it is acceptable only as a temporary freeze. Effort:
 > 14–19.5 person-weeks (~8–11 calendar weeks with two engineers); it is not a
-> Sprint 1 deliverable. The full argument is below in Russian.
+> This ADR is a design deliverable; implementation is separate. The full
+> argument is below in Russian.
 
 ## Решение (TL;DR)
 
@@ -1113,8 +1114,7 @@ config)` + чтения `Membership`. Проверки:
 Если сузить первый релиз (без mixed-version, без автоматического placement,
 decommission вручную) — 9–12 pw.
 
-Честно: это **не Sprint 1**. Sprint 1 даёт ADR; реализация — отдельный
-milestone. Оценка в `docs/PRODUCTION-PLAN.md` (6–8 недель на G1+G2 вместе)
+Честно: это только ADR; реализация — отдельныйmilestone. Оценка в `docs/PRODUCTION-PLAN.md` (6–8 недель на G1+G2 вместе)
 оптимистична: G2 в одиночку при выполнении заявленного gate (1000 changes,
 snapshot, decommission, mixed-version) — 14–19.5 pw. Риск недооценки высокий;
 лучше планировать верхнюю границу.
