@@ -220,9 +220,9 @@ meta SetRanges после успеха. Распределённый merge то�
 
 В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV,
 HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
-колонке), multi-row UPDATE/DELETE по индексу; e2e CREATE/INSERT/SELECT/
-UPDATE/DELETE прошёл.
-Осталось: JOIN/aggregates, pgwire. SQL на 3 узлах с kill лидера проверен.
+колонке), multi-row UPDATE/DELETE по индексу, агрегаты COUNT/SUM/AVG/
+MIN/MAX; e2e CREATE/INSERT/SELECT/UPDATE/DELETE прошёл.
+Осталось: GROUP BY, JOIN, pgwire. SQL на 3 узлах с kill лидера проверен.
 
 ## Целевая архитектура
 
