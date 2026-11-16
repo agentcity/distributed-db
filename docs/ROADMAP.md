@@ -222,6 +222,10 @@ planner/plan cache, extended pgwire, recovery, Jepsen partitions.
 Stage 2.3: auto-merge, backup/restore, gzip snapshot. Leader transfer/rebalance, snapshot resume и SQL/pgwire-метрики сделаны.
 Add/Remove replica (learner→voter) сделан; остались joint consensus/decommission,
 per-chunk CRC, SLO p99, TLS/auth.
+Stage 3.3: batch-entry (64 × 500 µs) + `CommitBatch` (256 in-flight) —
+throughput batch 256 на уровне PostgreSQL 13 на loopback; single-client
+latency всё ещё ~17×. `SyncWrites=false` для state machine: durability
+опирается на replay Raft-лога, нужен crash-soak.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
@@ -232,17 +236,30 @@ per-chunk CRC, SLO p99, TLS/auth.
 HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
 колонке), multi-row UPDATE/DELETE по индексу, агрегаты COUNT/SUM/AVG/
 MIN/MAX; e2e CREATE/INSERT/SELECT/UPDATE/DELETE прошёл.
-GROUP BY, INNER JOIN и минимальный pgwire сделаны. Осталось: planner
-(JOIN order/cost), extended protocol, LEFT/RIGHT JOIN. SQL на 3 узлах
-с kill лидера проверен.
+GROUP BY, INNER JOIN и pgwire simple+extended сделаны. Осталось: planner
+(JOIN order/cost), AND/OR, >2 JOIN, LEFT/RIGHT JOIN, NULL/DECIMAL/JSON/FK,
+online DDL, pg_catalog/JDBC/TLS. SQL на 3 узлах с kill лидера проверен.
+
+## Отдельный трек: edge hash cache
+
+Не транзакционная БД, а read-only membership для edge/CDN:
+
+- immutable сегменты, Bloom, Merkle inclusion/absence, Ed25519, zstd;
+- HTTP TLS/Bearer/rate limit/Range/CDN headers;
+- cache generation dirs + atomic CURRENT, LRU/TTL;
+- mobile Kotlin/Swift scaffold (не device-tested).
+
+Документация: [EDGE-HASH-CACHE.md](EDGE-HASH-CACHE.md).
+Применимость: [ASSESSMENT.md](ASSESSMENT.md).
 
 ## Production readiness
 
-Продуктовая оценка, применимость и гейты до production:
-[PRODUCT-READINESS.md](PRODUCT-READINESS.md).
+Честная оценка и применимость: [ASSESSMENT.md](ASSESSMENT.md).
+Гейты до production: [PRODUCT-READINESS.md](PRODUCT-READINESS.md).
 
-Коротко: Stage 1–3 закрыты как MVP, но production-блокеры — joint consensus,
-PITR, TLS/auth, rolling upgrade, SLO p99 и multi-AZ placement.
+Коротко: Stage 1–3 закрыты как MVP, batch throughput на уровне PostgreSQL
+на loopback, но production-блокеры — joint consensus, PITR, TLS/auth,
+rolling upgrade, SLO p99, 1 ТБ soak и multi-AZ placement.
 
 ## Целевая архитектура
 
