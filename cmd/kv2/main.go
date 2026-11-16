@@ -27,6 +27,9 @@ func main() {
 	addr := flag.String("addr", ":9090", "meta gRPC listen address")
 	dataDir := flag.String("data-dir", "./data/kv2", "node data directory")
 	peers := flag.String("peers", "", "comma-separated Raft peer addresses")
+	metaID := flag.String("meta-id", "", "meta node id, defaults to -addr")
+	metaPeers := flag.String("meta-peers", "", "comma-separated other meta gRPC addresses")
+	metaDataDir := flag.String("meta-data-dir", "./data/meta", "meta Raft WAL/snapshot directory")
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
 	flag.Parse()
 
@@ -34,7 +37,18 @@ func main() {
 
 	switch *mode {
 	case "meta":
-		srv, err := metaserver.New(metaserver.Config{Addr: *addr, Logger: log})
+		metaIDVal := *metaID
+		if metaIDVal == "" {
+			metaIDVal = *addr
+		}
+		metaCfg := metaserver.Config{
+			Addr: *addr, ID: metaIDVal, Peers: splitList(*metaPeers),
+			DataDir: *metaDataDir, Logger: log,
+		}
+		if len(metaCfg.Peers) > 0 {
+			metaCfg.Replicated = true
+		}
+		srv, err := metaserver.New(metaCfg)
 		if err != nil {
 			fatal(err)
 		}

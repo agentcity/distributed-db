@@ -50,8 +50,16 @@ v2 уже умеет одну Raft-группу с MVCC и транзакция�
 ```bash
 go build -o bin/kv2 ./cmd/kv2
 
-# meta/TSO
+# meta/TSO: один узел
 ./bin/kv2 -mode=meta -addr=:9090
+
+# meta/TSO: replicated Raft-кластер (3 узла, каждый в своём терминале)
+./bin/kv2 -mode=meta -addr=127.0.0.1:9090 -meta-id=127.0.0.1:9090 \
+  -meta-peers=127.0.0.1:9091,127.0.0.1:9092 -meta-data-dir=./data/meta1
+./bin/kv2 -mode=meta -addr=127.0.0.1:9091 -meta-id=127.0.0.1:9091 \
+  -meta-peers=127.0.0.1:9090,127.0.0.1:9092 -meta-data-dir=./data/meta2
+./bin/kv2 -mode=meta -addr=127.0.0.1:9092 -meta-id=127.0.0.1:9092 \
+  -meta-peers=127.0.0.1:9090,127.0.0.1:9091 -meta-data-dir=./data/meta3
 
 # три узла (в разных терминалах)
 ./bin/kv2 -mode=node -id=127.0.0.1:7001 -raft-addr=127.0.0.1:7001 \
