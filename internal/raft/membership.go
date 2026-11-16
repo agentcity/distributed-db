@@ -184,6 +184,11 @@ func (n *Node) applyConfigEntry(entry model.Entry) error {
 	n.configInFlight = false
 	n.syncReplicatorsLocked()
 	n.signalAllLocked()
+	if !n.selfIsVoterLocked() && (n.role == Leader || n.role == Candidate) {
+		// The committed configuration no longer contains this node, so it
+		// cannot lead or campaign. A learner may remain a follower.
+		n.stepDownWithErrorLocked("", ErrNotLeader)
+	}
 	if persistErr != nil {
 		n.logger.Error("raft: persist membership failed", "id", n.cfg.ID, "error", persistErr)
 	}

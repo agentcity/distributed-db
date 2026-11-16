@@ -88,10 +88,10 @@ func normalizeRanges(cfg Config) ([]RangeConfig, error) {
 			epoch = 1
 		}
 		out = append(out, RangeConfig{
-			ID:      rc.ID,
-			Start:   cloneBytes(rc.Start),
-			End:     cloneBytes(rc.End),
-			Peers:   cloneStrings(rc.Peers),
+			ID:           rc.ID,
+			Start:        cloneBytes(rc.Start),
+			End:          cloneBytes(rc.End),
+			Peers:        cloneStrings(rc.Peers),
 			Epoch:        epoch,
 			Learner:      rc.Learner,
 			ForceLearner: rc.ForceLearner,
@@ -144,10 +144,10 @@ func (s *Server) Ranges() []RangeConfig {
 			epoch = 1
 		}
 		out = append(out, RangeConfig{
-			ID:      rc.ID,
-			Start:   cloneBytes(rc.Start),
-			End:     cloneBytes(rc.End),
-			Peers:   cloneStrings(rc.Peers),
+			ID:           rc.ID,
+			Start:        cloneBytes(rc.Start),
+			End:          cloneBytes(rc.End),
+			Peers:        cloneStrings(rc.Peers),
 			Epoch:        epoch,
 			Learner:      rc.Learner,
 			ForceLearner: rc.ForceLearner,

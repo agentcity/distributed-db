@@ -1565,7 +1565,7 @@ func (n *Node) requestVote(peer string, req *RequestVoteRequest, electionTerm ui
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role != Candidate || n.term != electionTerm {
+	if n.stopped || n.role != Candidate || n.term != electionTerm || !n.selfIsVoterLocked() {
 		return
 	}
 	if resp.Term > n.term {
@@ -1586,7 +1586,7 @@ func (n *Node) requestVote(peer string, req *RequestVoteRequest, electionTerm ui
 // becomeLeaderLocked transitions to leader, appends the mandatory no-op entry
 // and starts one replicator per peer. Caller must hold mu.
 func (n *Node) becomeLeaderLocked() {
-	if n.stopped || n.role != Candidate {
+	if n.stopped || n.role != Candidate || !n.selfIsVoterLocked() {
 		return
 	}
 	n.role = Leader
