@@ -447,3 +447,28 @@ func TestCommitSingleConcurrentTransactions(t *testing.T) {
 		requireValue(t, store, key, 1000, value)
 	}
 }
+
+func TestCommitSinglesPerCommandOutcomes(t *testing.T) {
+	store, _ := newTestStoreWithEngine(t)
+	if err := store.CommitSingle([]Mutation{{Key: []byte("a"), Value: []byte("old")}}, nil, 10, 20); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	errs := store.CommitSingles([]SingleCommand{
+		{Mutations: []Mutation{{Key: []byte("b"), Value: []byte("vb")}}, StartTS: 30, CommitTS: 40},
+		{Mutations: []Mutation{{Key: []byte("a"), Value: []byte("stale")}}, StartTS: 15, CommitTS: 25},
+		{Mutations: []Mutation{{Key: []byte("c"), Value: []byte("vc")}}, StartTS: 30, CommitTS: 40},
+	})
+	if len(errs) != 3 {
+		t.Fatalf("errs len = %d", len(errs))
+	}
+	if errs[0] != nil || errs[2] != nil {
+		t.Fatalf("valid commands errors = %v, %v", errs[0], errs[2])
+	}
+	if !errors.Is(errs[1], ErrWriteConflict) {
+		t.Fatalf("stale command error = %v, want ErrWriteConflict", errs[1])
+	}
+	requireValue(t, store, "b", 40, "vb")
+	requireValue(t, store, "c", 40, "vc")
+	requireValue(t, store, "a", 20, "old")
+}

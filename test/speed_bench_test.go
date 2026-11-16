@@ -81,6 +81,10 @@ func speedWaitLeader(tb testing.TB, nodes []*v2Node) *v2Node {
 // leader, and registers teardown with tb.Cleanup. All listeners are on
 // 127.0.0.1 and all storage is under tb.TempDir().
 func newSpeedCluster(tb testing.TB) *speedCluster {
+	return newSpeedClusterWithDurability(tb, kvserver.DurabilityFast)
+}
+
+func newSpeedClusterWithDurability(tb testing.TB, durability string) *speedCluster {
 	tb.Helper()
 	ctx := context.Background()
 
@@ -116,7 +120,7 @@ func newSpeedCluster(tb testing.TB) *speedCluster {
 			Logger:             v2Logger(),
 			// Benchmarks measure the explicit fast profile; the production
 			// default is sync and is intentionally slower.
-			DurabilityMode: kvserver.DurabilityFast,
+			DurabilityMode: durability,
 		}
 		srv, err := kvserver.New(cfg)
 		if err != nil {
@@ -237,6 +241,55 @@ func BenchmarkV2Txn3NodeParallel(b *testing.B) {
 			txn.Set(speedAppendKey(buf, "bench-par/", seq.Add(1)), speedValue)
 			if err := txn.Commit(ctx); err != nil {
 				b.Errorf("speed bench: parallel commit: %v", err)
+				return
+			}
+		}
+	})
+}
+
+// BenchmarkV2Txn3NodeSync measures the production sync profile. It is
+// intentionally separate from the fast benchmark so regressions in per-batch
+// fsync batching are visible.
+func BenchmarkV2Txn3NodeSync(b *testing.B) {
+	c := newSpeedClusterWithDurability(b, kvserver.DurabilitySync)
+	speedWarmup(b, c.client)
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	buf := make([]byte, 0, 64)
+	for i := 0; i < b.N; i++ {
+		txn, err := c.client.Begin(ctx)
+		if err != nil {
+			b.Fatalf("sync bench: begin: %v", err)
+		}
+		txn.Set(speedAppendKey(buf, "bench-sync/", uint64(i)), speedValue)
+		if err := txn.Commit(ctx); err != nil {
+			b.Fatalf("sync bench: commit: %v", err)
+		}
+	}
+}
+
+// BenchmarkV2Txn3NodeSyncParallel measures production sync under concurrency.
+func BenchmarkV2Txn3NodeSyncParallel(b *testing.B) {
+	c := newSpeedClusterWithDurability(b, kvserver.DurabilitySync)
+	speedWarmup(b, c.client)
+	ctx := context.Background()
+	var seq atomic.Uint64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		buf := make([]byte, 0, 64)
+		for pb.Next() {
+			txn, err := c.client.Begin(ctx)
+			if err != nil {
+				b.Errorf("sync parallel begin: %v", err)
+				return
+			}
+			txn.Set(speedAppendKey(buf, "bench-sync-par/", seq.Add(1)), speedValue)
+			if err := txn.Commit(ctx); err != nil {
+				b.Errorf("sync parallel commit: %v", err)
 				return
 			}
 		}

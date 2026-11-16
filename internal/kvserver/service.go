@@ -87,10 +87,18 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		// failures: apply every command in order and let the batcher report
 		// each error to its own waiter. Returning an error here would fail
 		// the whole Raft entry for all transactions.
-		errs := make([]error, len(batch.Commands))
+		commands := make([]mvcc.SingleCommand, len(batch.Commands))
 		for i, cmd := range batch.Commands {
-			errs[i] = m.applyOne(cmd)
+			commands[i] = mvcc.SingleCommand{
+				Mutations: cmd.Mutations,
+				Primary:   cmd.Primary,
+				StartTS:   cmd.StartTS,
+				CommitTS:  cmd.CommitTS,
+			}
 		}
+		// One Pebble batch/fsync for the whole Raft entry. Per-command
+		// conflicts remain individual outcomes.
+		errs := m.store.CommitSingles(commands)
 		m.batchResults.put(batch.ID, errs)
 		return nil
 	case model.CommandRollback:
