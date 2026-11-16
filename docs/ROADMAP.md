@@ -222,7 +222,7 @@ planner/plan cache, extended pgwire, recovery, Jepsen partitions.
 Stage 2.3: auto-merge, backup/restore, gzip snapshot. Leader transfer/rebalance, snapshot resume и SQL/pgwire-метрики сделаны.
 Add/Remove replica (learner→voter) сделан; остались joint consensus/decommission,
 per-chunk CRC, SLO p99, TLS/auth.
-Stage 3.3: batch-entry (64 × 500 µs) + `CommitBatch` (256 in-flight) —
+Stage 3.3: batch-entry (256 × 500 µs) + `CommitBatch` (256 in-flight) —
 batch throughput ~5–7k tx/s на уровне PostgreSQL 13 на loopback, но batch
 latency 36–51 мс; interactive/parallel fast всё ещё ~8–11×, production sync
 ~33–37× медленнее. `SyncWrites=false` для state machine: durability

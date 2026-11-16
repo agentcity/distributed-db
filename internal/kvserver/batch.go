@@ -16,7 +16,7 @@ const (
 	// defaultCommitBatchMax is the maximum number of CommitSingle commands
 	// coalesced into one Raft entry. It matches Raft's own proposal batch cap
 	// so one application batch also fits into one durable log append.
-	defaultCommitBatchMax = 64
+	defaultCommitBatchMax = 256
 	// defaultCommitBatchWindow bounds how long the first CommitSingle of a
 	// batch waits for concurrent requests to join. It is deliberately tiny:
 	// every 1PC commit pays it once.
