@@ -87,12 +87,14 @@ membership не в state-machine snapshot.
 
 ### D. Security
 
-Сейчас: v2 gRPC и pgwire без TLS/auth; v1 HTTP имеет Basic/TLS; edgehash —
+Сейчас: gRPC TLS/mTLS реализован опционально (plaintext default); pgwire —
+TLS/password; SQL HTTP без TLS/auth; нет RBAC/audit/at-rest; edgehash —
 TLS/Bearer.
 
 Реализовать:
 
-1. TLS 1.3 + mTLS для gRPC (KV/Raft/meta), HTTP, pgwire.
+1. TLS 1.3 + mTLS сделать обязательным/fail-closed для gRPC (KV/Raft/meta),
+   SQL HTTP и pgwire.
 2. Authn: mTLS client cert или JWT/password; authz: RBAC (admin/read/write).
 3. **Audit log**: кто/что/когда, immutable/export.
 4. **Encryption at rest**: KMS/keys, rotation; snapshot/backup encryption.
