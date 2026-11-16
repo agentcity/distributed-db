@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,8 +31,29 @@ var (
 	ErrNotLeader = errors.New("v2client: not leader")
 	// ErrConflict is returned for lock/write conflicts.
 	ErrConflict = errors.New("v2client: transaction conflict")
+	// ErrCommitIncomplete means the primary range committed (the transaction
+	// is durable) but at least one secondary range did not. The transaction
+	// must not be rolled back; calling Txn.Commit again retries the remaining
+	// range commits idempotently at the same commitTS.
+	ErrCommitIncomplete = errors.New("v2client: commit point reached but not all ranges committed")
+	// ErrCommitUnknown means the primary range's commit outcome could not be
+	// determined (for example the primary leader died). The transaction may
+	// have committed, so Rollback is refused; retry Commit or resolve the
+	// transaction through the primary lock.
+	ErrCommitUnknown = errors.New("v2client: primary commit outcome unknown")
+	// ErrLockWaitTimeout means a conflicting lock did not clear within the
+	// configured wait budget. The error carries wait-for diagnostics.
+	ErrLockWaitTimeout = errors.New("v2client: lock wait timed out")
+
 	// errClientClosed is returned after Close.
 	errClientClosed = errors.New("v2client: closed")
+
+	// Server-reported conflict classes. They are wrapped together with
+	// ErrConflict so callers can distinguish "still locked" (worth waiting
+	// for) from "write conflict" (abort immediately).
+	errServerLocked           = errors.New("v2client: key is locked by another transaction")
+	errServerWriteConflict    = errors.New("v2client: write conflict")
+	errServerAlreadyCommitted = errors.New("v2client: transaction already committed")
 )
 
 const (
@@ -39,7 +61,146 @@ const (
 	maxAttempts    = 8
 	backoff        = 50 * time.Millisecond
 	defaultTimeout = 5 * time.Second
+
+	// defaultCommitRetryTimeout bounds secondary-commit retries after the
+	// primary range has committed. It is deliberately short: an unresolved
+	// transaction stays durably visible after recovery via its primary lock.
+	defaultCommitRetryTimeout = 5 * time.Second
+	// maxCommitRetryTimeout caps a caller-supplied retry budget.
+	maxCommitRetryTimeout = 30 * time.Second
+	// maxCommitRetryBackoff caps exponential backoff between retries.
+	maxCommitRetryBackoff = 500 * time.Millisecond
+	// maxResolveAttempts bounds prewrite/read conflict resolution loops.
+	maxResolveAttempts = 8
 )
+
+// TxnOptions tunes conflict waiting and post-commit retry for one transaction.
+// The zero value keeps the historical behavior: conflicts abort immediately and
+// secondary commits are retried for up to five seconds.
+type TxnOptions struct {
+	// LockWaitTimeout bounds how long a Prewrite or Get waits for a conflicting
+	// lock to be resolved (including cross-range resolution through the
+	// primary lock). Zero means do not wait: an unresolved lock is reported
+	// immediately with wait-for diagnostics.
+	LockWaitTimeout time.Duration
+	// CommitRetryTimeout bounds retries of a range commit after the primary
+	// commit point. Zero means defaultCommitRetryTimeout. The effective budget
+	// is additionally capped by the caller's context deadline.
+	CommitRetryTimeout time.Duration
+	// RetryBackoff is the initial delay between retries. Zero means 50ms; it
+	// doubles up to 500ms.
+	RetryBackoff time.Duration
+}
+
+func (o TxnOptions) retryBackoff() time.Duration {
+	if o.RetryBackoff > 0 {
+		return o.RetryBackoff
+	}
+	return backoff
+}
+
+func (o TxnOptions) commitRetryTimeout() time.Duration {
+	if o.CommitRetryTimeout <= 0 {
+		return defaultCommitRetryTimeout
+	}
+	if o.CommitRetryTimeout > maxCommitRetryTimeout {
+		return maxCommitRetryTimeout
+	}
+	return o.CommitRetryTimeout
+}
+
+// WaitFor is one lock that blocked a transaction, reported by LockWaitError.
+type WaitFor struct {
+	Key         []byte
+	Primary     []byte
+	LockStartTS uint64
+	Attempts    int
+	Waited      time.Duration
+	Reason      string
+}
+
+func (w WaitFor) String() string {
+	return fmt.Sprintf("key=%q lock_ts=%d primary=%q attempts=%d waited=%s (%s)",
+		w.Key, w.LockStartTS, w.Primary, w.Attempts, w.Waited.Round(time.Millisecond), w.Reason)
+}
+
+// LockWaitError reports a conflict that did not clear within the bounded wait
+// budget. It is a bounded alternative to spinning on a lock forever.
+type LockWaitError struct {
+	Keys    []WaitFor
+	Timeout time.Duration
+	Cause   error
+}
+
+func (e *LockWaitError) Error() string {
+	var b strings.Builder
+	if e.Timeout > 0 {
+		fmt.Fprintf(&b, "%s after %s", ErrLockWaitTimeout.Error(), e.Timeout)
+	} else {
+		fmt.Fprintf(&b, "%s: lock is still held", ErrConflict.Error())
+	}
+	for _, w := range e.Keys {
+		b.WriteString("; wait-for: ")
+		b.WriteString(w.String())
+	}
+	if e.Cause != nil {
+		b.WriteString("; last error: ")
+		b.WriteString(e.Cause.Error())
+	}
+	return b.String()
+}
+
+// Unwrap lets callers use errors.Is(err, ErrConflict); a waited conflict also
+// matches ErrLockWaitTimeout.
+func (e *LockWaitError) Unwrap() []error {
+	if e.Timeout > 0 {
+		return []error{ErrConflict, ErrLockWaitTimeout}
+	}
+	return []error{ErrConflict}
+}
+
+// CommitError reports a cross-range commit failure. OutcomeUnknown is set when
+// the primary range's commit result could not be determined; otherwise the
+// transaction reached its commit point and only secondary ranges are missing.
+type CommitError struct {
+	StartTS        uint64
+	CommitTS       uint64
+	Primary        []byte
+	PrimaryRange   uint64
+	FailedRange    uint64
+	Keys           [][]byte
+	Attempts       int
+	CommitPoint    bool
+	OutcomeUnknown bool
+	Cause          error
+}
+
+func (e *CommitError) Error() string {
+	var b strings.Builder
+	if e.OutcomeUnknown {
+		fmt.Fprintf(&b, "%s: start_ts=%d primary_range=%d failed_range=%d attempts=%d",
+			ErrCommitUnknown.Error(), e.StartTS, e.PrimaryRange, e.FailedRange, e.Attempts)
+	} else {
+		fmt.Fprintf(&b, "%s: start_ts=%d commit_ts=%d primary_range=%d failed_range=%d attempts=%d",
+			ErrCommitIncomplete.Error(), e.StartTS, e.CommitTS, e.PrimaryRange, e.FailedRange, e.Attempts)
+	}
+	b.WriteString("; do not roll back; retry Commit to finish secondary ranges")
+	if len(e.Keys) > 0 {
+		fmt.Fprintf(&b, "; keys=%q", e.Keys)
+	}
+	if e.Cause != nil {
+		b.WriteString("; last error: ")
+		b.WriteString(e.Cause.Error())
+	}
+	return b.String()
+}
+
+func (e *CommitError) Unwrap() error {
+	if e.OutcomeUnknown {
+		return ErrCommitUnknown
+	}
+	return ErrCommitIncomplete
+}
 
 // Client is a transactional v2 KV client. It is safe for concurrent use.
 type Client struct {
@@ -51,6 +212,10 @@ type Client struct {
 	closed  bool
 
 	addrs []string
+	// dialOpts are applied to KV node connections. They are useful for
+	// custom timeouts, TLS and test interceptors; meta connections are
+	// intentionally unaffected.
+	dialOpts []grpc.DialOption
 
 	// Meta service connection pool and leader discovery. Connections are
 	// pooled by address so repeated failover does not create a new gRPC
@@ -89,13 +254,22 @@ type leaderEntry struct {
 // New connects to the meta service and one or more KV nodes. It does not dial
 // KV nodes until the first operation.
 func New(metaAddr string, addrs []string) (*Client, error) {
+	return NewWithDialOptions(metaAddr, addrs)
+}
+
+// NewWithDialOptions is New with additional gRPC dial options applied to KV
+// node connections. Meta connections use the default options. It is primarily
+// useful for custom transport security, keepalive settings and test
+// interceptors.
+func NewWithDialOptions(metaAddr string, addrs []string, opts ...grpc.DialOption) (*Client, error) {
 	if metaAddr == "" {
 		return nil, errors.New("v2client: meta address is required")
 	}
 	if len(addrs) == 0 {
 		return nil, errors.New("v2client: at least one node address is required")
 	}
-	cc, err := grpc.NewClient(metaAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	metaOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	cc, err := grpc.NewClient(metaAddr, metaOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("v2client: dial meta: %w", err)
 	}
@@ -107,6 +281,7 @@ func New(metaAddr string, addrs []string) (*Client, error) {
 		metaPool:        map[string]*metaEntry{metaAddr: {cc: cc, mc: mc}},
 		metaDial:        dialMeta,
 		addrs:           append([]string(nil), addrs...),
+		dialOpts:        append([]grpc.DialOption(nil), opts...),
 		clients:         make(map[string]pbv2.KVServiceClient),
 		conns:           make(map[string]*grpc.ClientConn),
 		leaders:         make(map[uint64]leaderEntry),
@@ -168,7 +343,10 @@ func (c *Client) node(addr string) (pbv2.KVServiceClient, error) {
 	if cl, ok := c.clients[addr]; ok {
 		return cl, nil
 	}
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts := make([]grpc.DialOption, 0, len(c.dialOpts)+1)
+	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts = append(opts, c.dialOpts...)
+	cc, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +494,14 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 		case "range frozen":
 			lastErr = ErrConflict
 			continue
+		case "locked":
+			// A live lock is a conflict, not a transport error. Callers that
+			// can wait inspect the primary lock and resolve it explicitly.
+			return fmt.Errorf("%w: %w", ErrConflict, errServerLocked)
+		case "write conflict":
+			return fmt.Errorf("%w: %w", ErrConflict, errServerWriteConflict)
+		case "already committed":
+			return fmt.Errorf("%w: %w", ErrConflict, errServerAlreadyCommitted)
 		case "stale epoch", "not hosted":
 			// The cached descriptor is no longer valid (split/merge or the
 			// range moved). Drop everything for this key and re-resolve it
@@ -398,20 +584,40 @@ type Txn struct {
 	startTS uint64
 	order   []string
 	writes  map[string]*pbv2.Mutation
+	opts    TxnOptions
 	done    bool
+
+	// Cross-range commit state. Once commitStarted is set the plan is frozen
+	// and Commit can be retried idempotently at the same commitTS without
+	// re-prewriting or rolling back.
+	commitStarted   bool
+	commitPoint     bool // primary range committed: rollback is forbidden
+	commitAmbiguous bool // primary commit result unknown: rollback is forbidden
+	commitTS        uint64
+	primary         []byte
+	ordered         []*rangeBatch
 }
 
 // Begin allocates a start timestamp and returns a transaction.
 func (c *Client) Begin(ctx context.Context) (*Txn, error) {
+	return c.BeginWithOptions(ctx, TxnOptions{})
+}
+
+// BeginWithOptions is Begin with per-transaction retry and lock-wait options.
+func (c *Client) BeginWithOptions(ctx context.Context, opts TxnOptions) (*Txn, error) {
 	ts, err := c.AllocTS(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &Txn{c: c, startTS: ts, writes: make(map[string]*pbv2.Mutation)}, nil
+	return &Txn{c: c, startTS: ts, writes: make(map[string]*pbv2.Mutation), opts: opts}, nil
 }
 
 // StartTS returns the transaction's start timestamp.
 func (t *Txn) StartTS() uint64 { return t.startTS }
+
+// CommitTS returns the timestamp chosen for a commit that has started, or 0
+// before the commit phase. It is stable across idempotent Commit retries.
+func (t *Txn) CommitTS() uint64 { return t.commitTS }
 
 // Set stages a put.
 func (t *Txn) Set(key, value []byte) {
@@ -432,7 +638,11 @@ func (t *Txn) Delete(key []byte) {
 }
 
 // Get reads through the transaction snapshot: staged writes first, then the
-// committed value at startTS.
+// committed value at startTS. If the key is blocked by a lock, Get resolves the
+// lock through its primary: a committed primary means the secondary lock is
+// committed, a rolled-back primary means it is rolled back. When the primary is
+// still live, the read waits for at most TxnOptions.LockWaitTimeout and then
+// fails with wait-for diagnostics.
 func (t *Txn) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if m, ok := t.writes[string(key)]; ok {
 		if m.GetDelete() {
@@ -440,27 +650,130 @@ func (t *Txn) Get(ctx context.Context, key []byte) ([]byte, error) {
 		}
 		return append([]byte(nil), m.GetValue()...), nil
 	}
-	var out []byte
-	var found bool
-	var msg string
-	err := t.c.retry(ctx, key, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
-		resp, err := cl.Get(ctx, &pbv2.GetRequest{Key: key, Ts: t.startTS})
-		if err != nil {
-			return "", "", err
+	wait := t.opts.LockWaitTimeout
+	if wait < 0 {
+		wait = 0
+	}
+	deadline := time.Now().Add(wait)
+	for attempt := 0; attempt < maxResolveAttempts; attempt++ {
+		var out []byte
+		var found bool
+		var msg string
+		err := t.c.retry(ctx, key, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+			resp, err := cl.Get(ctx, &pbv2.GetRequest{Key: key, Ts: t.startTS})
+			if err != nil {
+				return "", "", err
+			}
+			out, found, msg = resp.GetValue(), resp.GetFound(), resp.GetError()
+			return resp.GetLeader(), resp.GetError(), nil
+		})
+		if err == nil {
+			if msg != "" {
+				return nil, fmt.Errorf("v2client: get: %s", msg)
+			}
+			if !found {
+				return nil, ErrNotFound
+			}
+			return out, nil
 		}
-		out, found, msg = resp.GetValue(), resp.GetFound(), resp.GetError()
-		return resp.GetLeader(), resp.GetError(), nil
-	})
-	if err != nil {
-		return nil, err
+		if !errors.Is(err, errServerLocked) {
+			return nil, err
+		}
+		resolved, wf, rerr := t.c.resolveLockedKey(ctx, key, deadline, t.opts.retryBackoff())
+		if rerr != nil {
+			return nil, rerr
+		}
+		if resolved {
+			continue
+		}
+		waits := make([]WaitFor, 0, 1)
+		if wf != nil {
+			waits = append(waits, *wf)
+		}
+		return nil, &LockWaitError{Keys: waits, Timeout: wait, Cause: err}
 	}
-	if msg != "" {
-		return nil, fmt.Errorf("v2client: get: %s", msg)
+	return nil, &LockWaitError{
+		Keys:    []WaitFor{{Key: append([]byte(nil), key...), Attempts: maxResolveAttempts, Reason: "conflict persisted"}},
+		Timeout: wait,
+		Cause:   ErrConflict,
 	}
-	if !found {
-		return nil, ErrNotFound
+}
+
+// resolveLockedKey inspects key's lock and tries to resolve it through the
+// transaction's primary lock, which lives in the primary range for cross-range
+// transactions. It returns resolved=true when the lock is gone (or was
+// committed/rolled back by this call), or resolved=false with wait-for
+// diagnostics when the primary transaction is still live at deadline.
+func (c *Client) resolveLockedKey(ctx context.Context, key []byte, deadline time.Time, backoff time.Duration) (bool, *WaitFor, error) {
+	if backoff <= 0 {
+		backoff = 50 * time.Millisecond
 	}
-	return out, nil
+	start := time.Now()
+	attempts := 0
+	var last WaitFor
+	for {
+		attempts++
+		st, err := c.CheckTxnStatus(ctx, key, 0)
+		if err != nil {
+			last = WaitFor{
+				Key: append([]byte(nil), key...), Attempts: attempts,
+				Waited: time.Since(start), Reason: "check lock status: " + err.Error(),
+			}
+		} else if st.GetLockTs() == 0 && len(st.GetLockPrimary()) == 0 {
+			// No lock remains; a commit/rollback record (if any) is handled by
+			// the normal read path.
+			return true, nil, nil
+		} else {
+			lockTS := st.GetLockTs()
+			primary := append([]byte(nil), st.GetLockPrimary()...)
+			if len(primary) == 0 {
+				primary = append([]byte(nil), key...)
+			}
+			last = WaitFor{
+				Key: append([]byte(nil), key...), Primary: primary, LockStartTS: lockTS,
+				Attempts: attempts, Waited: time.Since(start),
+			}
+			pst, perr := c.CheckTxnStatus(ctx, primary, lockTS)
+			keys := st.GetKeys()
+			if len(keys) == 0 {
+				keys = [][]byte{append([]byte(nil), key...)}
+			}
+			switch {
+			case perr != nil:
+				last.Reason = "check primary lock: " + perr.Error()
+			case pst.GetCommitted():
+				if rerr := c.ResolveLock(ctx, keys, lockTS, pst.GetCommitTs()); rerr != nil {
+					last.Reason = "resolve committed lock: " + rerr.Error()
+				} else {
+					return true, nil, nil
+				}
+			case pst.GetRolledBack():
+				if rerr := c.ResolveLock(ctx, keys, lockTS, 0); rerr != nil {
+					last.Reason = "resolve rolled-back lock: " + rerr.Error()
+				} else {
+					return true, nil, nil
+				}
+			default:
+				last.Reason = "primary transaction is still live"
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return false, &last, nil
+		}
+		pause := time.Until(deadline)
+		if pause > backoff {
+			pause = backoff
+		}
+		select {
+		case <-ctx.Done():
+			return false, &last, ctx.Err()
+		case <-time.After(pause):
+		}
+		backoff *= 2
+		if backoff > maxCommitRetryBackoff {
+			backoff = maxCommitRetryBackoff
+		}
+	}
 }
 
 // Scan reads a range at the transaction snapshot. It is routed by start key.
@@ -488,9 +801,20 @@ func (t *Txn) Scan(ctx context.Context, start, end []byte, limit int) ([]KV, err
 }
 
 // Commit prewrites all staged mutations and commits them.
+//
+// A cross-range transaction uses primary-first 2PC. Once the primary range's
+// commit succeeds the transaction is durable (the commit point) and Commit will
+// never roll back secondary ranges: if a secondary fails, Commit returns an
+// error matching ErrCommitIncomplete and a later Commit call retries the same
+// commitTS idempotently. If the primary's commit outcome cannot be determined,
+// the error matches ErrCommitUnknown and Rollback is refused for the same
+// reason.
 func (t *Txn) Commit(ctx context.Context) error {
 	if t.done {
 		return errors.New("v2client: transaction is finished")
+	}
+	if t.commitStarted {
+		return t.finishCommit(ctx)
 	}
 	if len(t.writes) == 0 {
 		t.done = true
@@ -541,7 +865,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 
 	if len(batches) == 1 {
 		var commitMsg string
-		if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 			resp, err := cl.CommitSingle(ctx, &pbv2.CommitSingleRequest{
 				StartTs: t.startTS, CommitTs: commitTS, Primary: primary, Mutations: mutations,
 			})
@@ -550,12 +874,24 @@ func (t *Txn) Commit(ctx context.Context) error {
 			}
 			commitMsg = resp.GetError()
 			return resp.GetLeader(), resp.GetError(), nil
-		}); err != nil {
+		})
+		if err != nil && errors.Is(err, errServerWriteConflict) {
+			// A retry after a lost success response reports a write conflict
+			// because the transaction is already committed. Confirm through
+			// the committed record before surfacing an error.
+			if st, serr := t.c.CheckTxnStatus(ctx, primary, t.startTS); serr == nil && st.GetCommitted() {
+				t.commitTS = st.GetCommitTs()
+				t.done = true
+				return nil
+			}
+		}
+		if err != nil {
 			return err
 		}
 		if commitMsg != "" {
 			return fmt.Errorf("v2client: commit: %s", commitMsg)
 		}
+		t.commitTS = commitTS
 		t.done = true
 		return nil
 	}
@@ -577,10 +913,39 @@ func (t *Txn) Commit(ctx context.Context) error {
 		}
 	}
 
+	// Prewrite every range, waiting out conflicting locks up to
+	// LockWaitTimeout. Any failure before the commit point rolls back the
+	// ranges that were already prewritten.
 	prewritten := make([]*rangeBatch, 0, len(ordered))
 	for _, b := range ordered {
+		if err := t.prewriteBatch(ctx, b, primary); err != nil {
+			t.rollbackBatches(ctx, prewritten)
+			return err
+		}
+		prewritten = append(prewritten, b)
+	}
+
+	// Freeze the plan before the first commit RPC. From this point on a retry
+	// reuses the same startTS/commitTS and only replays idempotent commits.
+	t.commitStarted = true
+	t.commitTS = commitTS
+	t.primary = primary
+	t.ordered = ordered
+	return t.finishCommit(ctx)
+}
+
+// prewriteBatch prewrites one range, resolving (or waiting for) conflicting
+// locks through the transaction's primary lock.
+func (t *Txn) prewriteBatch(ctx context.Context, b *rangeBatch, primary []byte) error {
+	wait := t.opts.LockWaitTimeout
+	if wait < 0 {
+		wait = 0
+	}
+	deadline := time.Now().Add(wait)
+	var last WaitFor
+	for attempt := 0; attempt < maxResolveAttempts; attempt++ {
 		var msg string
-		if err := t.c.retry(ctx, b.keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		err := t.c.retry(ctx, b.keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 			resp, err := cl.Prewrite(ctx, &pbv2.PrewriteRequest{
 				StartTs: t.startTS, Primary: primary, Mutations: b.muts,
 			})
@@ -589,37 +954,142 @@ func (t *Txn) Commit(ctx context.Context) error {
 			}
 			msg = resp.GetError()
 			return resp.GetLeader(), resp.GetError(), nil
-		}); err != nil {
-			t.rollbackBatches(ctx, prewritten)
-			return err
+		})
+		if err == nil && msg == "" {
+			return nil
 		}
-		if msg != "" {
-			t.rollbackBatches(ctx, prewritten)
-			return fmt.Errorf("v2client: prewrite range %d: %s", b.id, msg)
+		if err == nil {
+			err = fmt.Errorf("%s", msg)
 		}
-		prewritten = append(prewritten, b)
+		if !errors.Is(err, errServerLocked) {
+			return fmt.Errorf("v2client: prewrite range %d: %w", b.id, err)
+		}
+		resolved, wf, rerr := t.c.resolveLockedKey(ctx, b.keys[0], deadline, t.opts.retryBackoff())
+		if wf != nil {
+			last = *wf
+		}
+		if rerr != nil {
+			return fmt.Errorf("v2client: prewrite range %d: resolve lock: %w", b.id, rerr)
+		}
+		if resolved {
+			continue
+		}
+		return &LockWaitError{Keys: []WaitFor{last}, Timeout: wait, Cause: err}
 	}
+	return &LockWaitError{Keys: []WaitFor{last}, Timeout: wait, Cause: ErrConflict}
+}
 
-	for _, b := range ordered {
+// finishCommit drives the frozen cross-range plan. It is safe to call more than
+// once: each range commit is idempotent at the stored commitTS.
+func (t *Txn) finishCommit(ctx context.Context) error {
+	deadline := time.Now().Add(t.opts.commitRetryTimeout())
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	start := 0
+	if t.commitPoint {
+		// The primary is already committed; only secondaries remain. Replay
+		// them without touching the primary range.
+		start = 1
+	}
+	for i := start; i < len(t.ordered); i++ {
+		b := t.ordered[i]
+		attempts, err := t.commitBatch(ctx, b, deadline)
+		if err == nil {
+			if i == 0 {
+				t.commitPoint = true
+			}
+			continue
+		}
+		if i == 0 {
+			// The primary commit failed. Determine whether it nevertheless
+			// became durable; if that cannot be established, rollback would
+			// be unsafe.
+			st, serr := t.c.CheckTxnStatus(ctx, t.primary, t.startTS)
+			if serr == nil && st.GetCommitted() {
+				t.commitPoint = true
+				continue
+			}
+			if serr == nil && st.GetRolledBack() && st.GetLockTs() == 0 {
+				return fmt.Errorf("v2client: commit primary range %d: %w", b.id, err)
+			}
+			t.commitAmbiguous = true
+			return &CommitError{
+				StartTS: t.startTS, CommitTS: t.commitTS, Primary: t.primary,
+				PrimaryRange: b.id, FailedRange: b.id, Keys: b.keys,
+				Attempts: attempts, OutcomeUnknown: true, Cause: err,
+			}
+		}
+		if !t.commitPoint {
+			// Batch 0 committed in an earlier call (or just above).
+			t.commitPoint = true
+		}
+		return &CommitError{
+			StartTS: t.startTS, CommitTS: t.commitTS, Primary: t.primary,
+			PrimaryRange: t.ordered[0].id, FailedRange: b.id, Keys: b.keys,
+			Attempts: attempts, CommitPoint: true, Cause: err,
+		}
+	}
+	t.done = true
+	return nil
+}
+
+// commitBatch commits one range, retrying transient failures until deadline.
+// Conflict errors are permanent. Every retry uses the same commitTS, so a range
+// that already applied the commit treats the replay as a no-op.
+func (t *Txn) commitBatch(ctx context.Context, b *rangeBatch, deadline time.Time) (int, error) {
+	attempts := 0
+	wait := t.opts.retryBackoff()
+	var lastErr error
+	for {
+		attempts++
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr == nil {
+				lastErr = context.DeadlineExceeded
+			}
+			return attempts, lastErr
+		}
+		callCtx, cancel := context.WithTimeout(ctx, remaining)
 		var msg string
-		if err := t.c.retry(ctx, b.keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		err := t.c.retry(callCtx, b.keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
 			resp, err := cl.Commit(ctx, &pbv2.CommitRequest{
-				StartTs: t.startTS, CommitTs: commitTS, Keys: b.keys,
+				StartTs: t.startTS, CommitTs: t.commitTS, Keys: b.keys,
 			})
 			if err != nil {
 				return "", "", err
 			}
 			msg = resp.GetError()
 			return resp.GetLeader(), resp.GetError(), nil
-		}); err != nil {
-			return err
+		})
+		cancel()
+		if err == nil && msg == "" {
+			return attempts, nil
 		}
-		if msg != "" {
-			return fmt.Errorf("v2client: commit range %d: %s", b.id, msg)
+		if err == nil {
+			err = fmt.Errorf("v2client: commit range %d: %s", b.id, msg)
+		}
+		lastErr = err
+		if errors.Is(err, ErrConflict) || ctx.Err() != nil {
+			return attempts, err
+		}
+		if !time.Now().Before(deadline) {
+			return attempts, lastErr
+		}
+		pause := wait
+		if d := time.Until(deadline); d < pause {
+			pause = d
+		}
+		select {
+		case <-ctx.Done():
+			return attempts, ctx.Err()
+		case <-time.After(pause):
+		}
+		wait *= 2
+		if wait > maxCommitRetryBackoff {
+			wait = maxCommitRetryBackoff
 		}
 	}
-	t.done = true
-	return nil
 }
 
 // rollbackKeys rolls back one range's keys with the transaction's startTS.
@@ -649,11 +1119,19 @@ func (t *Txn) rollbackBatches(ctx context.Context, batches []*rangeBatch) {
 	}
 }
 
-// Rollback aborts the transaction. It is idempotent.
+// Rollback aborts the transaction. It is idempotent. After the primary range's
+// commit has succeeded (or may have succeeded) Rollback refuses to run: rolling
+// back secondary ranges would make the transaction partially visible.
 func (t *Txn) Rollback(ctx context.Context) error {
 	if t.done || len(t.writes) == 0 {
 		t.done = true
 		return nil
+	}
+	if t.commitPoint {
+		return fmt.Errorf("%w: start_ts=%d already reached its commit point; retry Commit instead of Rollback", ErrCommitIncomplete, t.startTS)
+	}
+	if t.commitAmbiguous {
+		return fmt.Errorf("%w: start_ts=%d primary commit outcome is unknown; retry Commit instead of Rollback", ErrCommitUnknown, t.startTS)
 	}
 	keys := make([][]byte, 0, len(t.order))
 	for _, k := range t.order {
