@@ -649,11 +649,13 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	MetaService_AllocTS_FullMethodName    = "/dbv2.MetaService/AllocTS"
-	MetaService_GetRange_FullMethodName   = "/dbv2.MetaService/GetRange"
-	MetaService_ListRanges_FullMethodName = "/dbv2.MetaService/ListRanges"
-	MetaService_Leader_FullMethodName     = "/dbv2.MetaService/Leader"
-	MetaService_SetRanges_FullMethodName  = "/dbv2.MetaService/SetRanges"
+	MetaService_AllocTS_FullMethodName     = "/dbv2.MetaService/AllocTS"
+	MetaService_GetRange_FullMethodName    = "/dbv2.MetaService/GetRange"
+	MetaService_ListRanges_FullMethodName  = "/dbv2.MetaService/ListRanges"
+	MetaService_Leader_FullMethodName      = "/dbv2.MetaService/Leader"
+	MetaService_SetRanges_FullMethodName   = "/dbv2.MetaService/SetRanges"
+	MetaService_SplitRange_FullMethodName  = "/dbv2.MetaService/SplitRange"
+	MetaService_MergeRanges_FullMethodName = "/dbv2.MetaService/MergeRanges"
 )
 
 // MetaServiceClient is the client API for MetaService service.
@@ -667,6 +669,8 @@ type MetaServiceClient interface {
 	ListRanges(ctx context.Context, in *ListRangesRequest, opts ...grpc.CallOption) (*ListRangesResponse, error)
 	Leader(ctx context.Context, in *LeaderRequest, opts ...grpc.CallOption) (*LeaderResponse, error)
 	SetRanges(ctx context.Context, in *SetRangesRequest, opts ...grpc.CallOption) (*SetRangesResponse, error)
+	SplitRange(ctx context.Context, in *MetaSplitRangeRequest, opts ...grpc.CallOption) (*MetaSplitRangeResponse, error)
+	MergeRanges(ctx context.Context, in *MetaMergeRangesRequest, opts ...grpc.CallOption) (*MetaMergeRangesResponse, error)
 }
 
 type metaServiceClient struct {
@@ -727,6 +731,26 @@ func (c *metaServiceClient) SetRanges(ctx context.Context, in *SetRangesRequest,
 	return out, nil
 }
 
+func (c *metaServiceClient) SplitRange(ctx context.Context, in *MetaSplitRangeRequest, opts ...grpc.CallOption) (*MetaSplitRangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MetaSplitRangeResponse)
+	err := c.cc.Invoke(ctx, MetaService_SplitRange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *metaServiceClient) MergeRanges(ctx context.Context, in *MetaMergeRangesRequest, opts ...grpc.CallOption) (*MetaMergeRangesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MetaMergeRangesResponse)
+	err := c.cc.Invoke(ctx, MetaService_MergeRanges_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MetaServiceServer is the server API for MetaService service.
 // All implementations must embed UnimplementedMetaServiceServer
 // for forward compatibility.
@@ -738,6 +762,8 @@ type MetaServiceServer interface {
 	ListRanges(context.Context, *ListRangesRequest) (*ListRangesResponse, error)
 	Leader(context.Context, *LeaderRequest) (*LeaderResponse, error)
 	SetRanges(context.Context, *SetRangesRequest) (*SetRangesResponse, error)
+	SplitRange(context.Context, *MetaSplitRangeRequest) (*MetaSplitRangeResponse, error)
+	MergeRanges(context.Context, *MetaMergeRangesRequest) (*MetaMergeRangesResponse, error)
 	mustEmbedUnimplementedMetaServiceServer()
 }
 
@@ -762,6 +788,12 @@ func (UnimplementedMetaServiceServer) Leader(context.Context, *LeaderRequest) (*
 }
 func (UnimplementedMetaServiceServer) SetRanges(context.Context, *SetRangesRequest) (*SetRangesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetRanges not implemented")
+}
+func (UnimplementedMetaServiceServer) SplitRange(context.Context, *MetaSplitRangeRequest) (*MetaSplitRangeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SplitRange not implemented")
+}
+func (UnimplementedMetaServiceServer) MergeRanges(context.Context, *MetaMergeRangesRequest) (*MetaMergeRangesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method MergeRanges not implemented")
 }
 func (UnimplementedMetaServiceServer) mustEmbedUnimplementedMetaServiceServer() {}
 func (UnimplementedMetaServiceServer) testEmbeddedByValue()                     {}
@@ -874,6 +906,42 @@ func _MetaService_SetRanges_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MetaService_SplitRange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MetaSplitRangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MetaServiceServer).SplitRange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MetaService_SplitRange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MetaServiceServer).SplitRange(ctx, req.(*MetaSplitRangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MetaService_MergeRanges_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MetaMergeRangesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MetaServiceServer).MergeRanges(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MetaService_MergeRanges_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MetaServiceServer).MergeRanges(ctx, req.(*MetaMergeRangesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MetaService_ServiceDesc is the grpc.ServiceDesc for MetaService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -900,6 +968,14 @@ var MetaService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetRanges",
 			Handler:    _MetaService_SetRanges_Handler,
+		},
+		{
+			MethodName: "SplitRange",
+			Handler:    _MetaService_SplitRange_Handler,
+		},
+		{
+			MethodName: "MergeRanges",
+			Handler:    _MetaService_MergeRanges_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

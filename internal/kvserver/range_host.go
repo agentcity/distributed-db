@@ -20,6 +20,7 @@ type RangeConfig struct {
 	Start []byte   `json:"start,omitempty"`
 	End   []byte   `json:"end,omitempty"`
 	Peers []string `json:"peers,omitempty"`
+	Epoch uint64   `json:"epoch,omitempty"`
 }
 
 var (
@@ -31,6 +32,8 @@ var (
 	ErrRangeMismatch = errors.New("kvserver: range mismatch")
 	// ErrRangeFrozen is returned while split/merge is copying a range.
 	ErrRangeFrozen = errors.New("kvserver: range is splitting/merging")
+	// ErrStaleEpoch is returned when a client used an old range map version.
+	ErrStaleEpoch = errors.New("kvserver: stale range epoch")
 )
 
 // normalizeRanges expands the legacy single-range Config fields when Ranges is
@@ -42,11 +45,16 @@ func normalizeRanges(cfg Config) ([]RangeConfig, error) {
 		if id == 0 {
 			id = 1
 		}
+		epoch := cfg.RangeEpoch
+		if epoch == 0 {
+			epoch = 1
+		}
 		return []RangeConfig{{
 			ID:    id,
 			Start: cloneBytes(cfg.RangeStart),
 			End:   cloneBytes(cfg.RangeEnd),
 			Peers: cloneStrings(cfg.Peers),
+			Epoch: epoch,
 		}}, nil
 	}
 
@@ -63,11 +71,16 @@ func normalizeRanges(cfg Config) ([]RangeConfig, error) {
 		if rc.Start != nil && rc.End != nil && bytes.Compare(rc.Start, rc.End) >= 0 {
 			return nil, fmt.Errorf("kvserver: range %d: Start must be before End", rc.ID)
 		}
+		epoch := rc.Epoch
+		if epoch == 0 {
+			epoch = 1
+		}
 		out = append(out, RangeConfig{
 			ID:    rc.ID,
 			Start: cloneBytes(rc.Start),
 			End:   cloneBytes(rc.End),
 			Peers: cloneStrings(rc.Peers),
+			Epoch: epoch,
 		})
 	}
 
@@ -112,11 +125,16 @@ func (s *Server) Ranges() []RangeConfig {
 	defer s.hostMu.RUnlock()
 	out := make([]RangeConfig, 0, len(s.cfg.Ranges))
 	for _, rc := range s.cfg.Ranges {
+		epoch := rc.Epoch
+		if epoch == 0 {
+			epoch = 1
+		}
 		out = append(out, RangeConfig{
 			ID:    rc.ID,
 			Start: cloneBytes(rc.Start),
 			End:   cloneBytes(rc.End),
 			Peers: cloneStrings(rc.Peers),
+			Epoch: epoch,
 		})
 	}
 	return out

@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -105,8 +106,22 @@ func TestV2RangeHostSplitMerge(t *testing.T) {
 	for _, r := range ranges {
 		metaRanges = append(metaRanges, meta.Range{
 			ID: r.ID, Start: r.Start, End: r.End,
-			Replicas: []string{addr}, Version: 1,
+			Replicas: []string{addr}, Version: 2,
 		})
+	}
+	// The meta map is still old: a client using range version 1 must be
+	// fenced by the new group's epoch 2.
+	stale, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("stale client: %v", err)
+	}
+	t.Cleanup(func() { _ = stale.Close() })
+	txnStale, err := stale.Begin(ctx)
+	if err != nil {
+		t.Fatalf("stale begin: %v", err)
+	}
+	if _, err := txnStale.Get(ctx, []byte("z")); err == nil || !strings.Contains(err.Error(), "stale epoch") {
+		t.Fatalf("stale epoch get = %v, want stale epoch", err)
 	}
 	if err := ms.ApplyRanges(ctx, metaRanges); err != nil {
 		t.Fatalf("meta ranges after split: %v", err)
@@ -139,7 +154,7 @@ func TestV2RangeHostSplitMerge(t *testing.T) {
 		t.Fatalf("ranges after merge = %+v", merged)
 	}
 	if err := ms.ApplyRanges(ctx, []meta.Range{{
-		ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 2,
+		ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 3,
 	}}); err != nil {
 		t.Fatalf("meta range after merge: %v", err)
 	}
@@ -288,7 +303,7 @@ func TestV2DistributedSplit(t *testing.T) {
 	for _, r := range ranges {
 		metaRanges = append(metaRanges, meta.Range{
 			ID: r.ID, Start: r.Start, End: r.End,
-			Replicas: addrs, Version: 1,
+			Replicas: addrs, Version: 2,
 		})
 	}
 	if err := ms.ApplyRanges(ctx, metaRanges); err != nil {
@@ -542,7 +557,7 @@ func TestV2RangeHostSplitPersist(t *testing.T) {
 	for _, r := range ranges {
 		metaRanges = append(metaRanges, meta.Range{
 			ID: r.ID, Start: r.Start, End: r.End,
-			Replicas: []string{addr}, Version: 1,
+			Replicas: []string{addr}, Version: 2,
 		})
 	}
 	if err := ms.ApplyRanges(ctx, metaRanges); err != nil {

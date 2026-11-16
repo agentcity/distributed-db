@@ -51,7 +51,8 @@ func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, 
 	}
 
 	newGroup, err := newRangeGroup(s.cfg, RangeConfig{
-		ID: newID, Start: cloneBytes(splitKey), End: oldEnd, Peers: cloneStrings(g.cfg.Peers),
+		ID: newID, Start: cloneBytes(splitKey), End: oldEnd,
+		Peers: cloneStrings(g.cfg.Peers), Epoch: g.cfg.Epoch + 1,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kvserver: split range %d: create group: %w", rangeID, err)
@@ -74,6 +75,7 @@ func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, 
 		return nil, fmt.Errorf("kvserver: split range %d: delete right: %w", rangeID, err)
 	}
 	g.cfg.End = cloneBytes(splitKey)
+	g.cfg.Epoch++
 	s.hostMu.Lock()
 	s.groups[newID] = newGroup
 	s.hostMu.Unlock()
@@ -129,6 +131,7 @@ func (s *Server) mergeLocalLocked(left, right *rangeGroup) ([]RangeConfig, error
 		return nil, fmt.Errorf("kvserver: merge: import left: %w", err)
 	}
 	left.cfg.End = cloneBytes(right.cfg.End)
+	left.cfg.Epoch++
 	if err := right.stop(); err != nil {
 		return nil, fmt.Errorf("kvserver: merge: stop right: %w", err)
 	}

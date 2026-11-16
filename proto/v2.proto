@@ -32,6 +32,8 @@ service MetaService {
   rpc ListRanges(ListRangesRequest) returns (ListRangesResponse);
   rpc Leader(LeaderRequest) returns (LeaderResponse);
   rpc SetRanges(SetRangesRequest) returns (SetRangesResponse);
+  rpc SplitRange(MetaSplitRangeRequest) returns (MetaSplitRangeResponse);
+  rpc MergeRanges(MetaMergeRangesRequest) returns (MetaMergeRangesResponse);
 }
 
 message GetRequest {
@@ -130,6 +132,7 @@ message SplitRangeRequest {
   uint64 range_id = 1;
   bytes split_key = 2;
   uint64 new_range_id = 3;
+  uint64 epoch = 4;
 }
 message SplitRangeResponse {
   bool success = 1;
@@ -140,6 +143,7 @@ message SplitRangeResponse {
 message MergeRangesRequest {
   uint64 left_range_id = 1;
   uint64 right_range_id = 2;
+  uint64 epoch = 3;
 }
 message MergeRangesResponse {
   bool success = 1;
@@ -160,6 +164,7 @@ message StatusResponse {
   uint64 range_id = 7;
   bytes range_start = 8;
   bytes range_end = 9;
+  uint64 epoch = 10;
 }
 
 message RequestVoteRequest {
@@ -218,6 +223,25 @@ message SetRangesRequest {
   repeated RangeInfo ranges = 1;
 }
 message SetRangesResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message MetaSplitRangeRequest {
+  uint64 range_id = 1;
+  bytes split_key = 2;
+}
+message MetaSplitRangeResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 new_range_id = 3;
+}
+
+message MetaMergeRangesRequest {
+  uint64 left_range_id = 1;
+  uint64 right_range_id = 2;
+}
+message MetaMergeRangesResponse {
   bool success = 1;
   string error = 2;
 }

@@ -12,8 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc/metadata"
 
 	pbv2 "distributed-db/internal/pb/v2"
 
@@ -330,9 +333,10 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
 		defer cancel()
 	}
-	var rangeID uint64
+	var rangeID, rangeEpoch uint64
 	if r, err := c.rangeFor(ctx, key); err == nil {
 		rangeID = r.GetId()
+		rangeEpoch = r.GetVersion()
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -357,7 +361,11 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 			lastErr = err
 			continue
 		}
-		hint, msg, err := call(ctx, cl)
+		callCtx := ctx
+		if rangeEpoch != 0 {
+			callCtx = metadata.AppendToOutgoingContext(ctx, "x-range-epoch", strconv.FormatUint(rangeEpoch, 10))
+		}
+		hint, msg, err := call(callCtx, cl)
 		if err != nil {
 			lastErr = err
 			c.invalidateLeader(rangeID)

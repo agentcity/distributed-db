@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc/metadata"
 
 	"distributed-db/internal/model"
 	"distributed-db/internal/mvcc"
@@ -217,6 +220,9 @@ func (k *kvService) Get(ctx context.Context, req *pbv2.GetRequest) (*pbv2.GetRes
 	if err != nil {
 		return &pbv2.GetResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.GetResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
 	leader := g.node.Leader()
 	if err := g.node.ReadBarrier(ctx); err != nil {
 		return &pbv2.GetResponse{Leader: leader, Error: opError(err)}, nil
@@ -249,6 +255,9 @@ func (k *kvService) Scan(ctx context.Context, req *pbv2.ScanRequest) (*pbv2.Scan
 	g, err := k.s.groupForKey(req.GetStart())
 	if err != nil {
 		return &pbv2.ScanResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.ScanResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if !g.containsRange(req.GetStart(), req.GetEnd()) {
 		err := fmt.Errorf("%w: scan [%q,%q) crosses range %d [%q,%q)",
@@ -291,6 +300,9 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 	if err != nil {
 		return &pbv2.PrewriteResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
 	if g.isFrozen() {
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
@@ -317,6 +329,9 @@ func (k *kvService) Commit(ctx context.Context, req *pbv2.CommitRequest) (*pbv2.
 	if err != nil {
 		return &pbv2.CommitResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
 	if g.isFrozen() {
 		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
@@ -339,6 +354,9 @@ func (k *kvService) Rollback(ctx context.Context, req *pbv2.RollbackRequest) (*p
 	if err != nil {
 		return &pbv2.RollbackResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
 	if g.isFrozen() {
 		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
@@ -359,6 +377,9 @@ func (k *kvService) CheckTxnStatus(ctx context.Context, req *pbv2.CheckTxnStatus
 	g, err := k.s.groupForKey(req.GetKey())
 	if err != nil {
 		return &pbv2.CheckTxnStatusResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.CheckTxnStatusResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	leader := g.node.Leader()
 	if err := g.node.ReadBarrier(ctx); err != nil {
@@ -386,6 +407,9 @@ func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockReques
 	g, err := k.s.groupForKeys(req.GetKeys())
 	if err != nil {
 		return &pbv2.ResolveLockResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if g.isFrozen() {
 		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
@@ -439,6 +463,9 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 	if req.GetNewRangeId() == 0 || len(req.GetSplitKey()) == 0 {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: "bad split request"}, nil
 	}
+	if req.GetEpoch() != 0 && req.GetEpoch() != g.cfg.Epoch {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(ErrStaleEpoch)}, nil
+	}
 	if _, ok := k.s.groups[req.GetNewRangeId()]; ok {
 		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
 	}
@@ -454,7 +481,7 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 		}
 	}
 	// Followers wait for the leader's prepare command to arrive through Raft.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !bytes.Equal(g.sm.splitPrepared(), req.GetSplitKey()) {
 		if time.Now().After(deadline) {
 			return &pbv2.SplitRangeResponse{Leader: leader, Error: "split prepare timeout"}, nil
@@ -494,6 +521,9 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	if left == right {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "same range"}, nil
 	}
+	if req.GetEpoch() != 0 && req.GetEpoch() != left.cfg.Epoch {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(ErrStaleEpoch)}, nil
+	}
 	payload, err := json.Marshal(struct {
 		Left  uint64 `json:"left"`
 		Right uint64 `json:"right"`
@@ -512,7 +542,7 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 		}
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ll, lr := left.sm.mergePrepared()
 		rl, rr := right.sm.mergePrepared()
@@ -558,6 +588,7 @@ func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.St
 		RangeId:     g.cfg.ID,
 		RangeStart:  cloneBytes(g.cfg.Start),
 		RangeEnd:    cloneBytes(g.cfg.End),
+		Epoch:       g.cfg.Epoch,
 	}, nil
 }
 
@@ -673,6 +704,8 @@ func opError(err error) string {
 		return "range mismatch"
 	case errors.Is(err, ErrRangeFrozen):
 		return "range frozen"
+	case errors.Is(err, ErrStaleEpoch):
+		return "stale epoch"
 	case errors.Is(err, context.Canceled):
 		return "canceled"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -680,4 +713,23 @@ func opError(err error) string {
 	default:
 		return "internal error"
 	}
+}
+
+func checkEpoch(ctx context.Context, g *rangeGroup) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil
+	}
+	values := md.Get("x-range-epoch")
+	if len(values) == 0 || values[0] == "" {
+		return nil
+	}
+	epoch, err := strconv.ParseUint(values[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("%w: bad header", ErrStaleEpoch)
+	}
+	if epoch != 0 && epoch != g.cfg.Epoch {
+		return fmt.Errorf("%w: have %d, request %d", ErrStaleEpoch, g.cfg.Epoch, epoch)
+	}
+	return nil
 }

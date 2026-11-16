@@ -76,5 +76,11 @@
     "title": "M2.4 — распределённый split на всех репликах",
     "status": "done",
     "file": "0013-distributed-split.md"
+  },
+  {
+    "id": "0014",
+    "title": "M2.5 — epoch/fencing и meta scheduler",
+    "status": "done",
+    "file": "0014-epoch-scheduler.md"
   }
 ]

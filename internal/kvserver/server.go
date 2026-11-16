@@ -39,6 +39,7 @@ type Config struct {
 	RangeID    uint64
 	RangeStart []byte
 	RangeEnd   []byte
+	RangeEpoch uint64
 
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
