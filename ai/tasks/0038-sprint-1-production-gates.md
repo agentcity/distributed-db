@@ -22,7 +22,17 @@ scope: {backend: true, console: false, mobile: false}
 
 ## Критерии
 
-- [ ] 8 задач реализованы/задокументированы.
-- [ ] `go build ./...`, `go vet ./...`, `gofmt -l .`.
-- [ ] `go test -race ./...`.
-- [ ] Изменения сведены без конфликтов.
+- [x] 8 задач реализованы/задокументированы.
+- [x] `go build ./...`, `go vet ./...`, `gofmt -l .`.
+- [x] `go test -race ./...`.
+- [x] Изменения сведены без конфликтов.
+
+## Результат
+
+- durability sync default + fast opt-in;
+- crash SIGKILL harness (fast/sync);
+- ADR 0005 membership, ADR 0006 PITR;
+- pgwire TLS/auth; grpctls helper;
+- 1TB harness; nightly chaos CI;
+- Jepsen PeerAddrs fix: 4/4 partition tests pass.
+- Отчёт: `docs/SPRINT-1-REPORT.md`.
