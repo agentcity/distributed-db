@@ -26,6 +26,7 @@ const (
 	KVService_Rollback_FullMethodName       = "/dbv2.KVService/Rollback"
 	KVService_CheckTxnStatus_FullMethodName = "/dbv2.KVService/CheckTxnStatus"
 	KVService_ResolveLock_FullMethodName    = "/dbv2.KVService/ResolveLock"
+	KVService_SplitRange_FullMethodName     = "/dbv2.KVService/SplitRange"
 	KVService_Status_FullMethodName         = "/dbv2.KVService/Status"
 )
 
@@ -42,6 +43,7 @@ type KVServiceClient interface {
 	Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error)
 	CheckTxnStatus(ctx context.Context, in *CheckTxnStatusRequest, opts ...grpc.CallOption) (*CheckTxnStatusResponse, error)
 	ResolveLock(ctx context.Context, in *ResolveLockRequest, opts ...grpc.CallOption) (*ResolveLockResponse, error)
+	SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error)
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
@@ -123,6 +125,16 @@ func (c *kVServiceClient) ResolveLock(ctx context.Context, in *ResolveLockReques
 	return out, nil
 }
 
+func (c *kVServiceClient) SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SplitRangeResponse)
+	err := c.cc.Invoke(ctx, KVService_SplitRange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *kVServiceClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StatusResponse)
@@ -146,6 +158,7 @@ type KVServiceServer interface {
 	Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error)
 	CheckTxnStatus(context.Context, *CheckTxnStatusRequest) (*CheckTxnStatusResponse, error)
 	ResolveLock(context.Context, *ResolveLockRequest) (*ResolveLockResponse, error)
+	SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error)
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedKVServiceServer()
 }
@@ -177,6 +190,9 @@ func (UnimplementedKVServiceServer) CheckTxnStatus(context.Context, *CheckTxnSta
 }
 func (UnimplementedKVServiceServer) ResolveLock(context.Context, *ResolveLockRequest) (*ResolveLockResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResolveLock not implemented")
+}
+func (UnimplementedKVServiceServer) SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SplitRange not implemented")
 }
 func (UnimplementedKVServiceServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Status not implemented")
@@ -328,6 +344,24 @@ func _KVService_ResolveLock_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_SplitRange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SplitRangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).SplitRange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_SplitRange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).SplitRange(ctx, req.(*SplitRangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _KVService_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StatusRequest)
 	if err := dec(in); err != nil {
@@ -380,6 +414,10 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResolveLock",
 			Handler:    _KVService_ResolveLock_Handler,
+		},
+		{
+			MethodName: "SplitRange",
+			Handler:    _KVService_SplitRange_Handler,
 		},
 		{
 			MethodName: "Status",

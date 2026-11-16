@@ -60,6 +60,9 @@ type Server struct {
 	grpcSrv *grpc.Server
 	lis     net.Listener
 
+	// hostMu protects groups/groupIDs/defaultID/cfg.Ranges after Start.
+	hostMu sync.RWMutex
+
 	mu       sync.Mutex
 	started  bool
 	stopped  bool

@@ -99,6 +99,8 @@ func compareRangeStart(a, b []byte) int {
 
 // Groups returns the hosted range IDs in range order (ascending start key).
 func (s *Server) Groups() []uint64 {
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
 	out := make([]uint64, len(s.groupIDs))
 	copy(out, s.groupIDs)
 	return out
@@ -106,6 +108,8 @@ func (s *Server) Groups() []uint64 {
 
 // Ranges returns a copy of the hosted range configurations in range order.
 func (s *Server) Ranges() []RangeConfig {
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
 	out := make([]RangeConfig, 0, len(s.cfg.Ranges))
 	for _, rc := range s.cfg.Ranges {
 		out = append(out, RangeConfig{
@@ -138,6 +142,8 @@ func (s *Server) GroupForKey(key []byte) (*raft.Node, error) {
 }
 
 func (s *Server) groupForID(id uint64) (*rangeGroup, error) {
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
 	if id == 0 {
 		id = s.defaultID
 	}
@@ -149,6 +155,8 @@ func (s *Server) groupForID(id uint64) (*rangeGroup, error) {
 }
 
 func (s *Server) groupForKey(key []byte) (*rangeGroup, error) {
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
 	for _, id := range s.groupIDs {
 		if g := s.groups[id]; g.containsKey(key) {
 			return g, nil
@@ -180,6 +188,8 @@ func (s *Server) groupForKeys(keys [][]byte) (*rangeGroup, error) {
 }
 
 func (s *Server) defaultGroup() *rangeGroup {
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
 	if s.groups == nil {
 		return nil
 	}

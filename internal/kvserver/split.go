@@ -10,9 +10,8 @@ import (
 // SplitRange creates a new Raft group for [splitKey, old.End) on this server
 // and moves the matching MVCC records from the old group into it.
 //
-// M2.3 scope: the split is performed on one RangeHost (one process). Every
-// replica of the old range must run the same operation before the meta range
-// map is updated; distributed split orchestration is the next layer.
+// M2.3 host-local scope: this method performs the data movement on one
+// RangeHost. Use the SplitRange RPC + meta SetRanges for a replicated split.
 func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte, newID uint64) ([]RangeConfig, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -39,7 +38,12 @@ func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte
 		return nil, fmt.Errorf("kvserver: split range %d: already frozen", rangeID)
 	}
 	defer g.frozen.Store(false)
+	return s.splitLocalLocked(g, splitKey, newID, true)
+}
 
+// splitLocalLocked performs the data copy/new-group work. Caller holds s.mu.
+func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, snapshotOld bool) ([]RangeConfig, error) {
+	rangeID := g.cfg.ID
 	oldEnd := cloneBytes(g.cfg.End)
 	records, err := g.store.ExportRange(splitKey, oldEnd)
 	if err != nil {
@@ -59,7 +63,7 @@ func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte
 		cleanup()
 		return nil, fmt.Errorf("kvserver: split range %d: import: %w", rangeID, err)
 	}
-	if err := newGroup.start(ctx); err != nil {
+	if err := newGroup.start(context.Background()); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("kvserver: split range %d: start new group: %w", rangeID, err)
 	}
@@ -70,13 +74,18 @@ func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte
 		return nil, fmt.Errorf("kvserver: split range %d: delete right: %w", rangeID, err)
 	}
 	g.cfg.End = cloneBytes(splitKey)
+	s.hostMu.Lock()
 	s.groups[newID] = newGroup
+	s.hostMu.Unlock()
 	s.rebuildRangeOrder()
 
-	// Compact the old log so a restart cannot replay right-side writes that
-	// were removed by the split.
-	if _, err := g.node.Snapshot(); err != nil {
-		return nil, fmt.Errorf("kvserver: split range %d: snapshot old range: %w", rangeID, err)
+	// Host-local split can compact the old log because no other replica needs
+	// the prepare entry. The distributed path must keep it until every replica
+	// has applied the prepare command.
+	if snapshotOld {
+		if _, err := g.node.Snapshot(); err != nil {
+			return nil, fmt.Errorf("kvserver: split range %d: snapshot old range: %w", rangeID, err)
+		}
 	}
 	return s.Ranges(), nil
 }
@@ -119,13 +128,17 @@ func (s *Server) MergeRanges(ctx context.Context, leftID, rightID uint64) ([]Ran
 	if err := right.stop(); err != nil {
 		return nil, fmt.Errorf("kvserver: merge: stop right: %w", err)
 	}
+	s.hostMu.Lock()
 	delete(s.groups, rightID)
+	s.hostMu.Unlock()
 	s.rebuildRangeOrder()
 	return s.Ranges(), nil
 }
 
 // rebuildRangeOrder refreshes the sorted hosted range list. Caller holds s.mu.
 func (s *Server) rebuildRangeOrder() {
+	s.hostMu.Lock()
+	defer s.hostMu.Unlock()
 	ids := make([]uint64, 0, len(s.groups))
 	for id := range s.groups {
 		ids = append(ids, id)

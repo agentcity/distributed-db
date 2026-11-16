@@ -22,6 +22,10 @@ const (
 	// Meta control-plane commands. Payload lives in Entry.Value as JSON.
 	CommandMetaAllocTS  CommandType = "meta_alloc_ts"
 	CommandMetaSetRange CommandType = "meta_set_ranges"
+
+	// CommandSplitPrepare freezes a range and records the split key on every
+	// replica before the coordinator creates the new group.
+	CommandSplitPrepare CommandType = "split_prepare"
 )
 
 // Entry is a single replicated log entry. Index is 1-based. Value is nil for

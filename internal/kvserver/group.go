@@ -125,6 +125,12 @@ func (g *rangeGroup) stop() error {
 	return g.stopErr
 }
 
+// isFrozen reports whether client writes must be rejected. A replicated split
+// prepare freezes every replica; local split/merge uses the frozen flag.
+func (g *rangeGroup) isFrozen() bool {
+	return g.frozen.Load() || len(g.sm.splitPrepared()) > 0
+}
+
 func (g *rangeGroup) containsKey(key []byte) bool {
 	if g.cfg.Start != nil && bytes.Compare(key, g.cfg.Start) < 0 {
 		return false

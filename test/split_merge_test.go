@@ -8,6 +8,7 @@ import (
 	"distributed-db/internal/kvserver"
 	"distributed-db/internal/meta"
 	"distributed-db/internal/metaserver"
+	pbv2 "distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
 	"distributed-db/internal/v2client"
 )
@@ -162,4 +163,164 @@ func waitGroupLeader(t *testing.T, srv *kvserver.Server, rangeID uint64) bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return false
+}
+
+func TestV2DistributedSplit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	addrs := []string{v2FreeAddr(t), v2FreeAddr(t), v2FreeAddr(t)}
+	metaAddr := v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{
+		Addr: metaAddr,
+		Ranges: []meta.Range{{
+			ID: 1, Start: nil, End: nil, Replicas: addrs, Version: 1,
+		}},
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+
+	nodes := make([]*v2Node, 0, 3)
+	for i, addr := range addrs {
+		peers := make([]string, 0, 2)
+		for j, p := range addrs {
+			if i != j {
+				peers = append(peers, p)
+			}
+		}
+		cfg := kvserver.Config{
+			ID: addr, RaftAddr: addr, DataDir: t.TempDir(), Peers: peers,
+			RangeID:            1,
+			ElectionTimeoutMin: 120 * time.Millisecond,
+			ElectionTimeoutMax: 240 * time.Millisecond,
+			HeartbeatInterval:  25 * time.Millisecond,
+			CacheSize:          8 << 20, MemTableSize: 4 << 20,
+			Logger: v2Logger(),
+		}
+		srv, err := kvserver.New(cfg)
+		if err != nil {
+			t.Fatalf("new %s: %v", addr, err)
+		}
+		if err := srv.Start(ctx); err != nil {
+			t.Fatalf("start %s: %v", addr, err)
+		}
+		n := &v2Node{srv: srv, addr: addr, cfg: cfg}
+		n.client = v2Dial(t, addr)
+		nodes = append(nodes, n)
+		t.Cleanup(func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = srv.Stop(sctx)
+		})
+	}
+	leader := v2WaitLeader(t, nodes)
+
+	client, err := v2client.New(metaAddr, addrs)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	put := func(key, value string) {
+		t.Helper()
+		txn, err := client.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		txn.Set([]byte(key), []byte(value))
+		if err := txn.Commit(ctx); err != nil {
+			t.Fatalf("commit %s: %v", key, err)
+		}
+	}
+	put("a", "left")
+	put("m", "middle")
+	put("z", "right")
+
+	// The coordinator asks every replica to split; followers wait for the
+	// leader's replicated prepare command.
+	split := func(n *v2Node) {
+		t.Helper()
+		resp, err := n.client.SplitRange(ctx, &pbv2.SplitRangeRequest{
+			RangeId: 1, SplitKey: []byte("m"), NewRangeId: 2,
+		})
+		if err != nil || !resp.GetSuccess() {
+			t.Fatalf("split on %s: %v %+v", n.addr, err, resp)
+		}
+	}
+	split(leader)
+	for _, n := range nodes {
+		if n != leader {
+			split(n)
+		}
+	}
+
+	// Wait for the new range group's leader on at least one node.
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		ok := false
+		for _, n := range nodes {
+			node, err := n.srv.GroupForID(2)
+			if err == nil && node.Status().Role == raft.Leader {
+				ok = true
+				break
+			}
+		}
+		if ok {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, n := range nodes {
+		if _, err := n.srv.GroupForID(2); err != nil {
+			t.Fatalf("range 2 group missing on %s", n.addr)
+		}
+	}
+
+	ranges := leader.srv.Ranges()
+	metaRanges := make([]meta.Range, 0, len(ranges))
+	for _, r := range ranges {
+		metaRanges = append(metaRanges, meta.Range{
+			ID: r.ID, Start: r.Start, End: r.End,
+			Replicas: addrs, Version: 1,
+		})
+	}
+	if err := ms.ApplyRanges(ctx, metaRanges); err != nil {
+		t.Fatalf("meta ranges: %v", err)
+	}
+
+	client2, err := v2client.New(metaAddr, addrs)
+	if err != nil {
+		t.Fatalf("client2: %v", err)
+	}
+	t.Cleanup(func() { _ = client2.Close() })
+	get := func(key, want string) {
+		t.Helper()
+		txn, err := client2.Begin(ctx)
+		if err != nil {
+			t.Fatalf("read begin: %v", err)
+		}
+		got, err := txn.Get(ctx, []byte(key))
+		if err != nil || string(got) != want {
+			t.Fatalf("get %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	get("a", "left")
+	get("m", "middle")
+	get("z", "right")
+
+	txn, err := client2.Begin(ctx)
+	if err != nil {
+		t.Fatalf("right begin: %v", err)
+	}
+	txn.Set([]byte("zz"), []byte("new"))
+	if err := txn.Commit(ctx); err != nil {
+		t.Fatalf("right commit: %v", err)
+	}
+	get("zz", "new")
 }

@@ -13,6 +13,7 @@ service KVService {
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   rpc CheckTxnStatus(CheckTxnStatusRequest) returns (CheckTxnStatusResponse);
   rpc ResolveLock(ResolveLockRequest) returns (ResolveLockResponse);
+  rpc SplitRange(SplitRangeRequest) returns (SplitRangeResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
 }
 
@@ -122,6 +123,17 @@ message ResolveLockResponse {
   bool success = 1;
   string leader = 2;
   string error = 3;
+}
+
+message SplitRangeRequest {
+  uint64 range_id = 1;
+  bytes split_key = 2;
+  uint64 new_range_id = 3;
+}
+message SplitRangeResponse {
+  bool success = 1;
+  string error = 2;
+  string leader = 3;
 }
 
 message StatusRequest {

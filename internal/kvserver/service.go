@@ -1,10 +1,12 @@
 package kvserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +33,9 @@ type stateMachine struct {
 	store       *mvcc.Store
 	engine      storage.Engine
 	lastApplied atomic.Uint64
+
+	splitMu  sync.RWMutex
+	splitKey []byte
 }
 
 func (m *stateMachine) Apply(entry model.Entry) error {
@@ -61,9 +66,32 @@ func (m *stateMachine) apply(entry model.Entry) error {
 			return fmt.Errorf("kvserver: decode rollback: %w", err)
 		}
 		return m.store.Rollback(cmd.Keys, cmd.StartTS)
+	case model.CommandSplitPrepare:
+		var cmd struct {
+			SplitKey []byte `json:"split_key"`
+		}
+		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
+			return fmt.Errorf("kvserver: decode split prepare: %w", err)
+		}
+		m.splitMu.Lock()
+		m.splitKey = append([]byte(nil), cmd.SplitKey...)
+		m.splitMu.Unlock()
+		return nil
 	default:
 		return fmt.Errorf("kvserver: unknown command type %q", entry.Type)
 	}
+}
+
+func (m *stateMachine) splitPrepared() []byte {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	return append([]byte(nil), m.splitKey...)
+}
+
+func (m *stateMachine) clearSplit() {
+	m.splitMu.Lock()
+	m.splitKey = nil
+	m.splitMu.Unlock()
 }
 
 // snapshotPayload is the durable state-machine snapshot. It contains every
@@ -237,7 +265,7 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 	if err != nil {
 		return &pbv2.PrewriteResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if g.frozen.Load() {
+	if g.isFrozen() {
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
 	if len(req.GetPrimary()) > 0 && !g.containsKey(req.GetPrimary()) {
@@ -263,7 +291,7 @@ func (k *kvService) Commit(ctx context.Context, req *pbv2.CommitRequest) (*pbv2.
 	if err != nil {
 		return &pbv2.CommitResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if g.frozen.Load() {
+	if g.isFrozen() {
 		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
@@ -285,7 +313,7 @@ func (k *kvService) Rollback(ctx context.Context, req *pbv2.RollbackRequest) (*p
 	if err != nil {
 		return &pbv2.RollbackResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if g.frozen.Load() {
+	if g.isFrozen() {
 		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
@@ -333,7 +361,7 @@ func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockReques
 	if err != nil {
 		return &pbv2.ResolveLockResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if g.frozen.Load() {
+	if g.isFrozen() {
 		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
@@ -353,7 +381,7 @@ func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockReques
 }
 
 func (g *rangeGroup) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbackKey []byte) error {
-	if g.frozen.Load() {
+	if g.isFrozen() {
 		return ErrRangeFrozen
 	}
 	keys := st.Keys
@@ -370,6 +398,59 @@ func (g *rangeGroup) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbac
 	}
 	_, err = g.node.Propose(ctx, model.Entry{Type: typ, Value: payload})
 	return err
+}
+
+// SplitRange is the admin RPC used by the coordinator. The leader first
+// replicates a split-prepare command; every replica then copies its local
+// slice and creates the new Raft group. Meta is updated by the coordinator
+// after all replicas succeed.
+func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest) (*pbv2.SplitRangeResponse, error) {
+	g, err := k.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return &pbv2.SplitRangeResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	leader := g.node.Leader()
+	if req.GetNewRangeId() == 0 || len(req.GetSplitKey()) == 0 {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: "bad split request"}, nil
+	}
+	if _, ok := k.s.groups[req.GetNewRangeId()]; ok {
+		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
+	}
+	if g.node.IsLeader() {
+		payload, err := json.Marshal(struct {
+			SplitKey []byte `json:"split_key"`
+		}{SplitKey: req.GetSplitKey()})
+		if err != nil {
+			return &pbv2.SplitRangeResponse{Leader: leader, Error: "encode"}, nil
+		}
+		if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandSplitPrepare, Value: payload}); err != nil {
+			return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
+		}
+	}
+	// Followers wait for the leader's prepare command to arrive through Raft.
+	deadline := time.Now().Add(10 * time.Second)
+	for !bytes.Equal(g.sm.splitPrepared(), req.GetSplitKey()) {
+		if time.Now().After(deadline) {
+			return &pbv2.SplitRangeResponse{Leader: leader, Error: "split prepare timeout"}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return &pbv2.SplitRangeResponse{Leader: leader, Error: "canceled"}, nil
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	k.s.mu.Lock()
+	defer k.s.mu.Unlock()
+	if _, ok := k.s.groups[req.GetNewRangeId()]; ok {
+		g.sm.clearSplit()
+		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
+	}
+	if _, err := k.s.splitLocalLocked(g, req.GetSplitKey(), req.GetNewRangeId(), false); err != nil {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
+	}
+	g.sm.clearSplit()
+	return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
 }
 
 func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {
