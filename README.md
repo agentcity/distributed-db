@@ -68,8 +68,8 @@ go build -o bin/kv2 ./cmd/kv2
 go test -race ./test -run TestV2SingleRangeCluster -v
 ```
 
-Пока нет: Multi-Raft по range, InstallSnapshot по сети, бенчмарка на
-реальном сервере. Это следующие шаги 0006/M2.
+Пока нет: Multi-Raft по range, e2e catch-up через snapshot и бенчмарка
+на реальном gRPC. InstallSnapshot по сети и snapshot/restart уже есть.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 

@@ -195,11 +195,12 @@ SQL не начинается, пока KV не даёт стабильные т
 - single-range v2: gRPC KVService/RaftService, `kv2 node|meta`, клиентский
   транзакционный SDK;
 - e2e 3 узла: prewrite/commit/get/scan, kill лидера, новая транзакция и
-  клиентский commit после failover.
+  клиентский commit после failover;
+- InstallSnapshot по gRPC, state-machine snapshot MVCC и restart из snapshot.
 
 Осталось до закрытия 0006/M1:
 
-- adapter `internal/multiraft` → `raft.Node` вместо одной группы напрямую;
-- InstallSnapshot в gRPC-транспорте и snapshot catch-up в e2e;
-- benchmark v2 на реальном gRPC (сейчас bench меряет in-memory engine);
-- проверка рестарта узла с применённым MVCC (applied index/snapshot).
+- adapter `internal/multiraft` → `raft.Node` (сейчас одна группа напрямую);
+- e2e catch-up отставшей реплики через InstallSnapshot (транспорт и
+  snapshot/restart уже есть);
+- benchmark v2 на реальном gRPC (сейчас bench меряет in-memory engine).
