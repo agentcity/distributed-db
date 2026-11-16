@@ -11,8 +11,8 @@
 
 | Критерий | Оценка (1–10) | Вердикт |
 |---|---:|---|
-| Скорость, lab/fast | 6 | 12 мс single, ~480–820 tx/s parallel, batch ~5–7k tx/s |
-| Скорость, production sync | 3 | ~44–185 tx/s после batch-фикса; было ~40–70 |
+| Скорость, lab/fast | 7 | 12 мс single; pipeline 64–256 на 10 workstations — ~12–19k tx/s |
+| Скорость, production sync | 4 | pipeline 64–256: ~4–8.6k tx/s; один in-flight ~200 tx/s |
 | Потенциал объёма | 3 | комфортно ≤50 ГБ; 50–300 ГБ рискованно; 1 ТБ — нет |
 | Безопасность | 3 | gRPC TLS/mTLS есть, но опционален; нет RBAC/audit/at-rest |
 | Надёжность | 3 | happy path крепкий, 4 production-блокера |
@@ -59,7 +59,8 @@
 | fast, 10 клиентов | ~1.2–2.1 мс/op | ~480–820 tx/s |
 | batch 256, fast | ~36–51 мс/batch | ~5–7k tx/s |
 | sync, 1 клиент | ~22.6 мс | ~44 tx/s |
-| sync, 10 клиентов | ~5.4 мс/op | ~185 tx/s |
+| sync, 10 клиентов, pipeline 256 | ~117 µs/txn | ~8.6k tx/s |
+| sync, 10 клиентов, 1 in-flight | ~5 мс/op | ~200 tx/s |
 
 Приоритеты:
 

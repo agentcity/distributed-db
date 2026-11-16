@@ -66,12 +66,37 @@ atomic batch: каждая транзакция имеет свой commit point
 ~185 tx/s на 10 клиентах. Это всё ещё медленнее fast, но не 70 tx/s:
 предыдущий per-command fsync был регрессом и исправлен.
 
+## Несколько рабочих станций
+
+Один in-flight на клиента упирается в latency commit (12–25 мс), поэтому
+10 клиентов дают лишь ~700–800 tx/s (fast) или ~200 tx/s (sync). Чтобы
+получить сопоставимый с PostgreSQL aggregate throughput, рабочая станция
+должна держать **pipeline независимых транзакций** (`CommitBatch`).
+
+10 workstations, loopback, batch=256, один batch/fsync на Raft-entry:
+
+| Pipeline на клиента | fast, tx/s | sync, tx/s | Latency batch (sync) |
+|---:|---:|---:|---:|
+| 1 | ~712 | ~200 | ~5 мс |
+| 16 | ~4 400 | ~1 470 | ~11 мс |
+| 64 | ~11 800 | ~3 980 | ~16 мс |
+| 256 | ~19 500 | ~8 570 | ~30 мс |
+
+Это уже **сопоставимо или выше** PostgreSQL 13 (~6.8k tx/s на 10 клиентах с
+одним in-flight) по aggregate throughput, но ценой batch latency 16–30 мс.
+Сравнение с PostgreSQL с таким же pipeline/batch нужно делать отдельно;
+текущие PG-цифры — один in-flight.
+
+Один in-flight остаётся latency-bound: чтобы поднять его, нужен async commit /
+local quorum (другие гарантии), а не batch.
+
 ## Почему мы медленнее
 
 1. **Raft-консенсус**: минимум один RTT до кворума + fsync Raft-лога.
    PostgreSQL на одном узле не платит за консенсус.
-2. **Один fsync на транзакцию** после отказа от Pebble SyncWrites; durability
-   state machine обеспечивается реплеем Raft-лога. Snapshot fsync'ится.
+2. **Один fsync на Raft-батч** (не на транзакцию): `CommitSingles` пишет все
+   команды одного батча в один Pebble batch; `SyncWrites=true` даёт один
+   fsync на батч. Snapshot fsync'ится отдельно.
    Вернуть отдельный fsync можно через `kvserver.Config.SyncStateMachine=true`
    (медленнее, но state machine durable независимо от лога).
 3. **gRPC/RPC overhead**: TSO (батчится), CommitSingle, range lookup.
