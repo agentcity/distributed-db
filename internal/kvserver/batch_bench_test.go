@@ -3,7 +3,6 @@ package kvserver
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -131,57 +130,6 @@ func newBatchBenchServer(b *testing.B) (*Server, string, *rangeGroup) {
 	}
 	b.Fatal("range 1 did not elect a leader")
 	return nil, "", nil
-}
-
-func runBatchedCommits(g *rangeGroup, n int, seq *atomic.Uint64) error {
-	errs := make([]error, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			id := seq.Add(1)
-			startTS := uint64(1)<<40 + id*2
-			key := benchMutationKey(id)
-			errs[i] = g.batcher.submit(context.Background(), applyCommand{
-				StartTS: startTS, CommitTS: startTS + 1, Primary: key,
-				Mutations: []mvcc.Mutation{{Key: key, Value: []byte("v")}},
-			})
-		}(i)
-	}
-	close(start)
-	wg.Wait()
-	return errors.Join(errs...)
-}
-
-func runDirectCommits(g *rangeGroup, n int, seq *atomic.Uint64) error {
-	errs := make([]error, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			id := seq.Add(1)
-			startTS := uint64(1)<<40 + id*2
-			key := benchMutationKey(id)
-			payload, err := encodeCommand(applyCommand{
-				StartTS: startTS, CommitTS: startTS + 1, Primary: key,
-				Mutations: []mvcc.Mutation{{Key: key, Value: []byte("v")}},
-			})
-			if err == nil {
-				_, err = g.node.Propose(context.Background(),
-					model.Entry{Type: model.CommandPrewriteCommit, Value: payload})
-			}
-			errs[i] = err
-		}(i)
-	}
-	close(start)
-	wg.Wait()
-	return errors.Join(errs...)
 }
 
 func benchTxn(id uint64) (uint64, []byte) {

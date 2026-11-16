@@ -10,7 +10,7 @@ import (
 const (
 	// DefaultCommitBatchConcurrency is the number of transactions CommitBatch
 	// commits at the same time when no explicit limit is given.
-	DefaultCommitBatchConcurrency = 32
+	DefaultCommitBatchConcurrency = 256
 )
 
 // errNilBatchTxn is returned in a CommitBatch result slot whose transaction is
@@ -60,7 +60,7 @@ func (c *Client) CommitBatchWithLimit(ctx context.Context, txns []*Txn, limit in
 	if len(txns) == 0 {
 		return errs
 	}
-	if limit <= 0 {
+	if limit <= 0 { // default 64
 		limit = DefaultCommitBatchConcurrency
 	}
 	if limit > len(txns) {

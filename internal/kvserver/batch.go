@@ -20,7 +20,7 @@ const (
 	// defaultCommitBatchWindow bounds how long the first CommitSingle of a
 	// batch waits for concurrent requests to join. It is deliberately tiny:
 	// every 1PC commit pays it once.
-	defaultCommitBatchWindow = 750 * time.Microsecond
+	defaultCommitBatchWindow = 500 * time.Microsecond
 	// defaultMaxInflightBatches bounds how many application batches may be
 	// proposed concurrently. Pipelining them keeps high-concurrency rounds
 	// from serialising on one Raft round trip, while the cap keeps the number
@@ -126,9 +126,8 @@ func (w *batchWaiter) complete(err error) { w.result <- err }
 type commitBatcher struct {
 	g *rangeGroup
 
-	window    time.Duration
-	maxBatch  int
-	maxFlight int
+	window   time.Duration
+	maxBatch int
 
 	submitCh chan *batchWaiter
 	stopCh   chan struct{}
@@ -158,16 +157,15 @@ type commitBatcher struct {
 func newCommitBatcher(g *rangeGroup) *commitBatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &commitBatcher{
-		g:         g,
-		window:    defaultCommitBatchWindow,
-		maxBatch:  defaultCommitBatchMax,
-		maxFlight: defaultMaxInflightBatches,
-		submitCh:  make(chan *batchWaiter),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
-		inflight:  make(chan struct{}, defaultMaxInflightBatches),
-		ctx:       ctx,
-		cancel:    cancel,
+		g:        g,
+		window:   defaultCommitBatchWindow,
+		maxBatch: defaultCommitBatchMax,
+		submitCh: make(chan *batchWaiter),
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+		inflight: make(chan struct{}, defaultMaxInflightBatches),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 	// Batch IDs only need to be unique within this process. A time-derived
 	// base avoids clashing with result entries left by an earlier leader.

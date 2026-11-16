@@ -421,3 +421,61 @@ func TestBatchResultStoreBounded(t *testing.T) {
 		t.Fatalf("retained %d results, want <= %d", got, maxBatchResults)
 	}
 }
+
+// TestCommitSingleBatchRetryIdempotent checks that replaying the same
+// start/commit/apply commands, including two identical retries inside one
+// batch, is a no-op success and leaves no lock behind.
+func TestCommitSingleBatchRetryIdempotent(t *testing.T) {
+	_, client, g := newBatchTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := commitSingleMutation("retry-key", "value", 6000, 6001)
+	if resp, err := client.CommitSingle(ctx, req); err != nil || !resp.GetSuccess() {
+		t.Fatalf("first commit: err=%v resp=%+v", err, resp)
+	}
+	// A plain retry outside any batch must still be a success.
+	if resp, err := client.CommitSingle(ctx, req); err != nil || !resp.GetSuccess() {
+		t.Fatalf("retry commit: err=%v resp=%+v", err, resp)
+	}
+
+	g.batcher.setWindow(50 * time.Millisecond)
+	baseStats := g.batcher.stats()
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	resps := make([]*pbv2.CommitSingleResponse, 2)
+	errs := make([]error, 2)
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			resps[i], errs[i] = client.CommitSingle(ctx, req)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < 2; i++ {
+		if errs[i] != nil || !resps[i].GetSuccess() {
+			t.Fatalf("batched retry %d: err=%v resp=%+v", i, errs[i], resps[i])
+		}
+	}
+	stats := g.batcher.stats()
+	if got := stats.Batches - baseStats.Batches; got != 1 {
+		t.Fatalf("batch proposals = %d, want 1 (stats=%+v)", got, stats)
+	}
+	if got := stats.Commands - baseStats.Commands; got != 2 {
+		t.Fatalf("batched commands = %d, want 2", got)
+	}
+	if value, err := g.store.Get([]byte("retry-key"), 6001); err != nil || string(value) != "value" {
+		t.Fatalf("retried key not visible: value=%q err=%v", value, err)
+	}
+	locks, err := g.store.ExpiredLockKeys(time.Now().Add(24 * time.Hour))
+	if err != nil {
+		t.Fatalf("scan locks: %v", err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("locks left after retried batch: %q", locks)
+	}
+}
