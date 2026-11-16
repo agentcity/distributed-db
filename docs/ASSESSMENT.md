@@ -80,7 +80,8 @@ DBaaS и не замена PostgreSQL.
   - fast: parallel 10 клиентов ~1.2–2.1 мс/op (~480–820 tx/s);
   - fast: batch 256 ~0.14–0.20 мс/txn (~5–7k tx/s амортизированно,
     batch latency 36–51 мс);
-  - production `sync`: ~25 мс single, ~40–70 tx/s на 10 клиентах;
+  - production `sync`: ~22.6 мс single (~44 tx/s), ~5.4 мс/op
+    (~185 tx/s) на 10 клиентах;
   - PostgreSQL 13 на том же железе: ~0.68 мс / 1 469 tx/s (1 клиент),
     ~1.47 мс / 6 835 tx/s (10 клиентов).
 

@@ -12,7 +12,7 @@
 | Критерий | Оценка (1–10) | Вердикт |
 |---|---:|---|
 | Скорость, lab/fast | 6 | 12 мс single, ~480–820 tx/s parallel, batch ~5–7k tx/s |
-| Скорость, production sync | 2 | ~40–70 tx/s, p50 151 мс на 10 клиентах |
+| Скорость, production sync | 3 | ~44–185 tx/s после batch-фикса; было ~40–70 |
 | Потенциал объёма | 3 | комфортно ≤50 ГБ; 50–300 ГБ рискованно; 1 ТБ — нет |
 | Безопасность | 3 | gRPC TLS/mTLS есть, но опционален; нет RBAC/audit/at-rest |
 | Надёжность | 3 | happy path крепкий, 4 production-блокера |
@@ -26,9 +26,9 @@
    benchmark — это время одной операции, а не десяти. Fast 10 клиентов:
    ~480–820 tx/s, не 5.5k. Batch 256 даёт ~5–7k tx/s только амортизированно,
    при latency batch 36–51 мс.
-2. **Production `sync` — не «немного медленнее».** State machine fsync'ится
-   на каждую команду внутри Raft-батча: 10 клиентов → p50 151 мс, ~70 tx/s,
-   ~100× медленнее PostgreSQL. Это главный performance-баг, не сеть.
+2. **Production `sync` был главным регрессом и исправлен.** Per-command
+   fsync внутри Raft-батча давал ~70 tx/s; один Pebble batch/fsync на батч
+   поднял до ~185 tx/s. Это всё ещё ~37× медленнее PostgreSQL, но не ~100×.
 3. **Объём ограничен lifecycle, а не диском.** MVCC GC не вызывается в
    production, Raft WAL не снапшотится периодически, replay читает WAL в RAM,
    backup квадратичен. 1 ТБ диска влезет, процесс — нет.
@@ -58,12 +58,13 @@
 | fast, 1 клиент | ~12 мс | ~83 tx/s |
 | fast, 10 клиентов | ~1.2–2.1 мс/op | ~480–820 tx/s |
 | batch 256, fast | ~36–51 мс/batch | ~5–7k tx/s |
-| sync, 1 клиент | p50 ~25 мс | ~40 tx/s |
-| sync, 10 клиентов | p50 ~151 мс | ~70 tx/s |
+| sync, 1 клиент | ~22.6 мс | ~44 tx/s |
+| sync, 10 клиентов | ~5.4 мс/op | ~185 tx/s |
 
 Приоритеты:
 
-1. **Один Pebble batch/fsync на Raft-батч** в sync-профиле — ожидаемо 5–10×.
+1. **Один Pebble batch/fsync на Raft-батч** — сделано, ~2.6× по throughput;
+   следующий шаг — pipelining/parallel apply.
 2. NVMe/Linux, где fsync дешевле; pipelining apply.
 3. Увеличить batch/parallel apply; не путать амортизированный throughput с
    latency.

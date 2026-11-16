@@ -49,8 +49,8 @@ Raft-лог): **sequential ~11.6 мс, parallel ~1.2–2.1 мс/op (~480–820 t
 | 1 клиент (fast) | ~11.6 мс / ~86 tx/s | ~0.68 мс / ~1 469 tx/s | ~17× |
 | 10 клиентов (fast) | ~1.2–2.1 мс/op / ~480–820 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~8–11× |
 | batch 256 (fast) | ~0.14–0.20 мс/txn / ~5–7k tx/s; batch latency 36–51 мс | ~1.47 мс/op / ~6 835 tx/s | ~1.0× по throughput |
-| production sync, 1 клиент | ~25 мс / ~40 tx/s | ~0.68 мс / ~1 469 tx/s | ~37× |
-| production sync, 10 клиентов | p50 ~151 мс / ~70 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~98× |
+| production sync, 1 клиент | ~22.6 мс / ~44 tx/s | ~0.68 мс / ~1 469 tx/s | ~33× |
+| production sync, 10 клиентов | ~5.4 мс/op / ~185 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~37× |
 
 Batch-режим (`CommitBatch`, 256 транзакций в одном batch, серверный
 batch-entry 64 × 500 µs, 256 in-flight) достигает ~5–7k tx/s — на уровне
@@ -61,9 +61,10 @@ atomic batch: каждая транзакция имеет свой commit point
 
 На одном клиенте всё ещё платим за Raft-консенсус и один fsync. Цифра
 ~11.6 мс — fast-профиль без batch; `CommitBatch`/batch-window добавляет
-~0.5–1 мс одиночному запросу. **Production default `sync`** добавляет fsync
-на state machine: ~25 мс на клиента и ~70 tx/s на 10 клиентах — это цена
-durability, а не регрессия.
+~0.5–1 мс одиночному запросу. **Production default `sync`** теперь делает
+один Pebble batch/fsync на весь Raft-батч: ~22.6 мс на клиента и
+~185 tx/s на 10 клиентах. Это всё ещё медленнее fast, но не 70 tx/s:
+предыдущий per-command fsync был регрессом и исправлен.
 
 ## Почему мы медленнее
 
@@ -118,7 +119,7 @@ commit. Сравнение честно только в классе «расп�
 ## Вывод
 
 **На 10 клиентах fast-профиль всё ещё в ~8–11× медленнее PostgreSQL**, а
-production `sync` — примерно в ~100×. На одном клиенте fast ~17×, sync ~37×.
+production `sync` — примерно в ~37×. На одном клиенте fast ~17×, sync ~33×.
 Это ожидаемо: один Raft-commit платит за консенсус и fsync, PostgreSQL — нет.
 
 Batch-режим достигает ~5–7k tx/s (на уровне PostgreSQL) только как

@@ -1,5 +1,11 @@
 # Скорость: честный разбор (Sprint 2)
 
+> **Post-fix addendum.** После аудита `CommitSingles` объединил все команды
+> одного Raft-батча в один Pebble batch/fsync. Новый замер:
+> sync 10 клиентов ~5.4 мс/op (~185 tx/s), sync 1 клиент ~22.6 мс (~44 tx/s).
+> Оценки ниже (70 tx/s, p50 151 мс) — состояние **до** фикса; см.
+> [PERFORMANCE.md](../PERFORMANCE.md).
+
 - Дата: 2026-11-17
 - HEAD: `b588e24`
 - Железо: Apple M1 Pro (10 CPU), macOS, loopback, Go 1.23.5

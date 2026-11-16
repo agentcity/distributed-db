@@ -153,7 +153,7 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
    - нет воспроизводимого p99-прогона на 3 узлах и 1 ТБ;
    - fast-профиль (M1 Pro/loopback): ~11.6 мс single (~86 tx/s),
      ~1.2–2.1 мс/op parallel (~480–820 tx/s), batch 256 ~0.14–0.20 мс/txn
-     (~5–7k tx/s, batch latency 36–51 мс); production `sync` — ~40–70 tx/s;
+     (~5–7k tx/s, batch latency 36–51 мс); production `sync` — ~44–185 tx/s;
      PostgreSQL 13 рядом — ~6.8k tx/s на 10 клиентах;
    - это не SLO: нет реальной сети, p99, 1 ТБ soak;
    - нет follower reads и parallel query.

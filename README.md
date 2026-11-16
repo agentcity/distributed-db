@@ -161,8 +161,8 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 - Замеры на M1 Pro/loopback в **fast**-профиле: 3 узла single txn ~11.6 мс (~86 tx/s),
   parallel 10 клиентов ~1.2–2.1 мс/op (~480–820 tx/s), batch 256
   ~0.14–0.20 мс/txn (~5–7k tx/s, но batch latency 36–51 мс); PostgreSQL 13
-  рядом — ~6.8k tx/s на 10 клиентах. Production default `sync`: ~40–70 tx/s,
-  разрыв ~100×. Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
+  рядом — ~6.8k tx/s на 10 клиентах. Production default `sync`: ~44–185 tx/s,
+  разрыв ~33–37×. Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
 
 Пока нет: joint consensus/decommission, per-chunk CRC, durable scheduler
 queue/leader lease, production TLS/auth, SLO p99 прогон, расширенный SQL
