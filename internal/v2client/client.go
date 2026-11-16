@@ -274,6 +274,12 @@ func (c *Client) AllocTS(ctx context.Context) (uint64, error) {
 	return resp.GetStart(), nil
 }
 
+// KV is one row returned by Txn.Scan.
+type KV struct {
+	Key   []byte
+	Value []byte
+}
+
 // Txn is a single optimistic transaction. It is not safe for concurrent use.
 type Txn struct {
 	c       *Client
@@ -343,6 +349,30 @@ func (t *Txn) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, ErrNotFound
 	}
 	return out, nil
+}
+
+// Scan reads a range at the transaction snapshot. It is routed by start key.
+func (t *Txn) Scan(ctx context.Context, start, end []byte, limit int) ([]KV, error) {
+	var rows []KV
+	var msg string
+	if err := t.c.retry(ctx, start, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		resp, err := cl.Scan(ctx, &pbv2.ScanRequest{Start: start, End: end, Ts: t.startTS, Limit: int32(limit)})
+		if err != nil {
+			return "", "", err
+		}
+		msg = resp.GetError()
+		rows = rows[:0]
+		for _, kv := range resp.GetKvs() {
+			rows = append(rows, KV{Key: kv.GetKey(), Value: kv.GetValue()})
+		}
+		return resp.GetLeader(), resp.GetError(), nil
+	}); err != nil {
+		return nil, err
+	}
+	if msg != "" {
+		return nil, fmt.Errorf("v2client: scan: %s", msg)
+	}
+	return rows, nil
 }
 
 // Commit prewrites all staged mutations and commits them.
