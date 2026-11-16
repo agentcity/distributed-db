@@ -201,6 +201,9 @@ SQL не начинается, пока KV не даёт стабильные т
 - adapter `multiraft` → `raft.Node`;
 - benchmark v2 на реальном gRPC (~20 ms/op для 4-RPC транзакции на одном узле).
 
-M1/0006 закрыт. Следующий этап — M2: подключить Multi-Raft host к kvserver,
-range routing, split/merge и meta-карта. SQL остаётся после стабильного
-транзакционного KV.
+M1/0006 закрыт. В M2 сделано: `meta.SetRanges`, `GetRange/ListRanges`,
+range identity в Status, клиентский routing по range ID и e2e
+2 диапазона × 3 реплики с failover.
+
+Осталось в M2/0007: split/merge с реальным переносом данных и Raft-групп,
+Multi-Raft host внутри одного процесса, переезд meta/TSO в Raft.

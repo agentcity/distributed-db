@@ -68,9 +68,12 @@ go build -o bin/kv2 ./cmd/kv2
 go test -race ./test -run TestV2SingleRangeCluster -v
 ```
 
-Пока нет: Multi-Raft host внутри kvserver (сейчас один range на процесс),
-range split/merge и SQL-слой. Snapshot catch-up, restart из snapshot и
-gRPC-бенчмарк уже есть.
+Есть 2 диапазона × 3 реплики: meta отдаёт `GetRange/ListRanges`, клиент
+маршрутизирует ключ по range ID и обновляет лидера при failover.
+
+Пока нет: Multi-Raft host внутри одного процесса, split/merge с переносом
+данных и SQL-слой. Snapshot catch-up, restart из snapshot и gRPC-бенчмарк
+уже есть.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
