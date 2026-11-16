@@ -209,8 +209,9 @@ replicated TSO, `Leader`, клиентский redirect и failover.
 В M2.2/0012 сделан RangeHost (N Raft-групп в процессе, range_id RPC) и
 host-local split/merge с переносом MVCC-записей. В M2.4/0013 — распределённый
 split: prepare через Raft, freeze всех реплик, новая группа на каждой,
-meta SetRanges после успеха. Осталось: распределённый merge, epoch/fencing,
-persist range map RangeHost.
+meta SetRanges после успеха. Распределённый merge тоже сделан: prepare в
+обеих группах, перенос right→left на каждой реплике, остановка right.
+Осталось: epoch/fencing, persist range map RangeHost.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.

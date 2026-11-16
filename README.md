@@ -85,7 +85,9 @@ go test -race ./test -run TestV2SingleRangeCluster -v
 
 Split теперь умеет распределённый режим: `KVService.SplitRange` реплицирует
 prepare, замораживает все реплики и создаёт новую Raft-группу на каждой;
-meta обновляется после успеха. Merge пока host-local, epoch/fencing — дальше. Транзакции
+meta обновляется после успеха. Распределённый merge также работает:
+prepare в обеих группах, перенос right→left на каждой реплике. Остались
+epoch/fencing и persist range map RangeHost. Транзакции
 поддерживают `CheckTxnStatus/ResolveLock`, а `Get` сам разрешает
 committed/rolled-back/expired locks.
 
