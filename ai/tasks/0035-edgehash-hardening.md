@@ -20,10 +20,20 @@ scope: {backend: true, console: false, mobile: true}
 
 ## Критерии
 
-- [ ] Ed25519 verify, HMAC legacy.
-- [ ] Absence proof verifies.
-- [ ] zstd segment + legacy v1.
-- [ ] TLS/auth/rate/range/CDN headers.
-- [ ] Atomic sync + TTL/LRU.
-- [ ] Mobile protocol scaffold.
-- [ ] Тесты.
+- [x] Ed25519 verify, HMAC legacy.
+- [x] Absence proof verifies.
+- [x] zstd segment + legacy v1.
+- [x] TLS/auth/rate/range/CDN headers.
+- [x] Atomic sync + TTL/LRU.
+- [x] Mobile protocol scaffold.
+- [x] Тесты.
+
+## Результат
+
+- Ed25519 manifest + Verifier; HMAC legacy.
+- AbsenceProof для before/between/after.
+- Segment v2 zstd, v1 совместим.
+- TLS, Bearer auth, per-IP rate limit, Range/206, CDN headers.
+- generation dirs + CURRENT, crash-atomic sync.
+- MaxCacheBytes/MaxSegments/SegmentTTL + LRU.
+- mobile scaffold (Kotlin/Swift, untested on device).

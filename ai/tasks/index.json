@@ -206,7 +206,7 @@
   {
     "id": "0035",
     "title": "Edge hash cache — production hardening",
-    "status": "in_progress",
+    "status": "done",
     "file": "0035-edgehash-hardening.md"
   }
 ]
