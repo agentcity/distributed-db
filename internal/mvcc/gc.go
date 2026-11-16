@@ -5,33 +5,89 @@ import (
 	"fmt"
 )
 
+// GCStats reports the records removed by one GCWithStats pass.
+//
+// The counters describe records that GC selected for deletion from the data
+// and write columns. Locks are never deleted by GC: LocksRetained reports how
+// many lock records the pass deliberately left for the lock resolver.
+type GCStats struct {
+	// DataVersions is the number of data-column versions deleted.
+	DataVersions int
+	// WriteRecords is the number of committed put/delete write records
+	// deleted. Each such record normally has a matching data version, which
+	// is counted separately in DataVersions.
+	WriteRecords int
+	// RollbackRecords is the number of rollback write records deleted.
+	RollbackRecords int
+	// LocksRetained is the number of lock records left untouched. GC counts
+	// every lock record, regardless of its startTS.
+	LocksRetained int
+}
+
+// Total returns the number of data/write records deleted by the pass. Locks
+// are not included because GC never deletes them.
+func (st GCStats) Total() int {
+	return st.DataVersions + st.WriteRecords + st.RollbackRecords
+}
+
 // GC removes versions that transactions at or above safePoint can no longer
-// read, plus locks that are assumed to belong to abandoned transactions.
+// read. It is a thin wrapper around GCWithStats that discards the statistics.
+//
+// See GCWithStats for the exact retained/deleted rules. GC never deletes lock
+// records, and safePoint == 0 is a no-op.
+func (s *Store) GC(safePoint uint64) error {
+	_, err := s.GCWithStats(safePoint)
+	return err
+}
+
+// GCWithStats performs one garbage-collection pass at safePoint and reports
+// what it did. safePoint is a lower bound on the startTS of every transaction
+// that may still read the store; callers are responsible for advancing it
+// monotonically.
 //
 // It keeps:
 //   - the newest committed put/delete version at or below safePoint (the base
-//     version), so snapshots at safePoint and later still see current data;
-//   - every data/write version at or above safePoint;
-//   - locks whose startTS is at or above safePoint.
+//     version), so snapshots at safePoint and later still see current data.
+//     A base delete is kept as a tombstone even though it has no data record;
+//   - every data/write version at or above safePoint.
 //
-// It deletes older data and write versions, rollback records below safePoint,
-// and locks with startTS < safePoint.
+// It deletes:
+//   - older data versions and their committed write records below safePoint;
+//   - rollback records below safePoint.
 //
-// # Deferred work
+// It never deletes locks, even when their startTS is below safePoint. A lock's
+// startTS says when its transaction began, not whether that transaction is
+// still alive or was abandoned, so a lock below the safe point can still belong
+// to a live transaction. Locks must be resolved through the transaction primary
+// (and, in a replicated group, through Raft); deleting them here would let a
+// reader observe a partially committed transaction. All lock records are left
+// for the lock resolver, and their count is returned in GCStats.LocksRetained.
 //
-// This is deliberately a basic, offline GC. It does not resolve locks (check
-// the primary and commit/rollback the transaction), it does not honour
-// lock TTL against a wall clock, and it is not safe to run concurrently with a
-// transaction whose startTS is below safePoint. It collects keys in memory
-// instead of using range deletes or Pebble compaction filters, and it does not
-// run in the background. Callers are responsible for moving safePoint forward
-// monotonically; running GC with an older safe point can delete a version a
-// later snapshot still needs.
-func (s *Store) GC(safePoint uint64) error {
+// safePoint == 0 is treated as "no safe point established yet" and is a no-op
+// returning zero-value GCStats. Zero is the zero value of the timestamp type
+// rather than a TSO a caller could have resolved, and a GC that treats an unset
+// bound as real risks collecting or retaining data by accident. Callers must
+// only call GC once they have a real safe point; a zero-valued safe point is
+// never treated as a real lower bound.
+//
+// The pass is deliberately basic and offline-style. It collects keys in memory
+// instead of using range deletes or Pebble compaction filters, and it is not
+// safe to run concurrently with a transaction whose startTS is below
+// safePoint. Running GC with an older safe point can delete a version a later
+// snapshot still needs. On error, some batches may already have been applied;
+// the returned statistics count the records selected for deletion.
+func (s *Store) GCWithStats(safePoint uint64) (GCStats, error) {
+	var stats GCStats
+	if safePoint == 0 {
+		return stats, nil
+	}
+
 	var deletes [][]byte
 
 	// Data versions: keep the base put version and everything above the safe
-	// point; everything else is unreachable by snapshots >= safePoint.
+	// point; everything else is unreachable by snapshots >= safePoint. Data
+	// of an uncommitted transaction is also collected here: Commit copies the
+	// value from the lock, so it does not need the provisional data version.
 	type baseVersion struct {
 		ts    uint64
 		kind  byte
@@ -41,7 +97,7 @@ func (s *Store) GC(safePoint uint64) error {
 
 	iter, err := s.engine.NewIter([]byte{dataCF}, []byte{dataCF + 1})
 	if err != nil {
-		return err
+		return stats, err
 	}
 	for iter.Valid() {
 		key := append([]byte(nil), iter.Key()...)
@@ -57,7 +113,7 @@ func (s *Store) GC(safePoint uint64) error {
 			rec, version, found, err := s.latestRealWriteAtOrBefore(userKey, safePoint)
 			if err != nil {
 				_ = iter.Close()
-				return err
+				return stats, err
 			}
 			base = baseVersion{ts: version, kind: rec.kind, found: found}
 			baseCache[cacheKey] = base
@@ -67,23 +123,26 @@ func (s *Store) GC(safePoint uint64) error {
 			continue
 		}
 		deletes = append(deletes, key)
+		stats.DataVersions++
 		iter.Next()
 	}
 	if err := iter.Error(); err != nil {
 		_ = iter.Close()
-		return err
+		return stats, err
 	}
 	if err := iter.Close(); err != nil {
-		return err
+		return stats, err
 	}
 
 	// Write records: find the newest real (put/delete) version per key below
 	// the safe point, then delete all other write records below it. Rollbacks
-	// below the safe point can be dropped once the locks are gone.
+	// below the safe point can be dropped once their transaction is resolved or
+	// unreachable; removing them does not affect lock resolution, because a
+	// lock's own record still names its primary and startTS.
 	newestReal := make(map[string]uint64)
 	iter, err = s.engine.NewIter([]byte{writeCF}, []byte{writeCF + 1})
 	if err != nil {
-		return err
+		return stats, err
 	}
 	for iter.Valid() {
 		userKey, commitTS, ok := decodeVersionedKey(iter.Key())
@@ -94,7 +153,7 @@ func (s *Store) GC(safePoint uint64) error {
 		rec, err := decodeWrite(iter.Value())
 		if err != nil {
 			_ = iter.Close()
-			return err
+			return stats, err
 		}
 		if rec.kind == kindPut || rec.kind == kindDelete {
 			cacheKey := string(userKey)
@@ -106,15 +165,15 @@ func (s *Store) GC(safePoint uint64) error {
 	}
 	if err := iter.Error(); err != nil {
 		_ = iter.Close()
-		return err
+		return stats, err
 	}
 	if err := iter.Close(); err != nil {
-		return err
+		return stats, err
 	}
 
 	iter, err = s.engine.NewIter([]byte{writeCF}, []byte{writeCF + 1})
 	if err != nil {
-		return err
+		return stats, err
 	}
 	for iter.Valid() {
 		key := append([]byte(nil), iter.Key()...)
@@ -126,51 +185,47 @@ func (s *Store) GC(safePoint uint64) error {
 		rec, err := decodeWrite(iter.Value())
 		if err != nil {
 			_ = iter.Close()
-			return err
+			return stats, err
 		}
 		if rec.kind == kindPut || rec.kind == kindDelete {
 			if newest, exists := newestReal[string(userKey)]; exists && newest == commitTS {
 				iter.Next()
 				continue
 			}
+			stats.WriteRecords++
+		} else {
+			stats.RollbackRecords++
 		}
 		deletes = append(deletes, key)
 		iter.Next()
 	}
 	if err := iter.Error(); err != nil {
 		_ = iter.Close()
-		return err
+		return stats, err
 	}
 	if err := iter.Close(); err != nil {
-		return err
+		return stats, err
 	}
 
-	// Locks below the safe point are treated as abandoned. A later
-	// milestone will resolve them through the primary instead of deleting them.
+	// Locks are deliberately not collected. Count them so callers can report
+	// how much work the lock resolver still has; do not decode or mutate them.
 	iter, err = s.engine.NewIter([]byte{lockCF}, []byte{lockCF + 1})
 	if err != nil {
-		return err
+		return stats, err
 	}
 	for iter.Valid() {
-		lock, err := decodeLock(iter.Value())
-		if err != nil {
-			_ = iter.Close()
-			return err
-		}
-		if lock.startTS < safePoint {
-			deletes = append(deletes, append([]byte(nil), iter.Key()...))
-		}
+		stats.LocksRetained++
 		iter.Next()
 	}
 	if err := iter.Error(); err != nil {
 		_ = iter.Close()
-		return err
+		return stats, err
 	}
 	if err := iter.Close(); err != nil {
-		return err
+		return stats, err
 	}
 
-	return s.applyDeletes(deletes)
+	return stats, s.applyDeletes(deletes)
 }
 
 // latestRealWriteAtOrBefore returns the newest put/delete record for key with a

@@ -48,11 +48,16 @@ func TestGCVersions(t *testing.T) {
 	if err := store.GC(75); err != nil {
 		t.Fatalf("GC(75): %v", err)
 	}
-	if engineHas(t, engine, lockKey([]byte("b"))) {
-		t.Fatal("GC did not remove abandoned lock")
+	if !engineHas(t, engine, lockKey([]byte("b"))) {
+		t.Fatal("GC removed a lock; locks must be resolved, not collected")
 	}
 	if engineHas(t, engine, dataKey([]byte("b"), 70)) {
 		t.Fatal("GC did not remove orphan provisional data")
+	}
+	requireErrIs(t, mustGetErr(store, "b", 75), ErrLocked)
+	// The lock is resolved through the transaction path, not deleted by GC.
+	if err := store.Rollback([][]byte{[]byte("b")}, 70); err != nil {
+		t.Fatalf("Rollback(b): %v", err)
 	}
 	requireKeyNotFound(t, store, "b", 75)
 	requireValue(t, store, "a", 75, "v3")
@@ -121,8 +126,13 @@ func TestGCSafePointBoundary(t *testing.T) {
 		t.Fatalf("GC(21): %v", err)
 	}
 	requireValue(t, store, "g", 21, "v1")
-	if engineHas(t, engine, lockKey([]byte("h"))) {
-		t.Fatal("GC(21) kept a lock below the safe point")
+	if !engineHas(t, engine, lockKey([]byte("h"))) {
+		t.Fatal("GC(21) deleted a lock below the safe point; locks are left for the resolver")
+	}
+	requireErrIs(t, mustGetErr(store, "h", 21), ErrLocked)
+	// Resolution, not GC, removes the lock.
+	if err := store.Rollback([][]byte{[]byte("h")}, 20); err != nil {
+		t.Fatalf("Rollback(h): %v", err)
 	}
 	requireKeyNotFound(t, store, "h", 21)
 }
