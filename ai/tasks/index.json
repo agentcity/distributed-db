@@ -16,5 +16,17 @@
     "title": "Деплой, CI и документация",
     "status": "done",
     "file": "0003-deploy-docs.md"
+  },
+  {
+    "id": "0004",
+    "title": "KV v2 — storage, MVCC, Multi-Raft, metadata, client, benchmarks",
+    "status": "in_progress",
+    "file": "0004-kv-v2-foundation.md"
+  },
+  {
+    "id": "0005",
+    "title": "SQL-слой поверх транзакционного KV — ADR",
+    "status": "in_progress",
+    "file": "0005-sql-layer-adr.md"
   }
 ]
