@@ -802,13 +802,15 @@ func (t *Txn) Scan(ctx context.Context, start, end []byte, limit int) ([]KV, err
 
 // Commit prewrites all staged mutations and commits them.
 //
-// A cross-range transaction uses primary-first 2PC. Once the primary range's
-// commit succeeds the transaction is durable (the commit point) and Commit will
-// never roll back secondary ranges: if a secondary fails, Commit returns an
-// error matching ErrCommitIncomplete and a later Commit call retries the same
-// commitTS idempotently. If the primary's commit outcome cannot be determined,
-// the error matches ErrCommitUnknown and Rollback is refused for the same
-// reason.
+// A cross-range transaction uses primary-first 2PC: the primary range is
+// prewritten first, the remaining ranges are prewritten concurrently, the
+// primary range commits first, and then every secondary range commits
+// concurrently. Once the primary range's commit succeeds the transaction is
+// durable (the commit point) and Commit will never roll back secondary ranges:
+// if a secondary fails, Commit returns an error matching ErrCommitIncomplete
+// and a later Commit call retries the same commitTS idempotently. If the
+// primary's commit outcome cannot be determined, the error matches
+// ErrCommitUnknown and Rollback is refused for the same reason.
 func (t *Txn) Commit(ctx context.Context) error {
 	if t.done {
 		return errors.New("v2client: transaction is finished")
@@ -832,9 +834,10 @@ func (t *Txn) Commit(ctx context.Context) error {
 	}
 
 	// Group mutations by range. A single-range transaction uses 1PC; a
-	// cross-range transaction uses primary-first 2PC: prewrite every range,
-	// then commit the primary's range first so a reader can resolve secondary
-	// locks by inspecting the primary.
+	// cross-range transaction uses primary-first 2PC: prewrite the primary
+	// range first and the rest concurrently, then commit the primary's range
+	// first (so a reader can resolve secondary locks by inspecting the
+	// primary) before committing the remaining ranges concurrently.
 	batches := make([]*rangeBatch, 0, 2)
 	byRange := make(map[uint64]*rangeBatch)
 	for i, k := range keys {
@@ -913,16 +916,19 @@ func (t *Txn) Commit(ctx context.Context) error {
 		}
 	}
 
-	// Prewrite every range, waiting out conflicting locks up to
-	// LockWaitTimeout. Any failure before the commit point rolls back the
-	// ranges that were already prewritten.
+	// Prewrite the primary range first: its lock must exist before any
+	// secondary commit can be attempted. Then prewrite every secondary range
+	// concurrently, waiting out conflicting locks up to LockWaitTimeout. Any
+	// failure before the commit point rolls back every range that was
+	// successfully prewritten, including concurrent results.
 	prewritten := make([]*rangeBatch, 0, len(ordered))
-	for _, b := range ordered {
-		if err := t.prewriteBatch(ctx, b, primary); err != nil {
-			t.rollbackBatches(ctx, prewritten)
-			return err
-		}
-		prewritten = append(prewritten, b)
+	if err := t.prewriteBatch(ctx, ordered[0], primary); err != nil {
+		return err
+	}
+	prewritten = append(prewritten, ordered[0])
+	if err := t.prewriteSecondaries(ctx, ordered[1:], primary, &prewritten); err != nil {
+		t.rollbackBatches(ctx, prewritten)
+		return err
 	}
 
 	// Freeze the plan before the first commit RPC. From this point on a retry
@@ -979,59 +985,137 @@ func (t *Txn) prewriteBatch(ctx context.Context, b *rangeBatch, primary []byte) 
 	return &LockWaitError{Keys: []WaitFor{last}, Timeout: wait, Cause: ErrConflict}
 }
 
-// finishCommit drives the frozen cross-range plan. It is safe to call more than
-// once: each range commit is idempotent at the stored commitTS.
+// prewriteSecondaries prewrites every secondary range concurrently. The primary
+// range is deliberately not included: it was already prewritten, so its lock
+// exists before any secondary commit can be attempted. Every successful result
+// is appended to prewritten even when a sibling fails, so the caller can roll
+// the whole set back. The returned error is the first failure in plan order,
+// which keeps error reporting deterministic.
+func (t *Txn) prewriteSecondaries(ctx context.Context, batches []*rangeBatch, primary []byte, prewritten *[]*rangeBatch) error {
+	if len(batches) == 0 {
+		return nil
+	}
+	errs := make([]error, len(batches))
+	var wg sync.WaitGroup
+	wg.Add(len(batches))
+	for i, b := range batches {
+		go func(i int, b *rangeBatch) {
+			defer wg.Done()
+			errs[i] = t.prewriteBatch(ctx, b, primary)
+		}(i, b)
+	}
+	wg.Wait()
+
+	var firstErr error
+	for i, b := range batches {
+		if errs[i] != nil {
+			if firstErr == nil {
+				firstErr = errs[i]
+			}
+			continue
+		}
+		*prewritten = append(*prewritten, b)
+	}
+	return firstErr
+}
+
+// finishCommit drives the frozen cross-range plan. The primary range commits
+// first and determines the transaction outcome. Only once the commit point is
+// established are secondary ranges committed, all of them concurrently and each
+// with bounded retries. It is safe to call more than once: each range commit is
+// idempotent at the stored commitTS.
 func (t *Txn) finishCommit(ctx context.Context) error {
 	deadline := time.Now().Add(t.opts.commitRetryTimeout())
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	start := 0
-	if t.commitPoint {
-		// The primary is already committed; only secondaries remain. Replay
-		// them without touching the primary range.
-		start = 1
-	}
-	for i := start; i < len(t.ordered); i++ {
-		b := t.ordered[i]
+
+	if !t.commitPoint {
+		b := t.ordered[0]
 		attempts, err := t.commitBatch(ctx, b, deadline)
 		if err == nil {
-			if i == 0 {
-				t.commitPoint = true
-			}
-			continue
-		}
-		if i == 0 {
+			t.commitPoint = true
+		} else {
 			// The primary commit failed. Determine whether it nevertheless
 			// became durable; if that cannot be established, rollback would
-			// be unsafe.
+			// be unsafe. No secondary commit may start before the primary's
+			// outcome is known to be committed.
 			st, serr := t.c.CheckTxnStatus(ctx, t.primary, t.startTS)
-			if serr == nil && st.GetCommitted() {
+			switch {
+			case serr == nil && st.GetCommitted():
 				t.commitPoint = true
-				continue
-			}
-			if serr == nil && st.GetRolledBack() && st.GetLockTs() == 0 {
+				t.commitAmbiguous = false
+			case serr == nil && st.GetRolledBack() && st.GetLockTs() == 0:
 				return fmt.Errorf("v2client: commit primary range %d: %w", b.id, err)
+			default:
+				t.commitAmbiguous = true
+				return &CommitError{
+					StartTS: t.startTS, CommitTS: t.commitTS, Primary: t.primary,
+					PrimaryRange: b.id, FailedRange: b.id, Keys: b.keys,
+					Attempts: attempts, OutcomeUnknown: true, Cause: err,
+				}
 			}
-			t.commitAmbiguous = true
-			return &CommitError{
-				StartTS: t.startTS, CommitTS: t.commitTS, Primary: t.primary,
-				PrimaryRange: b.id, FailedRange: b.id, Keys: b.keys,
-				Attempts: attempts, OutcomeUnknown: true, Cause: err,
-			}
 		}
-		if !t.commitPoint {
-			// Batch 0 committed in an earlier call (or just above).
-			t.commitPoint = true
-		}
-		return &CommitError{
-			StartTS: t.startTS, CommitTS: t.commitTS, Primary: t.primary,
-			PrimaryRange: t.ordered[0].id, FailedRange: b.id, Keys: b.keys,
-			Attempts: attempts, CommitPoint: true, Cause: err,
-		}
+	}
+
+	if err := t.commitSecondaries(ctx, deadline); err != nil {
+		return err
 	}
 	t.done = true
 	return nil
+}
+
+// commitSecondaries commits every secondary range concurrently, each bounded by
+// the same deadline. All results are collected before returning: after the
+// commit point a failure in one range must never cancel an in-flight commit in
+// another. If any range remains uncommitted, the returned *CommitError matches
+// ErrCommitIncomplete and reports the first failed range in plan order (with all
+// secondary causes joined) so a later Commit can replay the plan idempotently.
+func (t *Txn) commitSecondaries(ctx context.Context, deadline time.Time) error {
+	batches := t.ordered[1:]
+	if len(batches) == 0 {
+		return nil
+	}
+	type result struct {
+		batch    *rangeBatch
+		attempts int
+		err      error
+	}
+	results := make([]result, len(batches))
+	var wg sync.WaitGroup
+	wg.Add(len(batches))
+	for i, b := range batches {
+		go func(i int, b *rangeBatch) {
+			defer wg.Done()
+			attempts, err := t.commitBatch(ctx, b, deadline)
+			results[i] = result{batch: b, attempts: attempts, err: err}
+		}(i, b)
+	}
+	wg.Wait()
+
+	var first *result
+	var causes []error
+	for i := range results {
+		if results[i].err == nil {
+			continue
+		}
+		if first == nil {
+			first = &results[i]
+		}
+		causes = append(causes, results[i].err)
+	}
+	if first == nil {
+		return nil
+	}
+	cause := first.err
+	if len(causes) > 1 {
+		cause = errors.Join(causes...)
+	}
+	return &CommitError{
+		StartTS: t.startTS, CommitTS: t.commitTS, Primary: t.primary,
+		PrimaryRange: t.ordered[0].id, FailedRange: first.batch.id, Keys: first.batch.keys,
+		Attempts: first.attempts, CommitPoint: true, Cause: cause,
+	}
 }
 
 // commitBatch commits one range, retrying transient failures until deadline.
