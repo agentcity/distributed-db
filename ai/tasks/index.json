@@ -46,5 +46,11 @@
     "title": "M3 — lock resolution и транзакционные конфликты",
     "status": "in_progress",
     "file": "0008-m3-lock-resolution.md"
+  },
+  {
+    "id": "0009",
+    "title": "SQL P0 — CREATE/INSERT/SELECT/UPDATE/DELETE поверх KV",
+    "status": "in_progress",
+    "file": "0009-sql-p0.md"
   }
 ]
