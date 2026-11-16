@@ -209,20 +209,22 @@ replicated TSO, `Leader`, клиентский redirect и failover.
 В M2.2/0012 сделан RangeHost (N Raft-групп в процессе, range_id RPC) и
 host-local split/merge с переносом MVCC-записей. В M2.4/0013 — распределённый
 split: prepare через Raft, freeze всех реплик, новая группа на каждой,
-meta SetRanges после успеха. Распределённый merge тоже сделан. Epoch/fencing
-и meta scheduler Split/Merge готовы; range map persist. Остались только
-retry/очередь scheduler и Jepsen.
+meta SetRanges после успеха. Распределённый merge тоже сделан. Epoch/fencing,
+meta scheduler Split/Merge, retry fan-out и partial-merge idempotency готовы;
+range map persist. Остались durable scheduler queue/leader lease.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
-Клиентские методы, фоновый resolver и GC safe point (locks не удаляются)
-добавлены. Осталось: stress/Jepsen.
+Клиентские методы, resolver, GC safe point и opt-in Jepsen kill/restart
+добавлены. Осталось: network partitions, clock skew, longer soak.
 
 В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV,
 HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
 колонке), multi-row UPDATE/DELETE по индексу, агрегаты COUNT/SUM/AVG/
 MIN/MAX; e2e CREATE/INSERT/SELECT/UPDATE/DELETE прошёл.
-GROUP BY сделан. Осталось: JOIN, pgwire. SQL на 3 узлах с kill лидера проверен.
+GROUP BY, INNER JOIN и минимальный pgwire сделаны. Осталось: planner
+(JOIN order/cost), extended protocol, LEFT/RIGHT JOIN. SQL на 3 узлах
+с kill лидера проверен.
 
 ## Целевая архитектура
 

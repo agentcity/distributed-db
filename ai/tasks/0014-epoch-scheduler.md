@@ -37,8 +37,8 @@ scope:
 - [x] meta scheduler split/merge на всех репликах.
 - [x] meta map обновляется только после успеха.
 - [x] e2e 3 meta + 3 KV.
-- [ ] Retry-политика scheduler при частичном успехе (сейчас повторный вызов).
-- [ ] Raft-based scheduler queue/leader lease.
+- [x] Retry fan-out и partial-merge idempotency.
+- [ ] Durable scheduler queue/leader lease.
 
 ## Ссылки
 

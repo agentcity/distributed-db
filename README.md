@@ -79,9 +79,9 @@ go test -race ./test -run TestV2SingleRangeCluster -v
 Есть 2 диапазона × 3 реплики: meta отдаёт `GetRange/ListRanges`, клиент
 маршрутизирует ключ по range ID и обновляет лидера при failover. Meta/TSO
 теперь можно запустить как Raft-кластер из 3 узлов (`-mode=meta` + peers).
-`kvserver.Config.Ranges` host-ит несколько Raft-групп в одном процессе; для
-одного host доступны `SplitRange`/`MergeRanges` с реальным переносом MVCC-
-записей (`TestV2RangeHostSplitMerge`).
+`kvserver.Config.Ranges` host-ит несколько Raft-групп в одном процессе;
+split/merge идут через meta scheduler, epoch/fencing отсекает stale клиентов.
+Jepsen kill/restart: `JEPSEN=1 go test ./test -run TestJepsen`.
 
 Split теперь умеет распределённый режим: `KVService.SplitRange` реплицирует
 prepare, замораживает все реплики и создаёт новую Raft-группу на каждой;
@@ -100,7 +100,7 @@ committed/rolled-back locks, а фоновый resolver на лидере range
 
 Минимальный SQL-слой: `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, `INSERT`,
 `SELECT` (projection, `WHERE` по PK или indexed-колонке, `LIMIT`,
-`COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`), `UPDATE`,
+`COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `INNER JOIN`), `UPDATE`,
 `DELETE` (включая multi-row по indexed-колонке). Каталог, строки и индексы
 лежат в KV, каждая команда — транзакция.
 
@@ -117,7 +117,9 @@ curl -s -X POST localhost:8080/v1/sql \
   -d '{"sql":"SELECT * FROM users"}'
 ```
 
-P0 не умеет JOIN и pgwire; это следующие фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
+Есть минимальный pgwire (`cmd/pgsrv`, psql simple query). P0 не умеет
+JOIN более двух таблиц, LEFT/RIGHT JOIN и extended protocol; это следующие
+фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 

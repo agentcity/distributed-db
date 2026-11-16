@@ -37,7 +37,8 @@ Percolator-транзакция может оставить lock после па
 - [x] Клиентские методы CheckTxnStatus/ResolveLock и retry на live lock.
 - [x] Фоновый resolver просроченных locks.
 - [x] MVCC GC safe point (locks не удаляются).
-- [ ] Stress/Jepsen-проверка.
+- [x] Opt-in Jepsen kill/restart stress (JEPSEN=1).
+- [ ] Network partitions/clock skew/soak.
 
 ## Ссылки
 
