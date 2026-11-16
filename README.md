@@ -81,7 +81,8 @@ committed/rolled-back/expired locks.
 
 Минимальный SQL-слой: `CREATE/DROP TABLE`, `CREATE/DROP INDEX`, `INSERT`,
 `SELECT` (projection, `WHERE` по PK или indexed-колонке, `LIMIT`), `UPDATE`,
-`DELETE`. Каталог, строки и индексы лежат в KV, каждая команда — транзакция.
+`DELETE` (включая multi-row по indexed-колонке). Каталог, строки и индексы
+лежат в KV, каждая команда — транзакция.
 
 ```bash
 go build -o bin/sqlsrv ./cmd/sqlsrv
