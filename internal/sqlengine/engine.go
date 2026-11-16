@@ -28,11 +28,16 @@ var (
 	ErrBadColumn = errors.New("sqlengine: bad column")
 	// ErrUnsupported means the P0 engine does not implement this SQL feature.
 	ErrUnsupported = errors.New("sqlengine: unsupported")
+	// ErrIndexExists means CREATE INDEX reused a name.
+	ErrIndexExists = errors.New("sqlengine: index already exists")
+	// ErrIndexNotFound means DROP INDEX/SELECT referenced a missing index.
+	ErrIndexNotFound = errors.New("sqlengine: index not found")
 )
 
 const (
 	catalogPrefix byte = 0x01
 	rowPrefix     byte = 0x02
+	indexPrefix   byte = 0x03
 )
 
 // Engine executes the P0 SQL subset over a transactional KV client.
@@ -72,6 +77,10 @@ func (e *Engine) execute(ctx context.Context, stmt sqlparser.Statement) (*Result
 		res, err = e.selectRows(ctx, tx, *s)
 	case *sqlparser.Update:
 		res, err = e.update(ctx, tx, *s)
+	case *sqlparser.CreateIndex:
+		res, err = e.createIndex(ctx, tx, *s)
+	case *sqlparser.DropIndex:
+		res, err = e.dropIndex(ctx, tx, *s)
 	case *sqlparser.Delete:
 		res, err = e.delete(ctx, tx, *s)
 	case sqlparser.CreateTable:
@@ -84,6 +93,10 @@ func (e *Engine) execute(ctx context.Context, stmt sqlparser.Statement) (*Result
 		res, err = e.selectRows(ctx, tx, s)
 	case sqlparser.Update:
 		res, err = e.update(ctx, tx, s)
+	case sqlparser.CreateIndex:
+		res, err = e.createIndex(ctx, tx, s)
+	case sqlparser.DropIndex:
+		res, err = e.dropIndex(ctx, tx, s)
 	case sqlparser.Delete:
 		res, err = e.delete(ctx, tx, s)
 	default:
@@ -146,6 +159,16 @@ func (e *Engine) dropTable(ctx context.Context, tx Txn, s sqlparser.DropTable) (
 	if err != nil {
 		return nil, err
 	}
+	for _, idx := range schema.Indexes {
+		idxID := indexID(idx.Name)
+		indexRows, err := tx.Scan(ctx, indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range indexRows {
+			tx.Delete(row.Key)
+		}
+	}
 	rows, err := tx.Scan(ctx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
 	if err != nil {
 		return nil, err
@@ -155,6 +178,94 @@ func (e *Engine) dropTable(ctx context.Context, tx Txn, s sqlparser.DropTable) (
 	}
 	tx.Delete(catalogKey(schema.Name))
 	return &Result{Message: "table dropped"}, nil
+}
+
+func (e *Engine) createIndex(ctx context.Context, tx Txn, s sqlparser.CreateIndex) (*Result, error) {
+	schema, err := e.loadSchema(ctx, tx, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	name := strings.ToLower(s.Name)
+	for _, idx := range schema.Indexes {
+		if idx.Name == name {
+			return nil, ErrIndexExists
+		}
+	}
+	colName := strings.ToLower(s.Column)
+	idx, ok := columnIndex(schema, colName)
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, s.Column)
+	}
+	col := schema.Columns[idx]
+	if col.PrimaryKey {
+		return nil, fmt.Errorf("%w: index on primary key", ErrUnsupported)
+	}
+	rows, err := tx.Scan(ctx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), 0)
+	if err != nil {
+		return nil, err
+	}
+	idxID := indexID(name)
+	for _, row := range rows {
+		var values map[string]any
+		if err := json.Unmarshal(row.Value, &values); err != nil {
+			return nil, err
+		}
+		normalizeRow(schema, values)
+		v, ok := values[col.Name]
+		if !ok {
+			continue
+		}
+		lit, err := anyToLiteral(col, v)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := encodeValue(col, lit)
+		if err != nil {
+			return nil, err
+		}
+		pk := row.Key[len(tablePrefix(schema.ID)):]
+		tx.Set(indexEntryKey(schema.ID, idxID, encoded, pk), nil)
+	}
+	schema.Indexes = append(schema.Indexes, Index{Name: name, Column: col.Name})
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	tx.Set(catalogKey(schema.Name), data)
+	return &Result{Message: "index created"}, nil
+}
+
+func (e *Engine) dropIndex(ctx context.Context, tx Txn, s sqlparser.DropIndex) (*Result, error) {
+	schema, err := e.loadSchema(ctx, tx, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	name := strings.ToLower(s.Name)
+	pos := -1
+	for i, idx := range schema.Indexes {
+		if idx.Name == name {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return nil, ErrIndexNotFound
+	}
+	idxID := indexID(name)
+	rows, err := tx.Scan(ctx, indexTablePrefix(schema.ID, idxID), indexTableEnd(schema.ID, idxID), 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		tx.Delete(row.Key)
+	}
+	schema.Indexes = append(schema.Indexes[:pos], schema.Indexes[pos+1:]...)
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	tx.Set(catalogKey(schema.Name), data)
+	return &Result{Message: "index dropped"}, nil
 }
 
 func (e *Engine) insert(ctx context.Context, tx Txn, s sqlparser.Insert) (*Result, error) {
@@ -225,6 +336,19 @@ func (e *Engine) insert(ctx context.Context, tx Txn, s sqlparser.Insert) (*Resul
 		return nil, err
 	}
 	tx.Set(key, data)
+	for _, idx := range schema.Indexes {
+		ci, _ := columnIndex(schema, idx.Column)
+		col := schema.Columns[ci]
+		lit, err := anyToLiteral(col, row[idx.Column])
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := encodeValue(col, lit)
+		if err != nil {
+			return nil, err
+		}
+		tx.Set(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk), nil)
+	}
 	return &Result{RowsAffected: 1, Message: "row inserted"}, nil
 }
 
@@ -285,6 +409,11 @@ func (e *Engine) update(ctx context.Context, tx Txn, s sqlparser.Update) (*Resul
 	if err := json.Unmarshal(raw, &row); err != nil {
 		return nil, err
 	}
+	normalizeRow(schema, row)
+	oldRow := make(map[string]any, len(row))
+	for k, v := range row {
+		oldRow[k] = v
+	}
 	if len(s.Assignments) == 0 {
 		return nil, fmt.Errorf("%w: SET list is empty", ErrBadColumn)
 	}
@@ -302,11 +431,39 @@ func (e *Engine) update(ctx context.Context, tx Txn, s sqlparser.Update) (*Resul
 		}
 		row[name] = as.Value.AsAny()
 	}
+	for _, idx := range schema.Indexes {
+		ci, _ := columnIndex(schema, idx.Column)
+		col := schema.Columns[ci]
+		if old, ok := oldRow[idx.Column]; ok {
+			lit, err := anyToLiteral(col, old)
+			if err != nil {
+				return nil, err
+			}
+			encoded, err := encodeValue(col, lit)
+			if err != nil {
+				return nil, err
+			}
+			tx.Delete(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk))
+		}
+	}
 	data, err := json.Marshal(row)
 	if err != nil {
 		return nil, err
 	}
 	tx.Set(key, data)
+	for _, idx := range schema.Indexes {
+		ci, _ := columnIndex(schema, idx.Column)
+		col := schema.Columns[ci]
+		lit, err := anyToLiteral(col, row[idx.Column])
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := encodeValue(col, lit)
+		if err != nil {
+			return nil, err
+		}
+		tx.Set(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk), nil)
+	}
 	return &Result{RowsAffected: 1, Message: "row updated"}, nil
 }
 
@@ -328,10 +485,29 @@ func (e *Engine) delete(ctx context.Context, tx Txn, s sqlparser.Delete) (*Resul
 		return nil, err
 	}
 	key := rowKey(schema.ID, pk)
-	if _, err := tx.Get(ctx, key); errors.Is(err, ErrNotFound) {
+	raw, err := tx.Get(ctx, key)
+	if errors.Is(err, ErrNotFound) {
 		return &Result{RowsAffected: 0}, nil
 	} else if err != nil {
 		return nil, err
+	}
+	var row map[string]any
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return nil, err
+	}
+	normalizeRow(schema, row)
+	for _, idx := range schema.Indexes {
+		ci, _ := columnIndex(schema, idx.Column)
+		col := schema.Columns[ci]
+		lit, err := anyToLiteral(col, row[idx.Column])
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := encodeValue(col, lit)
+		if err != nil {
+			return nil, err
+		}
+		tx.Delete(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk))
 	}
 	tx.Delete(key)
 	return &Result{RowsAffected: 1, Message: "row deleted"}, nil
@@ -344,26 +520,66 @@ func (e *Engine) readRows(ctx context.Context, tx Txn, schema *Schema, where *sq
 	pkIdx, _ := schema.PrimaryKeyIndex()
 	pkCol := schema.Columns[pkIdx]
 	if where != nil {
-		if !strings.EqualFold(where.Column, pkCol.Name) {
-			return nil, fmt.Errorf("%w: WHERE must use primary key %q", ErrUnsupported, pkCol.Name)
+		if strings.EqualFold(where.Column, pkCol.Name) {
+			pk, err := encodePK(pkCol, where.Value)
+			if err != nil {
+				return nil, err
+			}
+			raw, err := tx.Get(ctx, rowKey(schema.ID, pk))
+			if errors.Is(err, ErrNotFound) {
+				return nil, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			var row map[string]any
+			if err := json.Unmarshal(raw, &row); err != nil {
+				return nil, err
+			}
+			normalizeRow(schema, row)
+			return []map[string]any{row}, nil
 		}
-		pk, err := encodePK(pkCol, where.Value)
+
+		column := strings.ToLower(where.Column)
+		ci, ok := columnIndex(schema, column)
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, where.Column)
+		}
+		idx, ok := indexForColumn(schema, column)
+		if !ok {
+			return nil, fmt.Errorf("%w: WHERE must use the primary key or an indexed column", ErrUnsupported)
+		}
+		col := schema.Columns[ci]
+		encoded, err := encodeValue(col, where.Value)
 		if err != nil {
 			return nil, err
 		}
-		raw, err := tx.Get(ctx, rowKey(schema.ID, pk))
-		if errors.Is(err, ErrNotFound) {
-			return nil, nil
-		}
+		idxID := indexID(idx.Name)
+		start := indexValueKey(schema.ID, idxID, encoded)
+		end := indexValueEnd(schema.ID, idxID, encoded)
+		indexRows, err := tx.Scan(ctx, start, end, limit)
 		if err != nil {
 			return nil, err
 		}
-		var row map[string]any
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return nil, err
+		out := make([]map[string]any, 0, len(indexRows))
+		valueKeyLen := len(start)
+		for _, ir := range indexRows {
+			pk := ir.Key[valueKeyLen:]
+			raw, err := tx.Get(ctx, rowKey(schema.ID, pk))
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			var row map[string]any
+			if err := json.Unmarshal(raw, &row); err != nil {
+				return nil, err
+			}
+			normalizeRow(schema, row)
+			out = append(out, row)
 		}
-		normalizeRow(schema, row)
-		return []map[string]any{row}, nil
+		return out, nil
 	}
 
 	rows, err := tx.Scan(ctx, tablePrefix(schema.ID), tablePrefixEnd(schema.ID), limit)
@@ -428,22 +644,10 @@ func rowKey(id uint64, pk []byte) []byte {
 }
 
 func encodePK(col Column, v sqlparser.Value) ([]byte, error) {
-	switch col.Type {
-	case "INT":
-		if v.Kind != sqlparser.ValueInt {
-			return nil, fmt.Errorf("%w: primary key %q expects INT", ErrBadColumn, col.Name)
-		}
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(v.Int)^(1<<63))
-		return buf[:], nil
-	case "TEXT":
-		if v.Kind != sqlparser.ValueText {
-			return nil, fmt.Errorf("%w: primary key %q expects TEXT", ErrBadColumn, col.Name)
-		}
-		return []byte(v.Str), nil
-	default:
-		return nil, fmt.Errorf("%w: type %q", ErrUnsupported, col.Type)
+	if err := checkLiteralType(col, v); err != nil {
+		return nil, err
 	}
+	return encodeValue(col, v)
 }
 
 func checkLiteralType(col Column, v sqlparser.Value) error {
@@ -460,6 +664,99 @@ func checkLiteralType(col Column, v sqlparser.Value) error {
 		return fmt.Errorf("%w: type %q", ErrUnsupported, col.Type)
 	}
 	return nil
+}
+
+func indexID(name string) uint64 { return xxhash.Sum64String(name) }
+
+func indexTablePrefix(tableID, idxID uint64) []byte {
+	prefix := make([]byte, 17)
+	prefix[0] = indexPrefix
+	binary.BigEndian.PutUint64(prefix[1:], tableID)
+	binary.BigEndian.PutUint64(prefix[9:], idxID)
+	return prefix
+}
+
+func indexTableEnd(tableID, idxID uint64) []byte {
+	prefix := indexTablePrefix(tableID, idxID)
+	end := make([]byte, len(prefix)+16)
+	copy(end, prefix)
+	for i := len(prefix); i < len(end); i++ {
+		end[i] = 0xff
+	}
+	return end
+}
+
+func indexValueKey(tableID, idxID uint64, value []byte) []byte {
+	key := indexTablePrefix(tableID, idxID)
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], uint32(len(value)))
+	key = append(key, n[:]...)
+	return append(key, value...)
+}
+
+func indexEntryKey(tableID, idxID uint64, value, pk []byte) []byte {
+	key := indexValueKey(tableID, idxID, value)
+	return append(key, pk...)
+}
+
+func indexValueEnd(tableID, idxID uint64, value []byte) []byte {
+	start := indexValueKey(tableID, idxID, value)
+	end := make([]byte, len(start)+16)
+	copy(end, start)
+	for i := len(start); i < len(end); i++ {
+		end[i] = 0xff
+	}
+	return end
+}
+
+func indexForColumn(s *Schema, column string) (Index, bool) {
+	for _, idx := range s.Indexes {
+		if idx.Column == column {
+			return idx, true
+		}
+	}
+	return Index{}, false
+}
+
+func encodeValue(col Column, v sqlparser.Value) ([]byte, error) {
+	switch col.Type {
+	case "INT":
+		if v.Kind != sqlparser.ValueInt {
+			return nil, fmt.Errorf("%w: column %q expects INT", ErrBadColumn, col.Name)
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(v.Int)^(1<<63))
+		return buf[:], nil
+	case "TEXT":
+		if v.Kind != sqlparser.ValueText {
+			return nil, fmt.Errorf("%w: column %q expects TEXT", ErrBadColumn, col.Name)
+		}
+		return []byte(v.Str), nil
+	default:
+		return nil, fmt.Errorf("%w: type %q", ErrUnsupported, col.Type)
+	}
+}
+
+func anyToLiteral(col Column, v any) (sqlparser.Value, error) {
+	switch col.Type {
+	case "INT":
+		switch n := v.(type) {
+		case int64:
+			return sqlparser.Value{Kind: sqlparser.ValueInt, Int: n}, nil
+		case float64:
+			return sqlparser.Value{Kind: sqlparser.ValueInt, Int: int64(n)}, nil
+		default:
+			return sqlparser.Value{}, fmt.Errorf("%w: column %q is not INT", ErrBadColumn, col.Name)
+		}
+	case "TEXT":
+		s, ok := v.(string)
+		if !ok {
+			return sqlparser.Value{}, fmt.Errorf("%w: column %q is not TEXT", ErrBadColumn, col.Name)
+		}
+		return sqlparser.Value{Kind: sqlparser.ValueText, Str: s}, nil
+	default:
+		return sqlparser.Value{}, fmt.Errorf("%w: type %q", ErrUnsupported, col.Type)
+	}
 }
 
 func columnIndex(s *Schema, name string) (int, bool) {

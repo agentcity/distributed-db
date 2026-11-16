@@ -81,10 +81,19 @@ func TestSQLP0OnKV(t *testing.T) {
 	if len(res.Rows) != 1 || res.Rows[0][0] != "bob" {
 		t.Fatalf("SQL point select = %+v", res)
 	}
+	exec("CREATE INDEX idx_name ON users (name)")
+	res = exec("SELECT id FROM users WHERE name = 'bob'")
+	if len(res.Rows) != 1 || res.Rows[0][0] != int64(2) {
+		t.Fatalf("SQL index select = %+v", res)
+	}
 	exec("UPDATE users SET name = 'carol' WHERE id = 1")
 	res = exec("SELECT name FROM users WHERE id = 1")
 	if len(res.Rows) != 1 || res.Rows[0][0] != "carol" {
 		t.Fatalf("SQL update = %+v", res)
+	}
+	res = exec("SELECT id FROM users WHERE name = 'carol'")
+	if len(res.Rows) != 1 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("SQL index after update = %+v", res)
 	}
 	exec("DELETE FROM users WHERE id = 2")
 	res = exec("SELECT * FROM users")

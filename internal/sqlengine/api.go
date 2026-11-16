@@ -47,11 +47,18 @@ type Column struct {
 	PrimaryKey bool   `json:"primary_key,omitempty"`
 }
 
+// Index describes a non-unique secondary index.
+type Index struct {
+	Name   string `json:"name"`
+	Column string `json:"column"`
+}
+
 // Schema is the persisted table descriptor.
 type Schema struct {
 	ID      uint64   `json:"id"`
 	Name    string   `json:"name"`
 	Columns []Column `json:"columns"`
+	Indexes []Index  `json:"indexes,omitempty"`
 }
 
 // PrimaryKeyIndex returns the index of the primary-key column.

@@ -160,3 +160,51 @@ func TestSQLTextPrimaryKeyOrder(t *testing.T) {
 		t.Fatalf("text pk order = %+v", res)
 	}
 }
+
+func TestSQLSecondaryIndex(t *testing.T) {
+	e := New(newFakeClient())
+	exec(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT)")
+	exec(t, e, "INSERT INTO users VALUES (1, 'alice', 'msk')")
+	exec(t, e, "INSERT INTO users VALUES (2, 'bob', 'spb')")
+	exec(t, e, "INSERT INTO users VALUES (3, 'bob', 'msk')")
+	exec(t, e, "CREATE INDEX idx_name ON users (name)")
+
+	res := exec(t, e, "SELECT id FROM users WHERE name = 'bob'")
+	if len(res.Rows) != 2 {
+		t.Fatalf("index select = %+v", res)
+	}
+
+	exec(t, e, "INSERT INTO users VALUES (4, 'bob', 'kazan')")
+	res = exec(t, e, "SELECT id FROM users WHERE name = 'bob'")
+	if len(res.Rows) != 3 {
+		t.Fatalf("index after insert = %+v", res)
+	}
+
+	exec(t, e, "UPDATE users SET name = 'carol' WHERE id = 2")
+	res = exec(t, e, "SELECT id FROM users WHERE name = 'bob'")
+	if len(res.Rows) != 2 {
+		t.Fatalf("index after update = %+v", res)
+	}
+	res = exec(t, e, "SELECT id FROM users WHERE name = 'carol'")
+	if len(res.Rows) != 1 || res.Rows[0][0] != int64(2) {
+		t.Fatalf("new index value = %+v", res)
+	}
+
+	exec(t, e, "DELETE FROM users WHERE id = 4")
+	res = exec(t, e, "SELECT id FROM users WHERE name = 'bob'")
+	if len(res.Rows) != 1 {
+		t.Fatalf("index after delete = %+v", res)
+	}
+
+	if _, err := e.Execute(context.Background(), "CREATE INDEX idx_name ON users (city)"); !errors.Is(err, ErrIndexExists) {
+		t.Fatalf("duplicate index = %v", err)
+	}
+	if _, err := e.Execute(context.Background(), "CREATE INDEX idx_pk ON users (id)"); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("index on PK = %v", err)
+	}
+
+	exec(t, e, "DROP INDEX idx_name ON users")
+	if _, err := e.Execute(context.Background(), "SELECT id FROM users WHERE name = 'bob'"); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("select after drop index = %v", err)
+	}
+}
