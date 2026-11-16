@@ -16,7 +16,7 @@
 | SQL-таблица, `INSERT/SELECT` | v2: `sqlsrv` HTTP | [SQL HTTP](#6-sql-через-http) |
 | `psql` / PostgreSQL-клиент | v2: `pgsrv` pgwire | [psql](#7-psql-pgwire) |
 | Сырой KV v2 из терминала | `kvctl` | [kvctl](#8-kvctl-терминальный-клиент) |
-| Сырой KV v2 из Go | `internal/v2client` | [Go SDK](#8-сырой-kv-v2-из-go) |
+| Сырой KV v2 из Go | `internal/v2client` | [Go SDK](#8a-сырой-kv-v2-из-go-advanced) |
 | Бэкап/восстановление | `cmd/kvbackup` | [backup](#9-backup-и-restore) |
 | Проверка огромного набора хешей | `cmd/edgehash` | [edgehash](#10-edgehash) |
 
@@ -410,7 +410,7 @@ echo -n "hello" | ./bin/kvctl put greeting -
 ./bin/kvctl scan -prefix user:
 
 # диапазон [start, end), лимит
-./bin/kvctl scan -start user: -end user; -limit 100
+./bin/kvctl scan -start user: -end "user;" -limit 100
 
 # JSON для скриптов
 ./bin/kvctl -format json scan -prefix user:
