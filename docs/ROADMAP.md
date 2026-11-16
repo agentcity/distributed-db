@@ -210,7 +210,8 @@ Multi-Raft host внутри одного процесса, переезд meta/
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
-Осталось: клиентские методы, фоновый GC locks, stress/Jepsen.
+Клиентские методы CheckTxnStatus/ResolveLock добавлены. Осталось: фоновый
+GC locks, stress/Jepsen.
 
 В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV,
 HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
