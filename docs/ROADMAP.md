@@ -206,8 +206,10 @@ range identity в Status, клиентский routing по range ID и e2e
 2 диапазона × 3 реплики с failover. M2.1/0011: meta Raft 3 узла,
 replicated TSO, `Leader`, клиентский redirect и failover.
 
-Осталось в M2/0007: split/merge с реальным переносом данных и Raft-групп,
-Multi-Raft host внутри одного процесса; meta/TSO уже реплицированы.
+В M2.2/0012 сделан RangeHost (N Raft-групп в процессе, range_id RPC) и
+host-local split/merge с переносом MVCC-записей. Осталось: распределённый
+split на всех репликах с epoch/fencing, persist range map RangeHost,
+переезд meta/TSO — meta уже реплицирована.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.

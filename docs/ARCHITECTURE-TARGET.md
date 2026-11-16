@@ -246,9 +246,9 @@ pgwire → parse → bind catalog → logical plan → optimize
 ### M2
 
 - [x] Meta Raft 3 узла; `AllocTS` монотонен после failover.
-- [ ] `RangeHost` держит 2+ группы в одном процессе; gRPC `range_id`.
-- [ ] Split: freeze → copy → new group → commit map; e2e чтение обеих половин.
-- [ ] Merge: freeze right → copy → drop group; e2e.
+- [x] `RangeHost` держит 2+ группы в одном процессе; gRPC `range_id`.
+- [x] Split: freeze → copy → new group → commit map; e2e чтение обеих половин (host-local MVP).
+- [x] Merge: freeze right → copy → drop group; e2e (host-local MVP).
 - [ ] Kill лидера meta и range во время split/merge; повтор идемпотентен.
 - [ ] Клиентский watch/refresh карты; stale epoch отвергается.
 

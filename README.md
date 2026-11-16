@@ -78,7 +78,14 @@ go test -race ./test -run TestV2SingleRangeCluster -v
 
 Есть 2 диапазона × 3 реплики: meta отдаёт `GetRange/ListRanges`, клиент
 маршрутизирует ключ по range ID и обновляет лидера при failover. Meta/TSO
-теперь можно запустить как Raft-кластер из 3 узлов (`-mode=meta` + peers). Транзакции
+теперь можно запустить как Raft-кластер из 3 узлов (`-mode=meta` + peers).
+`kvserver.Config.Ranges` host-ит несколько Raft-групп в одном процессе; для
+одного host доступны `SplitRange`/`MergeRanges` с реальным переносом MVCC-
+записей (`TestV2RangeHostSplitMerge`).
+
+Ограничение M2.3 MVP: split/merge выполняются на одном RangeHost; их нужно
+оркестрировать на всех репликах и обновлять meta после переноса. Это
+следующий шаг, а не production-сценарий. Транзакции
 поддерживают `CheckTxnStatus/ResolveLock`, а `Get` сам разрешает
 committed/rolled-back/expired locks.
 
