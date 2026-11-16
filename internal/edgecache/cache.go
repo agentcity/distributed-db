@@ -61,6 +61,7 @@ const (
 	cacheCurrentFile        = "CURRENT"
 	cacheGenerationPrefix   = "gen-"
 	cacheStagingPrefix      = ".staging-"
+	cacheLegacyStaging      = ".sync-"
 
 	defaultHTTPTimeout = 15 * time.Second
 
@@ -480,6 +481,10 @@ func (c *Cache) Sync(ctx context.Context) error {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// The signed source manifest is always retained. The materialized manifest
 	// is the server's exact bytes when every segment is selected; a filtered
 	// generation cannot keep the signature, so it is cross-checked against the
@@ -768,6 +773,7 @@ func (c *Cache) Contains(ctx context.Context, h edgeset.Hash) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	c.maybeEvictExpired()
 
 	// Hold the read lock while local segments are consulted so a concurrent
 	// Sync or eviction cannot replace the files underneath an old manifest.
@@ -821,6 +827,31 @@ func (c *Cache) Contains(ctx context.Context, h edgeset.Hash) (bool, error) {
 		return false, err
 	}
 	return result.Present, nil
+}
+
+// maybeEvictExpired applies TTL lazily so a lookup does not keep answering from
+// an expired segment when no background loop or explicit Evict ran.
+func (c *Cache) maybeEvictExpired() {
+	if c.segmentTTL <= 0 {
+		return
+	}
+	now := time.Now()
+	c.mu.RLock()
+	expired := false
+	for _, entry := range c.usage {
+		last := entry.lastUsed
+		if last.IsZero() {
+			last = entry.added
+		}
+		if !last.IsZero() && now.Sub(last) > c.segmentTTL {
+			expired = true
+			break
+		}
+	}
+	c.mu.RUnlock()
+	if expired {
+		_ = c.Evict()
+	}
 }
 
 func (c *Cache) touch(prefix uint16) {
@@ -1004,7 +1035,7 @@ func (c *Cache) cleanupStaleStaging() {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() && strings.HasPrefix(name, cacheStagingPrefix) {
+		if entry.IsDir() && isStagingDirName(name) {
 			_ = os.RemoveAll(filepath.Join(c.dir, name))
 			continue
 		}
@@ -1029,8 +1060,12 @@ func (c *Cache) pruneGenerationsLocked(active string) {
 			continue
 		}
 		if !keptPrevious {
-			keptPrevious = true
-			continue
+			// Retain the newest non-active generation that still verifies as
+			// the startup fallback; discard corrupt or older ones.
+			if _, _, err := loadGeneration(filepath.Join(c.dir, generation), c.verifier); err == nil {
+				keptPrevious = true
+				continue
+			}
 		}
 		_ = os.RemoveAll(filepath.Join(c.dir, generation))
 	}
@@ -1077,6 +1112,10 @@ func writeCurrentPointer(dir, name string) error {
 		return err
 	}
 	return syncDir(dir)
+}
+
+func isStagingDirName(name string) bool {
+	return strings.HasPrefix(name, cacheStagingPrefix) || strings.HasPrefix(name, cacheLegacyStaging)
 }
 
 func listGenerations(dir string) ([]string, error) {
@@ -1184,7 +1223,7 @@ func syncDir(path string) error {
 	}
 	defer dir.Close()
 	if err := dir.Sync(); err != nil {
-		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, os.ErrInvalid) {
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, os.ErrInvalid) {
 			return nil
 		}
 		return err

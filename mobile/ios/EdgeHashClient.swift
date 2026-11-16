@@ -2,9 +2,10 @@
 //  EdgeHashClient.swift
 //  EdgeHash mobile SDK - iOS/Swift scaffold.
 //
-//  STATUS: SCAFFOLD, NOT A SHIPPED SDK. This file has not been built into an
-//  iOS application in this repository and has not been exercised on a device.
-//  See mobile/TESTING.md for the tests required before production use.
+//  STATUS: SCAFFOLD, NOT A SHIPPED SDK. This file has not been built/linked as
+//  an iOS application and has not run on a device. It was typechecked against
+//  the iOS 16 simulator SDK and a reference-vector harness was run on macOS;
+//  see mobile/TESTING.md. That is not device validation.
 //
 //  Design constraints:
 //   - Foundation + CryptoKit + URLSession only; no third-party dependencies.

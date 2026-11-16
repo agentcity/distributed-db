@@ -83,7 +83,7 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `usage:
   edgehash build  -in FILE -out DIR [-prefix-bytes 2] [-fp 0.01] [-key HEX] [-ed25519-key FILE] [-compression auto|none|zstd]
   edgehash serve  -dir DIR [-addr :8080] [-key HEX] [-verify-ed25519 PUBKEY] [-tls-cert FILE] [-tls-key FILE] [-auth-token TOKEN] [-rate-limit N] [-rate-burst N]
-  edgehash lookup -server URL -hash HEX [-key HEX] [-verify-ed25519 PUBKEY] [-timeout D]
+  edgehash lookup -server URL -hash HEX [-key HEX] [-verify-ed25519 PUBKEY] [-auth-token TOKEN] [-timeout D]
   edgehash sync   -server URL -dir CACHE [-key HEX] [-verify-ed25519 PUBKEY] [-prefix P1,P2] [-max-bytes N] [-max-segments N] [-ttl D] [-timeout D]
 
 build reads one 64-character hexadecimal SHA-256 per line; blank lines and
@@ -294,6 +294,7 @@ func runLookup(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	hashHex := fs.String("hash", "", "hash to look up (64 hex characters)")
 	keyHex := fs.String("key", "", "manifest HMAC-SHA256 key as hex")
 	ed25519KeyFile := fs.String("verify-ed25519", "", "Ed25519 public key file (PEM SPKI, certificate or raw 32 bytes)")
+	authToken := fs.String("auth-token", "", "Bearer token for the edge server")
 	timeout := fs.Duration("timeout", defaultLookupTimeout, "HTTP timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -317,8 +318,9 @@ func runLookup(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 	result, err := edgecache.RemoteLookup(ctx, *serverURL, nil, h, edgecache.Options{
-		Timeout:  *timeout,
-		Verifier: verifier,
+		Timeout:   *timeout,
+		Verifier:  verifier,
+		AuthToken: *authToken,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "edgehash lookup: %v\n", err)
@@ -331,7 +333,7 @@ func runLookup(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	fmt.Fprintln(stdout, "present: false")
 	if result.AbsenceProof != nil {
-		fmt.Fprintf(stdout, "absence_proof: verified\nprefix: %04x\nroot: %s\n",
+		fmt.Fprintf(stdout, "absence_proof: verified (absence proof)\nprefix: %04x\nroot: %s\n",
 			result.Prefix, result.Root)
 	}
 	return 0
@@ -506,6 +508,12 @@ func loadEd25519PrivateKey(path string) (ed25519.PrivateKey, error) {
 		default:
 			key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 			if err != nil {
+				if len(block.Bytes) == ed25519.PrivateKeySize {
+					return append(ed25519.PrivateKey(nil), block.Bytes...), nil
+				}
+				if len(block.Bytes) == ed25519.SeedSize {
+					return ed25519.NewKeyFromSeed(block.Bytes), nil
+				}
 				return nil, fmt.Errorf("parse Ed25519 PKCS#8 private key: %w", err)
 			}
 			return asEd25519PrivateKey(key)
@@ -535,6 +543,11 @@ func decodeEd25519PrivateBytes(raw []byte) (ed25519.PrivateKey, error) {
 	}
 	if len(trimmed) == ed25519.SeedSize {
 		return ed25519.NewKeyFromSeed(trimmed), nil
+	}
+	if spaced := bytes.TrimSpace(raw); len(spaced) == ed25519.PrivateKeySize {
+		return append(ed25519.PrivateKey(nil), spaced...), nil
+	} else if len(spaced) == ed25519.SeedSize {
+		return ed25519.NewKeyFromSeed(spaced), nil
 	}
 	text := strings.TrimSpace(string(raw))
 	if decoded, err := hex.DecodeString(text); err == nil {
@@ -597,6 +610,9 @@ func loadEd25519PublicKey(path string) (ed25519.PublicKey, error) {
 	trimmed := bytes.TrimRight(raw, "\r\n")
 	if len(trimmed) == ed25519.PublicKeySize {
 		return append(ed25519.PublicKey(nil), trimmed...), nil
+	}
+	if spaced := bytes.TrimSpace(raw); len(spaced) == ed25519.PublicKeySize {
+		return append(ed25519.PublicKey(nil), spaced...), nil
 	}
 	if decoded, err := hex.DecodeString(strings.TrimSpace(string(raw))); err == nil && len(decoded) == ed25519.PublicKeySize {
 		return ed25519.PublicKey(decoded), nil

@@ -86,6 +86,9 @@ type Options struct {
 	// TLSCert and TLSKey are aliases for TLSCertFile and TLSKeyFile.
 	TLSCert string
 	TLSKey  string
+	// TLSCertPath and TLSKeyPath are additional aliases.
+	TLSCertPath string
+	TLSKeyPath  string
 
 	// AuthToken, when non-empty, requires "Authorization: Bearer <token>" on
 	// every endpoint except an exempt /healthz. Comparison is constant time.
@@ -97,12 +100,14 @@ type Options struct {
 	RateLimit float64
 
 	// RateBurst is the per-IP token bucket burst. Zero defaults to
-	// ceil(RateLimit), with a minimum of one.
+	// ceil(RateLimit), with a minimum of one. Burst is accepted as an alias.
 	RateBurst int
+	Burst     int
 
 	// RateLimitPerIP is accepted for compatibility and documentation. Limiting
-	// is always performed per remote IP.
+	// is always performed per remote IP. PerIP is an alias.
 	RateLimitPerIP bool
+	PerIP          bool
 
 	// ReadHeaderTimeout bounds request header reads. Zero selects ten seconds.
 	ReadHeaderTimeout time.Duration
@@ -112,12 +117,18 @@ type Options struct {
 	MaxSegmentBytes int64
 
 	// ProtectHealthz makes /healthz require auth and consume rate limit. By
-	// default /healthz is exempt.
-	ProtectHealthz bool
+	// default /healthz is exempt. RequireAuthForHealthz and HealthzAuth are
+	// aliases.
+	ProtectHealthz        bool
+	RequireAuthForHealthz bool
+	HealthzAuth           bool
 
 	// ExemptHealthz explicitly exempts /healthz. It is redundant with the
-	// default but makes the intent visible.
+	// default but makes the intent visible. HealthzExempt and PublicHealthz are
+	// aliases.
 	ExemptHealthz bool
+	HealthzExempt bool
+	PublicHealthz bool
 }
 
 // Server is an http.Handler backed by one immutable edgeset Store.
@@ -207,6 +218,9 @@ func NewServerWithOptions(dir string, opts Options) (*Server, error) {
 		readHeaderTimeout = defaultReadHeaderTimeout
 	}
 	rateBurst := opts.RateBurst
+	if rateBurst <= 0 {
+		rateBurst = opts.Burst
+	}
 	if opts.RateLimit > 0 && rateBurst <= 0 {
 		rateBurst = int(math.Ceil(opts.RateLimit))
 		if rateBurst < 1 {
@@ -229,7 +243,7 @@ func NewServerWithOptions(dir string, opts Options) (*Server, error) {
 		authToken:         opts.AuthToken,
 		rateLimit:         opts.RateLimit,
 		rateBurst:         rateBurst,
-		protectHealth:     opts.ProtectHealthz && !opts.ExemptHealthz,
+		protectHealth:     healthzProtected(opts),
 		limiters:          make(map[string]*ipLimiter),
 	}
 
@@ -247,6 +261,15 @@ func NewServerWithOptions(dir string, opts Options) (*Server, error) {
 	return s, nil
 }
 
+// healthzProtected resolves the exemption aliases. The default is exempt so a
+// liveness probe keeps working when auth/rate limiting is enabled.
+func healthzProtected(opts Options) bool {
+	if opts.ExemptHealthz || opts.HealthzExempt || opts.PublicHealthz {
+		return false
+	}
+	return opts.ProtectHealthz || opts.RequireAuthForHealthz || opts.HealthzAuth
+}
+
 // loadStore loads with signature verification according to verifier. A nil
 // verifier keeps the structural and segment checks but skips signatures.
 func loadStore(dir string, verifier edgeset.Verifier) (*edgeset.Store, *edgeset.Manifest, error) {
@@ -255,8 +278,8 @@ func loadStore(dir string, verifier edgeset.Verifier) (*edgeset.Store, *edgeset.
 
 // resolveTLSPaths merges the public cert/key path aliases.
 func resolveTLSPaths(opts Options) (certFile, keyFile string, err error) {
-	certFile = firstNonEmpty(opts.TLSCertFile, opts.CertFile, opts.TLSCert)
-	keyFile = firstNonEmpty(opts.TLSKeyFile, opts.KeyFile, opts.TLSKey)
+	certFile = firstNonEmpty(opts.TLSCertFile, opts.CertFile, opts.TLSCert, opts.TLSCertPath)
+	keyFile = firstNonEmpty(opts.TLSKeyFile, opts.KeyFile, opts.TLSKey, opts.TLSKeyPath)
 	if (certFile == "") != (keyFile == "") {
 		return "", "", fmt.Errorf("edgehttp: TLS certificate and key paths must be set together")
 	}
@@ -342,9 +365,22 @@ func (s *Server) HTTPHandlerServer() *http.Server {
 	}
 }
 
-// ServeTLS serves TLS on ln. Empty certFile/keyFile use the certificate pair
-// from Options (or Options.TLSConfig). The call blocks until the server stops.
-func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
+// HTTPServer is an alias for HTTPHandlerServer.
+func (s *Server) HTTPServer() *http.Server {
+	return s.HTTPHandlerServer()
+}
+
+// ServeTLS serves TLS on ln. The optional certFile/keyFile arguments use the
+// certificate pair from Options (or Options.TLSConfig) when omitted or empty.
+// The call blocks until the server stops.
+func (s *Server) ServeTLS(ln net.Listener, files ...string) error {
+	certFile, keyFile := "", ""
+	if len(files) > 0 {
+		certFile = files[0]
+	}
+	if len(files) > 1 {
+		keyFile = files[1]
+	}
 	if certFile == "" {
 		certFile = s.tlsCertFile
 	}
@@ -356,18 +392,18 @@ func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
 
 // StartTLS is ServeTLS using the certificate pair from Options. It is useful
 // when TLSConfig already carries certificates.
-func (s *Server) StartTLS(ln net.Listener) error {
-	return s.ServeTLS(ln, "", "")
+func (s *Server) StartTLS(ln net.Listener, files ...string) error {
+	return s.ServeTLS(ln, files...)
 }
 
-// ListenAndServeTLS listens on addr and serves TLS. Empty certFile/keyFile use
-// the Options pair.
-func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
+// ListenAndServeTLS listens on addr and serves TLS. Omitted certFile/keyFile
+// use the Options pair.
+func (s *Server) ListenAndServeTLS(addr string, files ...string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	return s.ServeTLS(ln, certFile, keyFile)
+	return s.ServeTLS(ln, files...)
 }
 
 func cloneManifest(m *edgeset.Manifest) *edgeset.Manifest {

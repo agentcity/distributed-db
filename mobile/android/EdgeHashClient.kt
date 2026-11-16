@@ -3,9 +3,10 @@
 /*
  * EdgeHash mobile SDK - Android/Kotlin scaffold.
  *
- * STATUS: SCAFFOLD, NOT A SHIPPED SDK. This file was written without an Android
- * build in this repository and has not been compiled or exercised on a device.
- * See mobile/TESTING.md for the tests that must exist before production use.
+ * STATUS: SCAFFOLD, NOT A SHIPPED SDK. This file has not been built with the
+ * Android SDK and has not run on a device. A JVM compile against minimal
+ * org.json stubs and a reference-vector harness were run (see
+ * mobile/TESTING.md); that is not Android validation.
  *
  * Design constraints:
  *  - No third-party runtime dependencies: java.net.HttpURLConnection, org.json,

@@ -272,7 +272,15 @@ scaffolding to adapt, not as a build verified in this repository.
 ### Android (Gradle)
 
 1. Create an app/library module with Kotlin and `minSdk 26` (Ed25519 requires
-   API 33+ or a bundled provider).
+   API 33+ or a bundled provider). A scaffold module block looks like:
+   ```kotlin
+   // Scaffold only: adapt to the host project.
+   android {
+       namespace = "dev.edgehash.sample"
+       compileSdk = 34
+       defaultConfig { minSdk = 26 }
+   }
+   ```
 2. Copy [`android/EdgeHashClient.kt`](android/EdgeHashClient.kt) to
    `app/src/main/java/dev/edgehash/mobile/EdgeHashClient.kt` (the package
    declaration is `dev.edgehash.mobile`; rename consistently if desired).
@@ -391,15 +399,16 @@ Client / app integration:
 - No background scheduling, retry/backoff, or connectivity-change listener.
 - No battery/charging observation is built in; the app supplies
   `DeviceConditions`.
-- No tests, fuzzing, benchmarks, or device validation were run here (Swift
-  typecheck only; no Android compile).
+- No committed Android/iOS test target, fuzzing, benchmarks, HTTP integration,
+  or device validation was run here. Only a JVM Kotlin compile against stubs,
+  a Swift typecheck, and temporary reference-vector harnesses were executed.
 
 Before production:
 
 1. Implement the required unit/integration tests in
    [`TESTING.md`](TESTING.md), including cross-language vectors.
-2. Make the server emit and verify Ed25519, and test the exact canonical bytes
-   with the vectors.
+2. Exercise the server's Ed25519 CLI end to end on devices and confirm the
+   exact canonical bytes with the vectors.
 3. Decide zstd support (platform library or server `"none"` policy) and prove
    it with decompression-bomb and size-limit tests.
 4. Add absence-proof request/verification (`?absence=1`) if offline absence

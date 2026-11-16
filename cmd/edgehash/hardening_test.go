@@ -1,15 +1,25 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"distributed-db/internal/edgehttp"
 	"distributed-db/internal/edgeset"
@@ -216,5 +226,122 @@ func TestEd25519FlagConflicts(t *testing.T) {
 	}, cliHashes()[0].String()+"\n")
 	if code != 2 || !strings.Contains(stderr, "mutually exclusive") {
 		t.Fatalf("build conflicting keys = %d, %q", code, stderr)
+	}
+}
+
+func writeTLSCertificate(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "edgehash-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "server.crt")
+	keyPath = filepath.Join(dir, "server.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
+}
+
+func TestServeTLSAndAuthCLI(t *testing.T) {
+	key := []byte("serve-tls-key")
+	storeDir := buildCLIStore(t, cliHashes(), key)
+	certPath, keyPath := writeTLSCertificate(t)
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"serve", "-dir", storeDir, "-addr", addr,
+			"-tls-cert", certPath, "-tls-key", keyPath,
+			"-auth-token", "tok", "-rate-limit", "100", "-rate-burst", "10",
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+	deadline := time.Now().Add(10 * time.Second)
+	var baseURL = "https://" + addr
+	for {
+		resp, err := client.Get(baseURL + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TLS server did not become ready: %v (stderr %s)", err, stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	resp, err := client.Get(baseURL + "/v1/manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("manifest without token status = %d, want 401", resp.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/manifest", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("manifest with token status = %d, want 200", resp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("serve exit = %d, stderr = %s", code, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("TLS serve did not shut down")
+	}
+	if !strings.Contains(stdout.String(), "serving") || !strings.Contains(stdout.String(), "(tls)") ||
+		!strings.Contains(stdout.String(), "shutting down") {
+		t.Fatalf("serve stdout = %q", stdout.String())
 	}
 }
