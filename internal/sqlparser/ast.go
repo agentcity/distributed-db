@@ -28,6 +28,23 @@ type DropTable struct{ Name string }
 
 func (DropTable) isStatement() {}
 
+// CreateIndex creates a non-unique secondary index on one column.
+type CreateIndex struct {
+	Name   string
+	Table  string
+	Column string
+}
+
+func (CreateIndex) isStatement() {}
+
+// DropIndex drops a secondary index.
+type DropIndex struct {
+	Name  string
+	Table string
+}
+
+func (DropIndex) isStatement() {}
+
 // Insert adds one row.
 type Insert struct {
 	Table   string

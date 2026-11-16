@@ -101,9 +101,15 @@ func (p *parser) parseStatement() (Statement, error) {
 	switch strings.ToUpper(t.text) {
 	case "CREATE":
 		p.next()
+		if p.matchKeyword("INDEX") {
+			return p.parseCreateIndex()
+		}
 		return p.parseCreateTable()
 	case "DROP":
 		p.next()
+		if p.matchKeyword("INDEX") {
+			return p.parseDropIndex()
+		}
 		return p.parseDropTable()
 	case "INSERT":
 		p.next()
@@ -186,6 +192,46 @@ func (p *parser) parseCreateTable() (Statement, error) {
 }
 
 // parseDropTable parses DROP TABLE name.
+func (p *parser) parseCreateIndex() (Statement, error) {
+	name, err := p.expectIdent("index name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("ON", " in CREATE INDEX"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdent("table name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKind(tokenLParen, "'('"); err != nil {
+		return nil, err
+	}
+	col, err := p.expectIdent("column name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKind(tokenRParen, "')'"); err != nil {
+		return nil, err
+	}
+	return &CreateIndex{Name: name.text, Table: table.text, Column: col.text}, nil
+}
+
+func (p *parser) parseDropIndex() (Statement, error) {
+	name, err := p.expectIdent("index name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("ON", " in DROP INDEX"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdent("table name")
+	if err != nil {
+		return nil, err
+	}
+	return &DropIndex{Name: name.text, Table: table.text}, nil
+}
+
 func (p *parser) parseDropTable() (Statement, error) {
 	if err := p.expectKeyword("TABLE", " after DROP"); err != nil {
 		return nil, err

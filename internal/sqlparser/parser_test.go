@@ -395,3 +395,25 @@ func TestParseValueAsAny(t *testing.T) {
 		t.Fatalf("text AsAny() = %#v, want %#v", got, want)
 	}
 }
+
+func TestParseIndexStatements(t *testing.T) {
+	stmt, err := Parse("CREATE INDEX idx_name ON users (name)")
+	if err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	ci, ok := stmt.(*CreateIndex)
+	if !ok || ci.Name != "idx_name" || ci.Table != "users" || ci.Column != "name" {
+		t.Fatalf("create index = %#v", stmt)
+	}
+	stmt, err = Parse("DROP INDEX idx_name ON users")
+	if err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	di, ok := stmt.(*DropIndex)
+	if !ok || di.Name != "idx_name" || di.Table != "users" {
+		t.Fatalf("drop index = %#v", stmt)
+	}
+	if _, err := Parse("CREATE INDEX idx ON users"); err == nil {
+		t.Fatal("CREATE INDEX without column accepted")
+	}
+}
