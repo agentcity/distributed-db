@@ -16,8 +16,12 @@ import (
 
 // peerTransport implements raft.Transport over gRPC. M1 has no TLS/mTLS; that
 // is added together with the production transport in M3.
+//
+// One transport is created per range group. rangeID is attached to every Raft
+// RPC so the receiving RangeHost can dispatch it to the right group.
 type peerTransport struct {
-	log *slog.Logger
+	log     *slog.Logger
+	rangeID uint64
 
 	mu      sync.Mutex
 	clients map[string]pbv2.RaftServiceClient
@@ -25,12 +29,13 @@ type peerTransport struct {
 	closed  bool
 }
 
-func newPeerTransport(log *slog.Logger) *peerTransport {
+func newPeerTransport(log *slog.Logger, rangeID uint64) *peerTransport {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &peerTransport{
 		log:     log,
+		rangeID: rangeID,
 		clients: make(map[string]pbv2.RaftServiceClient),
 		conns:   make(map[string]*grpc.ClientConn),
 	}
@@ -71,6 +76,7 @@ func (t *peerTransport) RequestVote(ctx context.Context, peer string, req *raft.
 		CandidateId:  req.CandidateID,
 		LastLogIndex: req.LastLogIndex,
 		LastLogTerm:  req.LastLogTerm,
+		RangeId:      t.rangeID,
 	})
 	if err != nil {
 		return nil, err
@@ -100,6 +106,7 @@ func (t *peerTransport) AppendEntries(ctx context.Context, peer string, req *raf
 		PrevLogTerm:  req.PrevLogTerm,
 		Entries:      entries,
 		LeaderCommit: req.LeaderCommit,
+		RangeId:      t.rangeID,
 	})
 	if err != nil {
 		return nil, err
@@ -125,6 +132,7 @@ func (t *peerTransport) InstallSnapshot(ctx context.Context, peer string, req *r
 			Term:  req.Snapshot.Term,
 			Data:  req.Snapshot.Data,
 		},
+		RangeId: t.rangeID,
 	})
 	if err != nil {
 		return nil, err

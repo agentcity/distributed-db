@@ -7,14 +7,11 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
-	"distributed-db/internal/mvcc"
 	"distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
-	"distributed-db/internal/storage"
 
 	"google.golang.org/grpc"
 )
@@ -24,10 +21,18 @@ type Config struct {
 	ID       string // defaults to RaftAddr
 	RaftAddr string // gRPC listen address for KVService and RaftService
 	DataDir  string
-	Peers    []string // other Raft members (their RaftAddr)
 
-	// Range metadata is descriptive for M2: this process hosts exactly one
-	// range. The client discovers the range through meta and routes by key.
+	// Ranges configures the ranges hosted by this process. Each entry gets its
+	// own Pebble engine, Raft log and state machine under
+	// <DataDir>/db/range-<id> and <DataDir>/raft/range-<id>.
+	//
+	// When Ranges is empty, one range is built from the legacy RangeID,
+	// RangeStart, RangeEnd and Peers fields (RangeID defaults to 1).
+	Ranges []RangeConfig
+
+	// Legacy single-range configuration. These fields remain supported and are
+	// ignored when Ranges is non-empty.
+	Peers      []string // other Raft members (their RaftAddr)
 	RangeID    uint64
 	RangeStart []byte
 	RangeEnd   []byte
@@ -42,18 +47,18 @@ type Config struct {
 	Logger       *slog.Logger
 }
 
-// Server is one v2 KV node: Raft + MVCC + Pebble + gRPC.
+// Server is one v2 KV node: a RangeHost owning one or more independently
+// replicated ranges plus the shared gRPC listener/server.
 type Server struct {
 	cfg Config
 	log *slog.Logger
 
-	engine    storage.Engine
-	store     *mvcc.Store
-	logStore  *raft.FileStore
-	raft      *raft.Node
-	transport *peerTransport
-	grpcSrv   *grpc.Server
-	lis       net.Listener
+	groups    map[uint64]*rangeGroup
+	groupIDs  []uint64 // range order (ascending start key)
+	defaultID uint64
+
+	grpcSrv *grpc.Server
+	lis     net.Listener
 
 	mu       sync.Mutex
 	started  bool
@@ -62,8 +67,8 @@ type Server struct {
 	stopErr  error
 }
 
-// New builds a server and opens its storage and Raft log. Start binds the
-// listener and starts Raft.
+// New builds a server and opens storage and Raft logs for every configured
+// range. Start binds the listener and starts all Raft groups.
 func New(cfg Config) (*Server, error) {
 	if cfg.RaftAddr == "" {
 		return nil, errors.New("kvserver: RaftAddr is required")
@@ -77,9 +82,6 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	if cfg.RangeID == 0 {
-		cfg.RangeID = 1
-	}
 	if cfg.ElectionTimeoutMin <= 0 {
 		cfg.ElectionTimeoutMin = 300 * time.Millisecond
 	}
@@ -89,52 +91,34 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 100 * time.Millisecond
 	}
+	ranges, err := normalizeRanges(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Ranges = ranges
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("kvserver: create data dir: %w", err)
 	}
 
-	engine, err := storage.Open(filepath.Join(cfg.DataDir, "db"), storage.Options{
-		CacheSize:    cfg.CacheSize,
-		MemTableSize: cfg.MemTableSize,
-		Compression:  "snappy",
-		SyncWrites:   true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("kvserver: open storage: %w", err)
-	}
-	logStore, err := raft.NewFileStore(filepath.Join(cfg.DataDir, "raft"))
-	if err != nil {
-		_ = engine.Close()
-		return nil, fmt.Errorf("kvserver: open raft log: %w", err)
-	}
-
-	tr := newPeerTransport(cfg.Logger)
 	s := &Server{
 		cfg:       cfg,
 		log:       cfg.Logger.With("node", cfg.ID),
-		engine:    engine,
-		store:     mvcc.New(engine),
-		logStore:  logStore,
-		transport: tr,
+		groups:    make(map[uint64]*rangeGroup, len(ranges)),
+		groupIDs:  make([]uint64, 0, len(ranges)),
+		defaultID: ranges[0].ID,
 	}
-
-	sm := &stateMachine{store: s.store, engine: engine}
-	rn, err := raft.New(raft.Config{
-		ID:                 cfg.ID,
-		Peers:              append([]string(nil), cfg.Peers...),
-		DataDir:            filepath.Join(cfg.DataDir, "raft"),
-		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
-		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
-		HeartbeatInterval:  cfg.HeartbeatInterval,
-		Logger:             cfg.Logger,
-	}, logStore, sm, tr)
-	if err != nil {
-		_ = logStore.Close()
-		_ = engine.Close()
-		tr.Close()
-		return nil, fmt.Errorf("kvserver: create raft: %w", err)
+	for _, rc := range ranges {
+		g, err := newRangeGroup(cfg, rc)
+		if err != nil {
+			var errs []error
+			for _, id := range s.groupIDs {
+				errs = append(errs, s.groups[id].stop())
+			}
+			return nil, errors.Join(append([]error{err}, errs...)...)
+		}
+		s.groups[rc.ID] = g
+		s.groupIDs = append(s.groupIDs, rc.ID)
 	}
-	s.raft = rn
 
 	s.grpcSrv = grpc.NewServer(
 		grpc.MaxRecvMsgSize(16<<20),
@@ -145,7 +129,7 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// Start binds the listener, serves gRPC and starts Raft.
+// Start binds the listener once, serves gRPC and then starts every Raft group.
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	if s.stopped {
@@ -165,23 +149,29 @@ func (s *Server) Start(ctx context.Context) error {
 	s.started = true
 	s.mu.Unlock()
 
+	// Serve before starting Raft: groups may send RPCs to peers immediately
+	// after their election timers fire.
 	go func() {
-		if err := s.grpcSrv.Serve(lis); err != nil {
+		if err := s.grpcSrv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			s.log.Error("grpc server stopped", "error", err)
 		}
 	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := s.raft.Start(ctx); err != nil {
-		_ = s.Stop(context.Background())
-		return fmt.Errorf("kvserver: start raft: %w", err)
+	for _, id := range s.groupIDs {
+		if err := s.groups[id].start(ctx); err != nil {
+			_ = s.Stop(context.Background())
+			return err
+		}
 	}
-	s.log.Info("kvserver started", "raft_addr", lis.Addr().String(), "peers", s.cfg.Peers)
+	s.log.Info("kvserver started",
+		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID)
 	return nil
 }
 
-// Stop stops Raft, gRPC, the log store and Pebble. It is idempotent.
+// Stop stops all Raft groups, gRPC, the log stores and Pebble engines. It is
+// idempotent.
 func (s *Server) Stop(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		s.stopErr = s.stop(ctx)
@@ -220,22 +210,12 @@ func (s *Server) stop(ctx context.Context) error {
 	if lis != nil {
 		_ = lis.Close()
 	}
-	if s.raft != nil {
-		s.raft.Stop()
-	}
+
 	var errs []error
-	if s.logStore != nil {
-		if err := s.logStore.Close(); err != nil {
+	for _, id := range s.groupIDs {
+		if err := s.groups[id].stop(); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if s.engine != nil {
-		if err := s.engine.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.transport != nil {
-		s.transport.Close()
 	}
 	s.log.Info("kvserver stopped")
 	return errors.Join(errs...)
@@ -251,9 +231,22 @@ func (s *Server) Addr() string {
 	return s.cfg.RaftAddr
 }
 
-// Raft exposes the Raft node for status/tests.
-func (s *Server) Raft() *raft.Node { return s.raft }
+// Raft exposes the default group's Raft node for status/tests.
+func (s *Server) Raft() *raft.Node {
+	g := s.defaultGroup()
+	if g == nil {
+		return nil
+	}
+	return g.node
+}
 
-// Snapshot takes a state-machine snapshot and compacts the local log. It is
-// used by tests and by an operator-triggered maintenance path.
-func (s *Server) Snapshot() (raft.Snapshot, error) { return s.raft.Snapshot() }
+// Snapshot takes a state-machine snapshot of the default range and compacts
+// its local log. It is used by tests and by an operator-triggered maintenance
+// path.
+func (s *Server) Snapshot() (raft.Snapshot, error) {
+	g := s.defaultGroup()
+	if g == nil {
+		return raft.Snapshot{}, fmt.Errorf("%w: no default range", ErrRangeNotFound)
+	}
+	return g.node.Snapshot()
+}

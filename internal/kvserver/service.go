@@ -159,23 +159,27 @@ type kvService struct {
 }
 
 func (k *kvService) Get(ctx context.Context, req *pbv2.GetRequest) (*pbv2.GetResponse, error) {
-	leader := k.s.raft.Leader()
-	if err := k.s.raft.ReadBarrier(ctx); err != nil {
+	g, err := k.s.groupForKey(req.GetKey())
+	if err != nil {
+		return &pbv2.GetResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	leader := g.node.Leader()
+	if err := g.node.ReadBarrier(ctx); err != nil {
 		return &pbv2.GetResponse{Leader: leader, Error: opError(err)}, nil
 	}
-	value, err := k.s.store.Get(req.GetKey(), req.GetTs())
+	value, err := g.store.Get(req.GetKey(), req.GetTs())
 	if errors.Is(err, mvcc.ErrLocked) {
 		// Resolve a lock left by a committed/rolled-back/expired transaction,
 		// then retry the read. A live lock is reported to the caller.
-		st, serr := k.s.store.CheckTxnStatus(req.GetKey(), 0, time.Now())
+		st, serr := g.store.CheckTxnStatus(req.GetKey(), 0, time.Now())
 		if serr != nil {
 			return &pbv2.GetResponse{Leader: leader, Error: opError(serr)}, nil
 		}
 		if st.Committed || st.RolledBack {
-			if rerr := k.s.resolveLock(ctx, st, req.GetKey()); rerr != nil {
+			if rerr := g.resolveLock(ctx, st, req.GetKey()); rerr != nil {
 				return &pbv2.GetResponse{Leader: leader, Error: opError(rerr)}, nil
 			}
-			value, err = k.s.store.Get(req.GetKey(), req.GetTs())
+			value, err = g.store.Get(req.GetKey(), req.GetTs())
 		}
 	}
 	if errors.Is(err, mvcc.ErrKeyNotFound) {
@@ -188,11 +192,20 @@ func (k *kvService) Get(ctx context.Context, req *pbv2.GetRequest) (*pbv2.GetRes
 }
 
 func (k *kvService) Scan(ctx context.Context, req *pbv2.ScanRequest) (*pbv2.ScanResponse, error) {
-	leader := k.s.raft.Leader()
-	if err := k.s.raft.ReadBarrier(ctx); err != nil {
+	g, err := k.s.groupForKey(req.GetStart())
+	if err != nil {
+		return &pbv2.ScanResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if !g.containsRange(req.GetStart(), req.GetEnd()) {
+		err := fmt.Errorf("%w: scan [%q,%q) crosses range %d [%q,%q)",
+			ErrRangeMismatch, req.GetStart(), req.GetEnd(), g.cfg.ID, g.cfg.Start, g.cfg.End)
+		return &pbv2.ScanResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
+	leader := g.node.Leader()
+	if err := g.node.ReadBarrier(ctx); err != nil {
 		return &pbv2.ScanResponse{Leader: leader, Error: opError(err)}, nil
 	}
-	rows, err := k.s.store.Scan(req.GetStart(), req.GetEnd(), req.GetTs(), int(req.GetLimit()))
+	rows, err := g.store.Scan(req.GetStart(), req.GetEnd(), req.GetTs(), int(req.GetLimit()))
 	if err != nil {
 		return &pbv2.ScanResponse{Leader: leader, Error: opError(err)}, nil
 	}
@@ -205,18 +218,31 @@ func (k *kvService) Scan(ctx context.Context, req *pbv2.ScanRequest) (*pbv2.Scan
 
 func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*pbv2.PrewriteResponse, error) {
 	if len(req.GetMutations()) == 0 {
-		return &pbv2.PrewriteResponse{Leader: k.s.raft.Leader(), Error: "empty mutations"}, nil
+		return &pbv2.PrewriteResponse{Leader: k.s.defaultLeader(), Error: "empty mutations"}, nil
 	}
 	mutations := make([]mvcc.Mutation, 0, len(req.GetMutations()))
+	keys := make([][]byte, 0, len(req.GetMutations()))
 	for _, m := range req.GetMutations() {
 		if m == nil {
-			return &pbv2.PrewriteResponse{Leader: k.s.raft.Leader(), Error: "nil mutation"}, nil
+			return &pbv2.PrewriteResponse{Leader: k.s.defaultLeader(), Error: "nil mutation"}, nil
 		}
 		mutations = append(mutations, mvcc.Mutation{
 			Key:    m.GetKey(),
 			Value:  m.GetValue(),
 			Delete: m.GetDelete(),
 		})
+		keys = append(keys, m.GetKey())
+	}
+	g, err := k.s.groupForKeys(keys)
+	if err != nil {
+		return &pbv2.PrewriteResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if g.frozen.Load() {
+		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	}
+	if len(req.GetPrimary()) > 0 && !g.containsKey(req.GetPrimary()) {
+		err := fmt.Errorf("%w: primary %q is outside range %d", ErrRangeMismatch, req.GetPrimary(), g.cfg.ID)
+		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS:   req.GetStartTs(),
@@ -224,49 +250,67 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 		Mutations: mutations,
 	})
 	if err != nil {
-		return &pbv2.PrewriteResponse{Leader: k.s.raft.Leader(), Error: "encode"}, nil
+		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: "encode"}, nil
 	}
-	if _, err := k.s.raft.Propose(ctx, model.Entry{Type: model.CommandPrewrite, Value: payload}); err != nil {
-		return &pbv2.PrewriteResponse{Leader: k.s.raft.Leader(), Error: opError(err)}, nil
+	if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandPrewrite, Value: payload}); err != nil {
+		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	return &pbv2.PrewriteResponse{Success: true, Leader: k.s.raft.Leader()}, nil
+	return &pbv2.PrewriteResponse{Success: true, Leader: g.node.Leader()}, nil
 }
 
 func (k *kvService) Commit(ctx context.Context, req *pbv2.CommitRequest) (*pbv2.CommitResponse, error) {
+	g, err := k.s.groupForKeys(req.GetKeys())
+	if err != nil {
+		return &pbv2.CommitResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if g.frozen.Load() {
+		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS:  req.GetStartTs(),
 		CommitTS: req.GetCommitTs(),
 		Keys:     req.GetKeys(),
 	})
 	if err != nil {
-		return &pbv2.CommitResponse{Leader: k.s.raft.Leader(), Error: "encode"}, nil
+		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: "encode"}, nil
 	}
-	if _, err := k.s.raft.Propose(ctx, model.Entry{Type: model.CommandCommit, Value: payload}); err != nil {
-		return &pbv2.CommitResponse{Leader: k.s.raft.Leader(), Error: opError(err)}, nil
+	if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandCommit, Value: payload}); err != nil {
+		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	return &pbv2.CommitResponse{Success: true, Leader: k.s.raft.Leader()}, nil
+	return &pbv2.CommitResponse{Success: true, Leader: g.node.Leader()}, nil
 }
 
 func (k *kvService) Rollback(ctx context.Context, req *pbv2.RollbackRequest) (*pbv2.RollbackResponse, error) {
+	g, err := k.s.groupForKeys(req.GetKeys())
+	if err != nil {
+		return &pbv2.RollbackResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if g.frozen.Load() {
+		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS: req.GetStartTs(),
 		Keys:    req.GetKeys(),
 	})
 	if err != nil {
-		return &pbv2.RollbackResponse{Leader: k.s.raft.Leader(), Error: "encode"}, nil
+		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: "encode"}, nil
 	}
-	if _, err := k.s.raft.Propose(ctx, model.Entry{Type: model.CommandRollback, Value: payload}); err != nil {
-		return &pbv2.RollbackResponse{Leader: k.s.raft.Leader(), Error: opError(err)}, nil
+	if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandRollback, Value: payload}); err != nil {
+		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	return &pbv2.RollbackResponse{Success: true, Leader: k.s.raft.Leader()}, nil
+	return &pbv2.RollbackResponse{Success: true, Leader: g.node.Leader()}, nil
 }
 
 func (k *kvService) CheckTxnStatus(ctx context.Context, req *pbv2.CheckTxnStatusRequest) (*pbv2.CheckTxnStatusResponse, error) {
-	leader := k.s.raft.Leader()
-	if err := k.s.raft.ReadBarrier(ctx); err != nil {
+	g, err := k.s.groupForKey(req.GetKey())
+	if err != nil {
+		return &pbv2.CheckTxnStatusResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	leader := g.node.Leader()
+	if err := g.node.ReadBarrier(ctx); err != nil {
 		return &pbv2.CheckTxnStatusResponse{Leader: leader, Error: opError(err)}, nil
 	}
-	st, err := k.s.store.CheckTxnStatus(req.GetKey(), req.GetStartTs(), time.Now())
+	st, err := g.store.CheckTxnStatus(req.GetKey(), req.GetStartTs(), time.Now())
 	if err != nil {
 		return &pbv2.CheckTxnStatusResponse{Leader: leader, Error: opError(err)}, nil
 	}
@@ -283,25 +327,35 @@ func (k *kvService) CheckTxnStatus(ctx context.Context, req *pbv2.CheckTxnStatus
 
 func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockRequest) (*pbv2.ResolveLockResponse, error) {
 	if len(req.GetKeys()) == 0 {
-		return &pbv2.ResolveLockResponse{Leader: k.s.raft.Leader(), Error: "empty keys"}, nil
+		return &pbv2.ResolveLockResponse{Leader: k.s.defaultLeader(), Error: "empty keys"}, nil
+	}
+	g, err := k.s.groupForKeys(req.GetKeys())
+	if err != nil {
+		return &pbv2.ResolveLockResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if g.frozen.Load() {
+		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS: req.GetStartTs(), CommitTS: req.GetCommitTs(), Keys: req.GetKeys(),
 	})
 	if err != nil {
-		return &pbv2.ResolveLockResponse{Leader: k.s.raft.Leader(), Error: "encode"}, nil
+		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: "encode"}, nil
 	}
 	typ := model.CommandRollback
 	if req.GetCommitTs() > 0 {
 		typ = model.CommandCommit
 	}
-	if _, err := k.s.raft.Propose(ctx, model.Entry{Type: typ, Value: payload}); err != nil {
-		return &pbv2.ResolveLockResponse{Leader: k.s.raft.Leader(), Error: opError(err)}, nil
+	if _, err := g.node.Propose(ctx, model.Entry{Type: typ, Value: payload}); err != nil {
+		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	return &pbv2.ResolveLockResponse{Success: true, Leader: k.s.raft.Leader()}, nil
+	return &pbv2.ResolveLockResponse{Success: true, Leader: g.node.Leader()}, nil
 }
 
-func (s *Server) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbackKey []byte) error {
+func (g *rangeGroup) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbackKey []byte) error {
+	if g.frozen.Load() {
+		return ErrRangeFrozen
+	}
 	keys := st.Keys
 	if len(keys) == 0 {
 		keys = [][]byte{fallbackKey}
@@ -314,12 +368,16 @@ func (s *Server) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbackKey
 	if st.Committed {
 		typ = model.CommandCommit
 	}
-	_, err = s.raft.Propose(ctx, model.Entry{Type: typ, Value: payload})
+	_, err = g.node.Propose(ctx, model.Entry{Type: typ, Value: payload})
 	return err
 }
 
-func (k *kvService) Status(_ context.Context, _ *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {
-	st := k.s.raft.Status()
+func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {
+	g, err := k.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
+	st := g.node.Status()
 	return &pbv2.StatusResponse{
 		Id:          st.ID,
 		Role:        string(st.Role),
@@ -327,9 +385,9 @@ func (k *kvService) Status(_ context.Context, _ *pbv2.StatusRequest) (*pbv2.Stat
 		Leader:      st.Leader,
 		CommitIndex: st.CommitIndex,
 		LastApplied: st.LastApplied,
-		RangeId:     k.s.cfg.RangeID,
-		RangeStart:  k.s.cfg.RangeStart,
-		RangeEnd:    k.s.cfg.RangeEnd,
+		RangeId:     g.cfg.ID,
+		RangeStart:  cloneBytes(g.cfg.Start),
+		RangeEnd:    cloneBytes(g.cfg.End),
 	}, nil
 }
 
@@ -342,7 +400,11 @@ func (r *raftService) RequestVote(ctx context.Context, req *pbv2.RequestVoteRequ
 	if req == nil {
 		return nil, errors.New("kvserver: nil RequestVote")
 	}
-	resp, err := r.s.raft.HandleRequestVote(ctx, &raft.RequestVoteRequest{
+	g, err := r.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.node.HandleRequestVote(ctx, &raft.RequestVoteRequest{
 		Term:         req.GetTerm(),
 		CandidateID:  req.GetCandidateId(),
 		LastLogIndex: req.GetLastLogIndex(),
@@ -358,6 +420,10 @@ func (r *raftService) AppendEntries(ctx context.Context, req *pbv2.AppendEntries
 	if req == nil {
 		return nil, errors.New("kvserver: nil AppendEntries")
 	}
+	g, err := r.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
 	entries := make([]model.Entry, 0, len(req.GetEntries()))
 	for _, e := range req.GetEntries() {
 		if e == nil {
@@ -371,7 +437,7 @@ func (r *raftService) AppendEntries(ctx context.Context, req *pbv2.AppendEntries
 			Value: e.GetValue(),
 		})
 	}
-	resp, err := r.s.raft.HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
+	resp, err := g.node.HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
 		Term:         req.GetTerm(),
 		LeaderID:     req.GetLeaderId(),
 		PrevLogIndex: req.GetPrevLogIndex(),
@@ -394,7 +460,11 @@ func (r *raftService) InstallSnapshot(ctx context.Context, req *pbv2.InstallSnap
 	if req == nil || req.GetSnapshot() == nil {
 		return nil, errors.New("kvserver: nil InstallSnapshot")
 	}
-	resp, err := r.s.raft.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+	g, err := r.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.node.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
 		Term:     req.GetTerm(),
 		LeaderID: req.GetLeaderId(),
 		Snapshot: raft.Snapshot{
@@ -427,6 +497,12 @@ func opError(err error) string {
 		return "write conflict"
 	case errors.Is(err, mvcc.ErrAlreadyCommitted):
 		return "already committed"
+	case errors.Is(err, ErrRangeNotFound):
+		return "not hosted"
+	case errors.Is(err, ErrRangeMismatch):
+		return "range mismatch"
+	case errors.Is(err, ErrRangeFrozen):
+		return "range frozen"
 	case errors.Is(err, context.Canceled):
 		return "canceled"
 	case errors.Is(err, context.DeadlineExceeded):
