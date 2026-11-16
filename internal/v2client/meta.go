@@ -3,6 +3,7 @@ package v2client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc"
@@ -11,6 +12,20 @@ import (
 	pbv2 "distributed-db/internal/pb/v2"
 )
 
+// RangeInfo is one meta range descriptor. Start is inclusive and End is
+// exclusive; a nil boundary means the range is unbounded on that side.
+//
+// RangeInfo is intentionally a plain value type so administrative callers do
+// not depend on the generated protobuf types.
+type RangeInfo struct {
+	ID       uint64
+	Start    []byte
+	End      []byte
+	Replicas []string
+	Leader   string
+	Version  uint64
+}
+
 // metaAPI is the subset of pbv2.MetaServiceClient used by the client. Keeping
 // it as an interface lets tests inject an in-memory meta service without
 // changing the public API.
@@ -18,6 +33,9 @@ type metaAPI interface {
 	AllocTS(ctx context.Context, in *pbv2.AllocTSRequest, opts ...grpc.CallOption) (*pbv2.AllocTSResponse, error)
 	GetRange(ctx context.Context, in *pbv2.GetRangeRequest, opts ...grpc.CallOption) (*pbv2.RangeInfo, error)
 	Leader(ctx context.Context, in *pbv2.LeaderRequest, opts ...grpc.CallOption) (*pbv2.LeaderResponse, error)
+	ListRanges(ctx context.Context, in *pbv2.ListRangesRequest, opts ...grpc.CallOption) (*pbv2.ListRangesResponse, error)
+	SplitRange(ctx context.Context, in *pbv2.MetaSplitRangeRequest, opts ...grpc.CallOption) (*pbv2.MetaSplitRangeResponse, error)
+	MergeRanges(ctx context.Context, in *pbv2.MetaMergeRangesRequest, opts ...grpc.CallOption) (*pbv2.MetaMergeRangesResponse, error)
 }
 
 type metaEntry struct {
@@ -248,4 +266,139 @@ func (c *Client) invalidateMetaLeader() {
 	}
 	c.metaMu.Unlock()
 	c.clearRangeCache()
+}
+
+// metaServerError reports a request that reached the meta service but was
+// rejected with success=false. It is not retried on another connection.
+type metaServerError struct{ msg string }
+
+func (e *metaServerError) Error() string { return e.msg }
+
+func newMetaServerError(fallback, msg string) error {
+	if msg != "" {
+		return &metaServerError{msg: msg}
+	}
+	return &metaServerError{msg: fallback}
+}
+
+// metaCall runs op against the current meta leader. If the call fails with a
+// transport error (for example a stale leader hint after failover), it asks
+// for a fresh leader view and retries once. Server-side rejections are
+// returned unchanged. Every operation routed through metaCall is idempotent.
+func (c *Client) metaCall(ctx context.Context, op func(metaAPI) error) error {
+	mc, err := c.metaClient(ctx)
+	if err == nil {
+		err = op(mc)
+	}
+	if err == nil {
+		return nil
+	}
+	var serverErr *metaServerError
+	if errors.As(err, &serverErr) || ctx.Err() != nil {
+		return err
+	}
+	fresh, _, freshErr := c.metaClientFresh(ctx)
+	if freshErr != nil {
+		return err
+	}
+	return op(fresh)
+}
+
+// ListRanges returns the current meta range map in the order reported by the
+// meta service. Callers that need a stable order should sort by ID.
+func (c *Client) ListRanges(ctx context.Context) ([]RangeInfo, error) {
+	var out []RangeInfo
+	err := c.metaCall(ctx, func(mc metaAPI) error {
+		resp, err := mc.ListRanges(ctx, &pbv2.ListRangesRequest{})
+		if err != nil {
+			return err
+		}
+		infos := make([]RangeInfo, 0, len(resp.GetRanges()))
+		for _, r := range resp.GetRanges() {
+			if r == nil {
+				return &metaServerError{msg: "v2client: meta returned a nil range descriptor"}
+			}
+			infos = append(infos, RangeInfo{
+				ID:       r.GetId(),
+				Start:    append([]byte(nil), r.GetStart()...),
+				End:      append([]byte(nil), r.GetEnd()...),
+				Replicas: append([]string(nil), r.GetReplicas()...),
+				Leader:   r.GetLeader(),
+				Version:  r.GetVersion(),
+			})
+		}
+		out = infos
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SplitRange asks the meta service to split rangeID at splitKey and returns
+// the ID of the new right-hand range. The meta service allocates the new ID.
+func (c *Client) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte) (uint64, error) {
+	var newRangeID uint64
+	err := c.metaCall(ctx, func(mc metaAPI) error {
+		resp, err := mc.SplitRange(ctx, &pbv2.MetaSplitRangeRequest{
+			RangeId:  rangeID,
+			SplitKey: splitKey,
+		})
+		if err != nil {
+			return err
+		}
+		if !resp.GetSuccess() {
+			return newMetaServerError(
+				fmt.Sprintf("v2client: split range %d failed", rangeID),
+				resp.GetError())
+		}
+		newRangeID = resp.GetNewRangeId()
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return newRangeID, nil
+}
+
+// MergeRanges asks the meta service to merge the adjacent ranges leftID and
+// rightID into leftID.
+func (c *Client) MergeRanges(ctx context.Context, leftID, rightID uint64) error {
+	return c.metaCall(ctx, func(mc metaAPI) error {
+		resp, err := mc.MergeRanges(ctx, &pbv2.MetaMergeRangesRequest{
+			LeftRangeId:  leftID,
+			RightRangeId: rightID,
+		})
+		if err != nil {
+			return err
+		}
+		if !resp.GetSuccess() {
+			return newMetaServerError(
+				fmt.Sprintf("v2client: merge ranges %d and %d failed", leftID, rightID),
+				resp.GetError())
+		}
+		return nil
+	})
+}
+
+// MetaLeader returns the current meta leader address and term as reported by
+// the meta service. A standalone (non-replicated) meta service may report an
+// empty leader.
+func (c *Client) MetaLeader(ctx context.Context) (string, uint64, error) {
+	var leader string
+	var term uint64
+	err := c.metaCall(ctx, func(mc metaAPI) error {
+		resp, err := mc.Leader(ctx, &pbv2.LeaderRequest{})
+		if err != nil {
+			return err
+		}
+		leader = resp.GetLeader()
+		term = resp.GetTerm()
+		return nil
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	return leader, term, nil
 }

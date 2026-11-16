@@ -31,7 +31,15 @@ type fakeMeta struct {
 	getRangeCalls int
 
 	leaderErr   error
+	leaderTerm  uint64
 	leaderCalls int
+
+	listRangesFn  func() ([]*pbv2.RangeInfo, error)
+	listRangesN   int
+	splitRangeFn  func(*pbv2.MetaSplitRangeRequest) (*pbv2.MetaSplitRangeResponse, error)
+	splitRequests []*pbv2.MetaSplitRangeRequest
+	mergeRangesFn func(*pbv2.MetaMergeRangesRequest) (*pbv2.MetaMergeRangesResponse, error)
+	mergeRequests []*pbv2.MetaMergeRangesRequest
 }
 
 var timeZero time.Time
@@ -62,6 +70,39 @@ func (f *fakeMeta) setLeaderErr(err error) {
 	f.mu.Lock()
 	f.leaderErr = err
 	f.mu.Unlock()
+}
+
+func (f *fakeMeta) setLeaderInfo(leader string, term uint64) {
+	f.mu.Lock()
+	f.leader = leader
+	f.leaderTerm = term
+	f.mu.Unlock()
+}
+
+func (f *fakeMeta) setListRanges(fn func() ([]*pbv2.RangeInfo, error)) {
+	f.mu.Lock()
+	f.listRangesFn = fn
+	f.mu.Unlock()
+}
+
+func (f *fakeMeta) setSplitRange(fn func(*pbv2.MetaSplitRangeRequest) (*pbv2.MetaSplitRangeResponse, error)) {
+	f.mu.Lock()
+	f.splitRangeFn = fn
+	f.mu.Unlock()
+}
+
+func (f *fakeMeta) setMergeRanges(fn func(*pbv2.MetaMergeRangesRequest) (*pbv2.MetaMergeRangesResponse, error)) {
+	f.mu.Lock()
+	f.mergeRangesFn = fn
+	f.mu.Unlock()
+}
+
+func (f *fakeMeta) adminStats() (listCalls int, splits []*pbv2.MetaSplitRangeRequest, merges []*pbv2.MetaMergeRangesRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listRangesN,
+		append([]*pbv2.MetaSplitRangeRequest(nil), f.splitRequests...),
+		append([]*pbv2.MetaMergeRangesRequest(nil), f.mergeRequests...)
 }
 
 func (f *fakeMeta) setAllocErr(err error) {
@@ -127,12 +168,49 @@ func (f *fakeMeta) GetRange(_ context.Context, req *pbv2.GetRangeRequest, _ ...g
 func (f *fakeMeta) Leader(context.Context, *pbv2.LeaderRequest, ...grpc.CallOption) (*pbv2.LeaderResponse, error) {
 	f.mu.Lock()
 	f.leaderCalls++
-	leader, err := f.leader, f.leaderErr
+	leader, term, err := f.leader, f.leaderTerm, f.leaderErr
 	f.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return &pbv2.LeaderResponse{Leader: leader}, nil
+	return &pbv2.LeaderResponse{Leader: leader, Term: term}, nil
+}
+
+func (f *fakeMeta) ListRanges(context.Context, *pbv2.ListRangesRequest, ...grpc.CallOption) (*pbv2.ListRangesResponse, error) {
+	f.mu.Lock()
+	f.listRangesN++
+	fn := f.listRangesFn
+	f.mu.Unlock()
+	if fn != nil {
+		ranges, err := fn()
+		if err != nil {
+			return nil, err
+		}
+		return &pbv2.ListRangesResponse{Ranges: ranges}, nil
+	}
+	return &pbv2.ListRangesResponse{}, nil
+}
+
+func (f *fakeMeta) SplitRange(_ context.Context, req *pbv2.MetaSplitRangeRequest, _ ...grpc.CallOption) (*pbv2.MetaSplitRangeResponse, error) {
+	f.mu.Lock()
+	f.splitRequests = append(f.splitRequests, req)
+	fn := f.splitRangeFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(req)
+	}
+	return &pbv2.MetaSplitRangeResponse{Success: true, NewRangeId: req.GetRangeId() + 1}, nil
+}
+
+func (f *fakeMeta) MergeRanges(_ context.Context, req *pbv2.MetaMergeRangesRequest, _ ...grpc.CallOption) (*pbv2.MetaMergeRangesResponse, error) {
+	f.mu.Lock()
+	f.mergeRequests = append(f.mergeRequests, req)
+	fn := f.mergeRangesFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(req)
+	}
+	return &pbv2.MetaMergeRangesResponse{Success: true}, nil
 }
 
 // newTestClient builds a Client wired to an in-memory meta service. The KV

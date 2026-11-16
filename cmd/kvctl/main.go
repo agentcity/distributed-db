@@ -1,6 +1,9 @@
 // Command kvctl is the terminal client for the v2 distributed KV cluster.
 //
 //	kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 get user:1
+//	kvctl -meta 127.0.0.1:9090 ranges
+//	kvctl -meta 127.0.0.1:9090 split 1 m
+//	kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 backup -out ./backup
 //
 // Run `kvctl help` for commands and global flags.
 package main

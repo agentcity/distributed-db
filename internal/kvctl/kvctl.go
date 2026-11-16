@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -38,7 +40,35 @@ type Op struct {
 	Value  []byte
 }
 
-// Backend is the subset of the v2 client used by the CLI.
+// RangeInfo describes one range in the meta range map. Start is inclusive and
+// End is exclusive; nil boundaries mean the range is unbounded on that side.
+type RangeInfo struct {
+	ID       uint64
+	Start    []byte
+	End      []byte
+	Replicas []string
+	Leader   string
+	Version  uint64
+}
+
+// BackupOptions configures one logical backup.
+type BackupOptions struct {
+	OutDir     string
+	ChunkKeys  int
+	ChunkBytes int64
+}
+
+// BackupResult summarizes a completed logical backup.
+type BackupResult struct {
+	OutDir     string
+	SnapshotTS uint64
+	Keys       int64
+	Bytes      int64
+	Ranges     int
+}
+
+// Backend is the subset of the v2 client used by the CLI. The administrative
+// methods only need a meta connection; data methods need KV nodes.
 type Backend interface {
 	Put(ctx context.Context, key, value []byte) error
 	Get(ctx context.Context, key []byte) ([]byte, error)
@@ -47,6 +77,12 @@ type Backend interface {
 	Txn(ctx context.Context, ops []Op) error
 	Ping(ctx context.Context) error
 	Close() error
+
+	ListRanges(ctx context.Context) ([]RangeInfo, error)
+	SplitRange(ctx context.Context, rangeID uint64, splitKey []byte) (uint64, error)
+	MergeRanges(ctx context.Context, leftID, rightID uint64) error
+	MetaLeader(ctx context.Context) (string, uint64, error)
+	Backup(ctx context.Context, opts BackupOptions) (BackupResult, error)
 }
 
 // Config is the resolved global CLI configuration.
@@ -84,18 +120,27 @@ Commands:
   delete <key>              delete one key (alias: del)
   scan [start] [end]        scan a range (flags: -start -end -prefix -limit)
   txn [-file ops.txt]       atomic transaction; stdin: put/delete lines
-  shell                     interactive shell
+  shell                     interactive shell (data commands only)
   ping                      check meta/TSO connectivity
+  ranges                    list meta ranges (meta only)
+  status                    show meta leader, term and range counts (meta only)
+  split <range-id> <key>    split a range at key (meta only)
+  merge <left-id> <right-id>  merge two adjacent ranges (meta only)
+  backup -out DIR           logical backup (flags: -chunk-keys -chunk-bytes)
   version                   print version
   help                      this help
 
 Global flags:
   -meta ADDR                meta/TSO gRPC address (env KVCTL_META; default 127.0.0.1:9090)
   -nodes A,B                KV node gRPC addresses (env KVCTL_NODES; required for data)
-  -timeout D                per-command timeout (default 10s)
+  -timeout D                per-command timeout (default 10s; backup 10m)
   -format table|json|raw    output format (default table)
   -hex                      treat keys/values as hex on input and output
   -quiet                    suppress success messages
+
+  ranges, status, split and merge only need -meta. get, put, delete, scan,
+  txn, shell, ping and backup also require -nodes. Backup defaults to a 10m
+  timeout; raise -timeout for very large data sets.
 
 Examples:
   kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put user:1 alice
@@ -103,6 +148,11 @@ Examples:
   kvctl -nodes ... scan -prefix user: -limit 100 -format json
   printf 'put a 1\nput b 2\ndelete a\n' | kvctl -nodes ... txn
   kvctl -nodes ... -hex put 6b 76   # key "k", value "v"
+  kvctl -format json -meta 127.0.0.1:9090 ranges
+  kvctl -meta 127.0.0.1:9090 status
+  kvctl -meta 127.0.0.1:9090 split 1 m
+  kvctl -meta 127.0.0.1:9090 merge 2 3
+  kvctl -nodes ... backup -out ./backup
 `
 
 func (r *Runner) out() io.Writer {
@@ -146,6 +196,12 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		}
 		return 2
 	}
+	timeoutSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			timeoutSet = true
+		}
+	})
 	rest := fs.Args()
 	if len(rest) == 0 {
 		fmt.Fprint(r.errOut(), usageText)
@@ -172,6 +228,11 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		fmt.Fprintln(r.errOut(), "kvctl: -timeout must be > 0")
 		return 2
 	}
+	if cmd == "backup" && !timeoutSet {
+		// A backup of more than a handful of keys easily exceeds the
+		// interactive default. Keep a bound, but make it generous.
+		cfg.Timeout = 10 * time.Minute
+	}
 	switch cfg.Format {
 	case "table", "json", "raw":
 	default:
@@ -182,7 +243,9 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		fmt.Fprintln(r.errOut(), "kvctl: -meta or KVCTL_META is required")
 		return 2
 	}
-	if len(cfg.Nodes) == 0 {
+	// Administrative range commands talk only to the meta service. Everything
+	// else needs at least one KV node.
+	if !metaOnlyCommand(cmd) && len(cfg.Nodes) == 0 {
 		fmt.Fprintln(r.errOut(), "kvctl: -nodes or KVCTL_NODES is required (comma-separated KV addresses)")
 		return 2
 	}
@@ -278,6 +341,21 @@ func (r *Runner) execute(ctx context.Context, b Backend, cfg Config, cmd string,
 			fmt.Fprintln(r.out(), "pong")
 		}
 		return 0
+
+	case "ranges":
+		return r.executeRanges(ctx, b, cfg, args)
+
+	case "status":
+		return r.executeStatus(ctx, b, cfg, args)
+
+	case "split":
+		return r.executeSplit(ctx, b, cfg, args)
+
+	case "merge":
+		return r.executeMerge(ctx, b, cfg, args)
+
+	case "backup":
+		return r.executeBackup(ctx, b, cfg, args)
 
 	default:
 		return r.usage(fmt.Sprintf("unknown command %q", cmd))
@@ -389,6 +467,246 @@ func (r *Runner) executeTxn(ctx context.Context, b Backend, cfg Config, args []s
 	return 0
 }
 
+type rangeJSON struct {
+	ID       uint64   `json:"id"`
+	Start    string   `json:"start"`
+	End      string   `json:"end"`
+	Leader   string   `json:"leader"`
+	Replicas []string `json:"replicas"`
+	Version  uint64   `json:"version"`
+}
+
+func (r *Runner) executeRanges(ctx context.Context, b Backend, cfg Config, args []string) int {
+	if len(args) != 0 {
+		return r.usage("ranges takes no arguments")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("ranges: -format raw is not supported; use table or json")
+	}
+	infos, err := b.ListRanges(ctx)
+	if err != nil {
+		return r.fail("ranges", err)
+	}
+	sort.SliceStable(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+	if cfg.Format == "json" {
+		out := make([]rangeJSON, 0, len(infos))
+		for _, info := range infos {
+			replicas := info.Replicas
+			if replicas == nil {
+				replicas = []string{}
+			}
+			out = append(out, rangeJSON{
+				ID:       info.ID,
+				Start:    display(info.Start, cfg.Hex),
+				End:      display(info.End, cfg.Hex),
+				Leader:   info.Leader,
+				Replicas: replicas,
+				Version:  info.Version,
+			})
+		}
+		return r.writeJSON(out)
+	}
+	fmt.Fprintln(r.out(), "ID\tSTART\tEND\tLEADER\tREPLICAS\tVERSION")
+	for _, info := range infos {
+		fmt.Fprintf(r.out(), "%d\t%s\t%s\t%s\t%s\t%d\n",
+			info.ID, display(info.Start, cfg.Hex), display(info.End, cfg.Hex),
+			info.Leader, strings.Join(info.Replicas, ","), info.Version)
+	}
+	return 0
+}
+
+type statusJSON struct {
+	MetaLeader string         `json:"meta_leader"`
+	MetaTerm   uint64         `json:"meta_term"`
+	Ranges     int            `json:"ranges"`
+	Leaders    map[string]int `json:"leaders"`
+	Meta       string         `json:"meta"`
+	Nodes      []string       `json:"nodes"`
+}
+
+func (r *Runner) executeStatus(ctx context.Context, b Backend, cfg Config, args []string) int {
+	if len(args) != 0 {
+		return r.usage("status takes no arguments")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("status: -format raw is not supported; use table or json")
+	}
+	leader, term, err := b.MetaLeader(ctx)
+	if err != nil {
+		return r.fail("status", err)
+	}
+	infos, err := b.ListRanges(ctx)
+	if err != nil {
+		return r.fail("status", err)
+	}
+	counts := make(map[string]int)
+	for _, info := range infos {
+		if info.Leader != "" {
+			counts[info.Leader]++
+		}
+	}
+	if cfg.Format == "json" {
+		nodes := append([]string{}, cfg.Nodes...)
+		return r.writeJSON(statusJSON{
+			MetaLeader: leader,
+			MetaTerm:   term,
+			Ranges:     len(infos),
+			Leaders:    counts,
+			Meta:       cfg.Meta,
+			Nodes:      nodes,
+		})
+	}
+	nodes := append([]string{}, cfg.Nodes...)
+	fmt.Fprintln(r.out(), "META_LEADER\tTERM\tRANGES\tMETA\tNODES")
+	fmt.Fprintf(r.out(), "%s\t%d\t%d\t%s\t%s\n",
+		leader, term, len(infos), cfg.Meta, strings.Join(nodes, ","))
+	fmt.Fprintln(r.out(), "LEADER\tRANGES")
+	for _, l := range sortedKeys(counts) {
+		fmt.Fprintf(r.out(), "%s\t%d\n", l, counts[l])
+	}
+	return 0
+}
+
+type splitJSON struct {
+	Status     string `json:"status"`
+	RangeID    uint64 `json:"range_id"`
+	SplitKey   string `json:"split_key"`
+	NewRangeID uint64 `json:"new_range_id"`
+}
+
+func (r *Runner) executeSplit(ctx context.Context, b Backend, cfg Config, args []string) int {
+	if len(args) != 2 {
+		return r.usage("split requires <range-id> <split-key>")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("split: -format raw is not supported; use table or json")
+	}
+	rangeID, err := parseRangeID(args[0])
+	if err != nil {
+		return r.usage(err.Error())
+	}
+	splitKey, err := decodeArg(args[1], cfg.Hex)
+	if err != nil {
+		return r.fail("invalid split key", err)
+	}
+	if len(splitKey) == 0 {
+		return r.usage("split key must not be empty")
+	}
+	newRangeID, err := b.SplitRange(ctx, rangeID, splitKey)
+	if err != nil {
+		return r.fail("split", err)
+	}
+	if cfg.Format == "json" {
+		return r.writeJSON(splitJSON{
+			Status:     "ok",
+			RangeID:    rangeID,
+			SplitKey:   display(splitKey, cfg.Hex),
+			NewRangeID: newRangeID,
+		})
+	}
+	if !cfg.Quiet {
+		fmt.Fprintf(r.out(), "new range id: %d\n", newRangeID)
+	}
+	return 0
+}
+
+type mergeJSON struct {
+	Status       string `json:"status"`
+	LeftRangeID  uint64 `json:"left_range_id"`
+	RightRangeID uint64 `json:"right_range_id"`
+}
+
+func (r *Runner) executeMerge(ctx context.Context, b Backend, cfg Config, args []string) int {
+	if len(args) != 2 {
+		return r.usage("merge requires <left-range-id> <right-range-id>")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("merge: -format raw is not supported; use table or json")
+	}
+	leftID, err := parseRangeID(args[0])
+	if err != nil {
+		return r.usage(err.Error())
+	}
+	rightID, err := parseRangeID(args[1])
+	if err != nil {
+		return r.usage(err.Error())
+	}
+	if err := b.MergeRanges(ctx, leftID, rightID); err != nil {
+		return r.fail("merge", err)
+	}
+	if cfg.Format == "json" {
+		return r.writeJSON(mergeJSON{
+			Status:       "ok",
+			LeftRangeID:  leftID,
+			RightRangeID: rightID,
+		})
+	}
+	if !cfg.Quiet {
+		fmt.Fprintln(r.out(), "OK")
+	}
+	return 0
+}
+
+type backupJSON struct {
+	Dir        string `json:"dir"`
+	SnapshotTS uint64 `json:"snapshot_ts"`
+	Keys       int64  `json:"keys"`
+	Bytes      int64  `json:"bytes"`
+	Ranges     int    `json:"ranges"`
+}
+
+func (r *Runner) executeBackup(ctx context.Context, b Backend, cfg Config, args []string) int {
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	fs.SetOutput(r.errOut())
+	outDir := fs.String("out", "", "backup directory to create")
+	chunkKeys := fs.Int("chunk-keys", 0, "maximum keys per chunk (0 uses the backend default)")
+	chunkBytes := fs.Int64("chunk-bytes", 0, "maximum key+value bytes per chunk (0 uses the backend default)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		return r.usage("backup takes no positional arguments")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("backup: -format raw is not supported; use table or json")
+	}
+	if *outDir == "" {
+		return r.usage("backup requires -out DIR")
+	}
+	if *chunkKeys < 0 {
+		return r.usage("backup: -chunk-keys must be >= 0")
+	}
+	if *chunkBytes < 0 {
+		return r.usage("backup: -chunk-bytes must be >= 0")
+	}
+	result, err := b.Backup(ctx, BackupOptions{
+		OutDir:     *outDir,
+		ChunkKeys:  *chunkKeys,
+		ChunkBytes: *chunkBytes,
+	})
+	if err != nil {
+		return r.fail("backup", err)
+	}
+	if cfg.Format == "json" {
+		return r.writeJSON(backupJSON{
+			Dir:        result.OutDir,
+			SnapshotTS: result.SnapshotTS,
+			Keys:       result.Keys,
+			Bytes:      result.Bytes,
+			Ranges:     result.Ranges,
+		})
+	}
+	if !cfg.Quiet {
+		fmt.Fprintf(r.out(), "backup complete: %s\n", result.OutDir)
+		fmt.Fprintf(r.out(), "snapshot_ts=%d keys=%d bytes=%d ranges=%d\n",
+			result.SnapshotTS, result.Keys, result.Bytes, result.Ranges)
+	}
+	return 0
+}
+
 func (r *Runner) runShell(ctx context.Context, b Backend, cfg Config) int {
 	if cfg.Format == "json" {
 		fmt.Fprintln(r.errOut(), "kvctl: shell is not available with -format json")
@@ -412,6 +730,10 @@ func (r *Runner) runShell(ctx context.Context, b Backend, cfg Config) int {
 			return 0
 		case "help", "?":
 			fmt.Fprintln(r.out(), "get <key> | put <key> <value> | delete <key> | scan [-prefix P] [-limit N] | quit")
+			continue
+		}
+		if adminCommand(cmd) {
+			fmt.Fprintf(r.errOut(), "kvctl shell: %s is not available in the shell; run it directly\n", cmd)
 			continue
 		}
 		var args []string
@@ -647,6 +969,43 @@ func prefixEnd(prefix []byte) []byte {
 		}
 	}
 	return nil
+}
+
+// metaOnlyCommand reports whether cmd talks only to the meta service and can
+// therefore run without -nodes.
+func metaOnlyCommand(cmd string) bool {
+	switch cmd {
+	case "ranges", "status", "split", "merge":
+		return true
+	default:
+		return false
+	}
+}
+
+// adminCommand reports whether cmd is an administrative command that is not
+// available in the interactive shell.
+func adminCommand(cmd string) bool {
+	return metaOnlyCommand(cmd) || cmd == "backup"
+}
+
+func parseRangeID(s string) (uint64, error) {
+	id, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid range id %q", s)
+	}
+	if id == 0 {
+		return 0, errors.New("range id must be greater than zero")
+	}
+	return id, nil
+}
+
+func sortedKeys(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func splitList(s string) []string {

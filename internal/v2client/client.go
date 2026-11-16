@@ -268,6 +268,22 @@ func NewWithDialOptions(metaAddr string, addrs []string, opts ...grpc.DialOption
 	if len(addrs) == 0 {
 		return nil, errors.New("v2client: at least one node address is required")
 	}
+	return newClient(metaAddr, addrs, opts...)
+}
+
+// NewMetaOnly connects only to the meta service. It is intended for
+// administrative operations that read or change the range map (listing,
+// splitting and merging ranges, or asking for the meta leader) where no KV
+// node address is needed. Data operations are intended for a client created
+// with New.
+func NewMetaOnly(metaAddr string) (*Client, error) {
+	return newClient(metaAddr, nil)
+}
+
+func newClient(metaAddr string, addrs []string, opts ...grpc.DialOption) (*Client, error) {
+	if metaAddr == "" {
+		return nil, errors.New("v2client: meta address is required")
+	}
 	metaOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	cc, err := grpc.NewClient(metaAddr, metaOpts...)
 	if err != nil {
