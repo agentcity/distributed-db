@@ -17,7 +17,10 @@ import (
 )
 
 // schedulerRPCTimeout bounds every per-replica KVService administration call.
-const schedulerRPCTimeout = 30 * time.Second
+const (
+	schedulerRPCTimeout = 30 * time.Second
+	schedulerAttempts   = 3
+)
 
 // schedulerMu serializes split/merge orchestration in this process. The
 // sequence "read range map snapshot -> fan out to replicas -> ApplyRanges" is
@@ -87,7 +90,7 @@ func (s *Server) SplitRange(ctx context.Context, req *pbv2.MetaSplitRangeRequest
 	// from the local AllocID counter (different meta replicas could disagree).
 	newID := maxID + 1
 
-	errs := callReplicas(ctx, old.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
+	errs := callReplicasWithRetry(ctx, old.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
 		resp, err := client.SplitRange(ctx, &pbv2.SplitRangeRequest{
 			RangeId:    old.ID,
 			SplitKey:   splitKey,
@@ -191,11 +194,12 @@ func (s *Server) MergeRanges(ctx context.Context, req *pbv2.MetaMergeRangesReque
 		return mergeFailed("merge: range %d has no replicas", leftID), nil
 	}
 
-	errs := callReplicas(ctx, left.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
+	errs := callReplicasWithRetry(ctx, left.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
 		resp, err := client.MergeRanges(ctx, &pbv2.MergeRangesRequest{
 			LeftRangeId:  left.ID,
 			RightRangeId: right.ID,
 			Epoch:        left.Version,
+			RightEnd:     right.End,
 		})
 		if err != nil {
 			return err
@@ -304,6 +308,35 @@ func adjacent(left, right meta.Range) bool {
 		return false
 	}
 	return bytes.Equal(left.End, right.Start)
+}
+
+// callReplicasWithRetry retries a partially failed fan-out. KV split and
+// merge are idempotent, so retrying the whole replica set is safe.
+func callReplicasWithRetry(ctx context.Context, replicas []string, call func(context.Context, pbv2.KVServiceClient) error) []error {
+	var errs []error
+	for attempt := 0; attempt < schedulerAttempts; attempt++ {
+		errs = callReplicas(ctx, replicas, call)
+		if allOK(errs) {
+			return errs
+		}
+		if attempt+1 < schedulerAttempts {
+			select {
+			case <-ctx.Done():
+				return errs
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+	return errs
+}
+
+func allOK(errs []error) bool {
+	for _, err := range errs {
+		if err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // callReplicas invokes call on every replica concurrently. Each replica gets

@@ -516,7 +516,16 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	}
 	right, err := k.s.groupForID(req.GetRightRangeId())
 	if err != nil {
+		// A partial merge may already have stopped the right group on this
+		// replica. If the left end covers the requested right end, the local
+		// merge is complete and the retry is idempotent.
+		if errors.Is(err, ErrRangeNotFound) && len(req.GetRightEnd()) > 0 && bytes.Equal(left.cfg.End, req.GetRightEnd()) {
+			return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
+		}
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+	}
+	if len(req.GetRightEnd()) > 0 && !bytes.Equal(right.cfg.End, req.GetRightEnd()) {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "right end mismatch"}, nil
 	}
 	if left == right {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "same range"}, nil

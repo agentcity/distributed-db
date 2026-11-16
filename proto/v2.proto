@@ -144,6 +144,7 @@ message MergeRangesRequest {
   uint64 left_range_id = 1;
   uint64 right_range_id = 2;
   uint64 epoch = 3;
+  bytes right_end = 4;
 }
 message MergeRangesResponse {
   bool success = 1;

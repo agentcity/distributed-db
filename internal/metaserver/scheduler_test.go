@@ -181,7 +181,7 @@ func TestSplitRangeReplicaFailureLeavesMapUnchanged(t *testing.T) {
 	if !strings.Contains(resp.GetError(), addr2) || !strings.Contains(resp.GetError(), "1/2 replicas") {
 		t.Fatalf("error = %q, want failed replica and failure count", resp.GetError())
 	}
-	if len(kv1.splitRequests()) != 1 {
+	if len(kv1.splitRequests()) < 1 {
 		t.Fatalf("healthy replica was not asked to split")
 	}
 
