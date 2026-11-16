@@ -43,6 +43,15 @@ func buildCLIStore(t *testing.T, hashes []edgeset.Hash, key []byte) string {
 	return dir
 }
 
+func loadCLICache(cacheDir string, verifier edgeset.Verifier) (*edgeset.Store, *edgeset.Manifest, error) {
+	raw, err := os.ReadFile(filepath.Join(cacheDir, "CURRENT"))
+	if err != nil {
+		return nil, nil, err
+	}
+	generation := strings.TrimSpace(string(raw))
+	return edgeset.LoadStoreVerified(filepath.Join(cacheDir, generation), verifier)
+}
+
 func invoke(t *testing.T, args []string, stdin string) (code int, stdout, stderr string) {
 	t.Helper()
 	var out, errOut bytes.Buffer
@@ -208,9 +217,9 @@ func TestLookupAndSyncCLI(t *testing.T) {
 	if !strings.Contains(stdout, "synced 2/2 segments") {
 		t.Fatalf("sync stdout = %q", stdout)
 	}
-	cached, manifest, err := edgeset.LoadStore(cacheDir, key)
+	cached, manifest, err := loadCLICache(cacheDir, edgeset.NewHMACVerifier(key))
 	if err != nil {
-		t.Fatalf("LoadStore(cache): %v", err)
+		t.Fatalf("load cache generation: %v", err)
 	}
 	if cached.TotalCount() != len(hashes) || len(manifest.Segments) != 2 {
 		t.Fatalf("cache total/segments = %d/%d", cached.TotalCount(), len(manifest.Segments))
@@ -226,9 +235,9 @@ func TestLookupAndSyncCLI(t *testing.T) {
 	if !strings.Contains(stdout, "synced 1/2 segments") {
 		t.Fatalf("filtered sync stdout = %q", stdout)
 	}
-	filteredStore, filteredManifest, err := edgeset.LoadStore(filteredDir, nil)
+	filteredStore, filteredManifest, err := loadCLICache(filteredDir, nil)
 	if err != nil {
-		t.Fatalf("LoadStore(filtered): %v", err)
+		t.Fatalf("load filtered cache generation: %v", err)
 	}
 	if filteredStore.TotalCount() != 1 || len(filteredManifest.Segments) != 1 {
 		t.Fatalf("filtered total/segments = %d/%d", filteredStore.TotalCount(), len(filteredManifest.Segments))

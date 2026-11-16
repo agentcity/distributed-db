@@ -307,7 +307,12 @@ At scaffold time:
   manifest, or with the manual fixture in `TESTING.md`.
 - `internal/edgeset.Proof` has no JSON tags, so the server currently emits
   `Hash`, `Index`, `Path`, `Right`. The mobile decoders accept both cases; new
-  servers should emit lower-case.
+  servers should emit lower-case. `absence_proof` uses `Prefix`, `Root`,
+  `Left`, `Right` for the same reason.
+- The current server supports `GET /v1/lookup/{hash}?absence=1` with a Merkle
+  non-membership proof. The mobile scaffold does not request or verify it; a
+  plain `present=false` remains unverified. The fixture in §8 can be used to
+  test an absence proof once implemented.
 - `Manifest.Signature []byte` is base64 in JSON. The mobile decoders accept
   base64 and hex.
 - `Manifest.Version` is schema version 1, not a content generation. Cache keys
@@ -315,8 +320,10 @@ At scaffold time:
 - The mobile scaffold has no zstd decoder. It skips zstd segments during sync
   and can still answer online via remote proofs. Use v2 `"none"` for offline
   tests.
-- Absence proofs are not in the HTTP response yet. `present=false` is not
-  verified; a missing segment in the signed manifest is the stronger answer.
+- Absence proofs are available from the current server via `?absence=1` but
+  are not consumed by the scaffold. `present=false` without a verified
+  `absence_proof` is not a client-verifiable answer; a missing segment in the
+  signed manifest is the stronger answer.
 
 ## 10. Reproducing the vectors
 

@@ -359,7 +359,7 @@ public enum LookupSource: String, Sendable, CaseIterable {
     case localBloomFalsePositive = "local_bloom_false_positive"
     /// Remote inclusion proof verified against the signed Merkle root.
     case remoteProof = "remote_proof"
-    /// Remote server answered present=false. v1 has no verifiable absence proof.
+    /// Remote server answered present=false without a verified absence proof.
     case remoteAbsent = "remote_absent"
 }
 
@@ -614,7 +614,8 @@ internal enum ManifestCodec {
             )
         }
 
-        if let algorithm = wire.signatureAlg,
+        let signatureAlg = wire.signatureAlg?.isEmpty == true ? nil : wire.signatureAlg
+        if let algorithm = signatureAlg,
            algorithm != "ed25519" && algorithm != "hmac-sha256" {
             throw EdgeHashError.unsupportedVersion("unknown signature_alg \"\(algorithm)\"")
         }
@@ -627,20 +628,20 @@ internal enum ManifestCodec {
             version: wire.version,
             prefixBytes: wire.prefixBytes,
             segments: segments,
-            signatureAlg: wire.signatureAlg
+            signatureAlg: signatureAlg
         )
         let fingerprint = sha256(canonical)
         let manifest = Manifest(
             version: wire.version,
             prefixBytes: wire.prefixBytes,
             segments: segments,
-            signatureAlg: wire.signatureAlg,
+            signatureAlg: signatureAlg,
             signature: signature,
             fingerprint: fingerprint
         )
         try verifySignature(
             trust: trust,
-            algorithm: wire.signatureAlg,
+            algorithm: signatureAlg,
             signature: signature,
             canonical: canonical
         )
@@ -2186,7 +2187,7 @@ public actor EdgeHashClient {
             ifNoneMatch: nil
         )
         if response.statusCode == 404 {
-            // Compatibility with older servers; v1 absence is not verifiable.
+            // Compatibility with older servers; absence is unverified here.
             return LookupResult(
                 present: false,
                 prefix: prefix,

@@ -1,21 +1,28 @@
 # Testing the EdgeHash mobile scaffold
 
-Status: **none of the mobile code was built or run here.** Honest inventory:
+Status: **this is not a validated app or SDK.** Honest inventory of what was
+and was not checked:
 
-- Android: no Kotlin compiler, Gradle, Android SDK, emulator, or device was
-  available. `android/EdgeHashClient.kt` has **not been compiled**.
-- iOS: `swiftc -typecheck` was run against the local macOS SDK while authoring
-  the file. That catches Swift type/syntax errors, but it is **not** an iOS
-  build, does not link an app, does not use the iOS SDK, and does not run on a
-  simulator/device. Do not treat it as validation.
-- No test executed the HTTP client, cache, signature verification, Bloom,
-  Merkle, segment parser, or policy code end to end.
-- No zstd path is exercised because the mobile scaffold deliberately has no
-  zstd decoder.
-- The Go tree was being changed concurrently with this scaffold (Ed25519,
-  segment v2/zstd, absence proof helpers). The commands below describe the
-  server as observed at scaffold time; verify flags with `-h` and inspect the
-  served manifest.
+| Check | Result |
+|---|---|
+| Android app build (Gradle/Android SDK) | **Not done.** No Android SDK, Gradle project, emulator, or device was available. |
+| Kotlin compile | `EdgeHashClient.kt` compiled with Kotlin 2.0.21/JVM against minimal `org.json` stubs. This checks Kotlin syntax/semantics, not Android's actual `org.json` implementation or Android APIs. |
+| Android vector harness | Temporary JVM harness passed canonical JSON, HMAC, Ed25519, Merkle, Bloom, and v1/v2 segment vectors. |
+| iOS app build/link/run | **Not done.** No app target, no simulator run, no device. |
+| iOS typecheck | `swiftc -typecheck -warnings-as-errors` against the iPhoneSimulator SDK, target `arm64-apple-ios16.0-simulator`, exit 0. |
+| Swift vector harness | Compiled and run on macOS; passed the same canonical/signature/Merkle/Bloom/segment vectors, including JSON parsing. |
+| HTTP end-to-end, cache, policy, concurrency | **Not run.** |
+| zstd, absence proof, background sync, real devices | **Not run.** zstd/absence are not implemented in the mobile scaffold; the server has both. |
+
+The Go tree was being changed concurrently with this scaffold (Ed25519,
+segment v2/zstd, absence-proof helpers). The curl recipes describe the server
+as observed at scaffold time; verify flags with `-h` and inspect the served
+manifest. The temporary harnesses are not committed; the required tests below
+must live in a real Android/iOS test target.
+
+`org.json` stubs only implement the methods this file calls. Android-specific
+behavior such as `JSONObject.keys()`, number coercion, and exception messages
+still needs a real device/instrumentation test.
 
 Reference values live in [`tests/notes.md`](tests/notes.md).
 
@@ -91,6 +98,11 @@ curl -sS "http://127.0.0.1:8080/v1/lookup/$H1" | tee /tmp/lookup-present.json | 
 # Absent lookup inside the same segment (prefix 1234, not one of the three).
 ABSENT="123403$(printf '%058d' 0)"
 curl -sS "http://127.0.0.1:8080/v1/lookup/$ABSENT" | jq .
+
+# Ask the current server for a non-membership proof as well.
+curl -sS "http://127.0.0.1:8080/v1/lookup/$ABSENT?absence=1" | jq .
+# The scaffold does not request/verify absence_proof yet; inspect it manually
+# and use the protocol §7.4 rules when implementing that feature.
 
 # A hash outside the signed manifest's prefixes yields the stronger
 # no-segment answer (present=false, no proof).
@@ -334,7 +346,8 @@ At minimum, add these to a real Android test source set and an iOS XCTest target
   under load.
 - Real HTTP/2, proxies, CDNs, TLS, ATS/cleartext configuration.
 - zstd segments and decompression limits.
-- Absence proofs (not in the HTTP protocol yet).
+- Absence proofs: the server supports `?absence=1` and `absence_proof`; the
+  mobile scaffold neither requests nor verifies them.
 - Background sync, WorkManager/BGTaskScheduler, battery/network observers.
 - Key rotation, multi-key keyrings, rollback prevention.
 - Memory/CPU/disk benchmarks and large-store behavior.

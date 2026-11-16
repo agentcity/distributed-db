@@ -1,9 +1,10 @@
 // Package edgehttp exposes an immutable edgeset Store over HTTP.
 //
-// A Server is constructed with NewServer, which loads and fully verifies the
-// store (manifest HMAC, segment sizes, checksums, headers and Merkle roots)
-// before any request is served. A tampered store therefore fails at startup
-// instead of serving unverified bytes.
+// A Server is constructed with NewServer or NewServerWithOptions, which loads
+// and fully verifies the store (manifest signature, segment sizes, checksums,
+// headers, compression and Merkle roots) before any request is served. A
+// tampered store therefore fails at startup instead of serving unverified
+// bytes.
 //
 // Endpoints:
 //
@@ -13,26 +14,111 @@
 //	GET /v1/segment/{prefix}     raw verified segment bytes (4 hex characters)
 //	GET /v1/lookup/{hash}        exact lookup, proof on success
 //
-// The server is read-only and safe for concurrent use. It does not implement
-// authentication, rate limiting or TLS; put it behind a gateway when the
-// network is untrusted.
+// GET /v1/lookup/{hash}?absence=1 additionally returns an absence_proof for a
+// hash that is not in the set but whose segment exists. The proof can be
+// verified with edgeset.VerifyAbsence against the segment root returned in the
+// same response (and that root must match an authenticated manifest).
+//
+// Segment responses are safe to serve through a CDN: they are immutable,
+// cacheable for a year, carry a strong SHA-256 ETag and support single and
+// multiple byte ranges.
+//
+// NewServerWithOptions adds optional Bearer-token authentication, per-IP token
+// bucket rate limiting and TLS. /healthz is exempt from auth and rate limiting
+// by default; set Options.ProtectHealthz to change that.
 package edgehttp
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 
 	"distributed-db/internal/edgeset"
 )
 
 // maxErrorBodyBytes bounds the error text returned from a failed lookup.
 const maxErrorBodyBytes = 512
+
+// defaultReadHeaderTimeout protects against slow-header clients when Options
+// does not specify a value.
+const defaultReadHeaderTimeout = 10 * time.Second
+
+// Options configures NewServerWithOptions.
+//
+// The zero value serves an unsigned store over plain HTTP without
+// authentication or rate limiting. Callers that need integrity should set
+// Verifier (for example edgeset.NewHMACVerifier(key) or
+// edgeset.NewEd25519Verifier(pub)).
+type Options struct {
+	// Verifier authenticates the manifest. A nil Verifier disables signature
+	// verification but still validates the manifest structure and every
+	// segment. Use edgeset.NewHMACVerifier for legacy HMAC-SHA256 stores and
+	// edgeset.NewEd25519Verifier for Ed25519 stores.
+	Verifier edgeset.Verifier
+
+	// TLSConfig optionally enables TLS for ServeTLS/StartTLS. It is cloned by
+	// the constructor; the caller's config is never mutated.
+	TLSConfig *tls.Config
+
+	// TLSCertFile and TLSKeyFile are a PEM certificate/key pair used by
+	// ServeTLS/StartTLS and exposed through TLSConfig. Both must be set
+	// together. CertFile/KeyFile are accepted as aliases.
+	TLSCertFile string
+	TLSKeyFile  string
+	CertFile    string
+	KeyFile     string
+
+	// TLSCert and TLSKey are aliases for TLSCertFile and TLSKeyFile.
+	TLSCert string
+	TLSKey  string
+
+	// AuthToken, when non-empty, requires "Authorization: Bearer <token>" on
+	// every endpoint except an exempt /healthz. Comparison is constant time.
+	AuthToken string
+
+	// RateLimit is the sustained request rate per remote IP in requests per
+	// second. Zero disables rate limiting. Negative or non-finite values are
+	// rejected.
+	RateLimit float64
+
+	// RateBurst is the per-IP token bucket burst. Zero defaults to
+	// ceil(RateLimit), with a minimum of one.
+	RateBurst int
+
+	// RateLimitPerIP is accepted for compatibility and documentation. Limiting
+	// is always performed per remote IP.
+	RateLimitPerIP bool
+
+	// ReadHeaderTimeout bounds request header reads. Zero selects ten seconds.
+	ReadHeaderTimeout time.Duration
+
+	// MaxSegmentBytes refuses to serve a segment larger than this many stored
+	// (possibly compressed) bytes with 413. Zero means unlimited.
+	MaxSegmentBytes int64
+
+	// ProtectHealthz makes /healthz require auth and consume rate limit. By
+	// default /healthz is exempt.
+	ProtectHealthz bool
+
+	// ExemptHealthz explicitly exempts /healthz. It is redundant with the
+	// default but makes the intent visible.
+	ExemptHealthz bool
+}
 
 // Server is an http.Handler backed by one immutable edgeset Store.
 type Server struct {
@@ -41,7 +127,29 @@ type Server struct {
 	manifest     *edgeset.Manifest
 	manifestJSON []byte
 	manifestETag string
+	opts         Options
 	handler      http.Handler
+
+	tlsConfig         *tls.Config
+	tlsCertFile       string
+	tlsKeyFile        string
+	readHeaderTimeout time.Duration
+	maxSegmentBytes   int64
+
+	authToken     string
+	rateLimit     float64
+	rateBurst     int
+	protectHealth bool
+
+	rateMu        sync.Mutex
+	limiters      map[string]*ipLimiter
+	lastRateSweep time.Time
+}
+
+// ipLimiter is one remote IP's token bucket plus its last-seen time.
+type ipLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
 }
 
 // New is an alias for NewServer.
@@ -50,13 +158,40 @@ func New(dir string, key []byte) (*Server, error) {
 }
 
 // NewServer loads dir with the optional HMAC key and returns a ready handler.
-// It returns an error for a missing or structurally invalid manifest, a bad
-// signature, or any segment that does not match its manifest metadata.
+// It is equivalent to NewServerWithOptions with a legacy HMAC verifier.
 func NewServer(dir string, key []byte) (*Server, error) {
+	return NewServerWithOptions(dir, Options{Verifier: edgeset.NewHMACVerifier(key)})
+}
+
+// NewServerWithOptions loads dir and returns a fully verified HTTP handler.
+//
+// It returns an error for a missing or structurally invalid manifest, a bad
+// signature, any segment that does not match its manifest metadata, invalid
+// options, or an unreadable TLS certificate/key pair.
+func NewServerWithOptions(dir string, opts Options) (*Server, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("edgehttp: empty store directory")
 	}
-	store, manifest, err := edgeset.LoadStore(dir, key)
+	if opts.RateLimit < 0 || math.IsNaN(opts.RateLimit) || math.IsInf(opts.RateLimit, 0) {
+		return nil, fmt.Errorf("edgehttp: RateLimit %v must be a finite non-negative number", opts.RateLimit)
+	}
+	if opts.ReadHeaderTimeout < 0 {
+		return nil, fmt.Errorf("edgehttp: ReadHeaderTimeout must not be negative")
+	}
+	if opts.MaxSegmentBytes < 0 {
+		return nil, fmt.Errorf("edgehttp: MaxSegmentBytes must not be negative")
+	}
+
+	tlsCertFile, tlsKeyFile, err := resolveTLSPaths(opts)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig, err := buildTLSConfig(opts.TLSConfig, tlsCertFile, tlsKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	store, manifest, err := loadStore(dir, opts.Verifier)
 	if err != nil {
 		return nil, fmt.Errorf("edgehttp: load store: %w", err)
 	}
@@ -67,12 +202,35 @@ func NewServer(dir string, key []byte) (*Server, error) {
 	body = append(body, '\n')
 	sum := sha256.Sum256(body)
 
+	readHeaderTimeout := opts.ReadHeaderTimeout
+	if readHeaderTimeout == 0 {
+		readHeaderTimeout = defaultReadHeaderTimeout
+	}
+	rateBurst := opts.RateBurst
+	if opts.RateLimit > 0 && rateBurst <= 0 {
+		rateBurst = int(math.Ceil(opts.RateLimit))
+		if rateBurst < 1 {
+			rateBurst = 1
+		}
+	}
+
 	s := &Server{
-		dir:          filepath.Clean(dir),
-		store:        store,
-		manifest:     manifest,
-		manifestJSON: body,
-		manifestETag: quoteETag(hex.EncodeToString(sum[:])),
+		dir:               filepath.Clean(dir),
+		store:             store,
+		manifest:          manifest,
+		manifestJSON:      body,
+		manifestETag:      quoteETag(hex.EncodeToString(sum[:])),
+		opts:              opts,
+		tlsConfig:         tlsConfig,
+		tlsCertFile:       tlsCertFile,
+		tlsKeyFile:        tlsKeyFile,
+		readHeaderTimeout: readHeaderTimeout,
+		maxSegmentBytes:   opts.MaxSegmentBytes,
+		authToken:         opts.AuthToken,
+		rateLimit:         opts.RateLimit,
+		rateBurst:         rateBurst,
+		protectHealth:     opts.ProtectHealthz && !opts.ExemptHealthz,
+		limiters:          make(map[string]*ipLimiter),
 	}
 
 	mux := http.NewServeMux()
@@ -81,8 +239,58 @@ func NewServer(dir string, key []byte) (*Server, error) {
 	mux.HandleFunc("GET /v1/manifest/version", s.handleVersion)
 	mux.HandleFunc("GET /v1/segment/{prefix}", s.handleSegment)
 	mux.HandleFunc("GET /v1/lookup/{hash}", s.handleLookup)
-	s.handler = mux
+
+	var handler http.Handler = mux
+	handler = s.rateLimitMiddleware(handler)
+	handler = s.authMiddleware(handler)
+	s.handler = handler
 	return s, nil
+}
+
+// loadStore loads with signature verification according to verifier. A nil
+// verifier keeps the structural and segment checks but skips signatures.
+func loadStore(dir string, verifier edgeset.Verifier) (*edgeset.Store, *edgeset.Manifest, error) {
+	return edgeset.LoadStoreVerified(dir, verifier)
+}
+
+// resolveTLSPaths merges the public cert/key path aliases.
+func resolveTLSPaths(opts Options) (certFile, keyFile string, err error) {
+	certFile = firstNonEmpty(opts.TLSCertFile, opts.CertFile, opts.TLSCert)
+	keyFile = firstNonEmpty(opts.TLSKeyFile, opts.KeyFile, opts.TLSKey)
+	if (certFile == "") != (keyFile == "") {
+		return "", "", fmt.Errorf("edgehttp: TLS certificate and key paths must be set together")
+	}
+	return certFile, keyFile, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// buildTLSConfig clones the caller's config and, when cert/key files are
+// supplied, loads them so startup fails fast on an unreadable pair.
+func buildTLSConfig(base *tls.Config, certFile, keyFile string) (*tls.Config, error) {
+	var cfg *tls.Config
+	if base != nil {
+		cfg = base.Clone()
+	}
+	if certFile == "" {
+		return cfg, nil
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("edgehttp: load TLS key pair: %w", err)
+	}
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
+	cfg.Certificates = append(cfg.Certificates, cert)
+	return cfg, nil
 }
 
 // ServeHTTP implements http.Handler.
@@ -90,7 +298,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
 }
 
-// Handler returns the immutable handler built by NewServer.
+// Handler returns the immutable middleware-wrapped handler built at startup.
 func (s *Server) Handler() http.Handler {
 	return s.handler
 }
@@ -111,25 +319,187 @@ func (s *Server) Manifest() *edgeset.Manifest {
 	if s == nil || s.manifest == nil {
 		return nil
 	}
-	out := &edgeset.Manifest{
-		Version:     s.manifest.Version,
-		PrefixBytes: s.manifest.PrefixBytes,
-		Segments:    append([]edgeset.SegmentMeta(nil), s.manifest.Segments...),
+	return cloneManifest(s.manifest)
+}
+
+// TLSConfig returns a clone of the configured TLS config, or nil when TLS was
+// not configured.
+func (s *Server) TLSConfig() *tls.Config {
+	if s == nil || s.tlsConfig == nil {
+		return nil
 	}
-	if s.manifest.Signature != nil {
-		out.Signature = append([]byte(nil), s.manifest.Signature...)
+	return s.tlsConfig.Clone()
+}
+
+// HTTPHandlerServer returns an http.Server using this handler and the
+// configured TLS and read-header settings. The caller owns its lifecycle.
+func (s *Server) HTTPHandlerServer() *http.Server {
+	return &http.Server{
+		Handler:           s.handler,
+		TLSConfig:         s.TLSConfig(),
+		ReadHeaderTimeout: s.readHeaderTimeout,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
+// ServeTLS serves TLS on ln. Empty certFile/keyFile use the certificate pair
+// from Options (or Options.TLSConfig). The call blocks until the server stops.
+func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
+	if certFile == "" {
+		certFile = s.tlsCertFile
+	}
+	if keyFile == "" {
+		keyFile = s.tlsKeyFile
+	}
+	return s.HTTPHandlerServer().ServeTLS(ln, certFile, keyFile)
+}
+
+// StartTLS is ServeTLS using the certificate pair from Options. It is useful
+// when TLSConfig already carries certificates.
+func (s *Server) StartTLS(ln net.Listener) error {
+	return s.ServeTLS(ln, "", "")
+}
+
+// ListenAndServeTLS listens on addr and serves TLS. Empty certFile/keyFile use
+// the Options pair.
+func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.ServeTLS(ln, certFile, keyFile)
+}
+
+func cloneManifest(m *edgeset.Manifest) *edgeset.Manifest {
+	if m == nil {
+		return nil
+	}
+	out := &edgeset.Manifest{
+		Version:      m.Version,
+		PrefixBytes:  m.PrefixBytes,
+		SignatureAlg: m.SignatureAlg,
+		Segments:     append([]edgeset.SegmentMeta(nil), m.Segments...),
+	}
+	if m.Signature != nil {
+		out.Signature = append([]byte(nil), m.Signature...)
 	}
 	return out
 }
 
-// lookupResponse is the wire form of GET /v1/lookup/{hash}. Root and Proof are
-// only populated when the hash is present. Prefix is always the routing prefix
-// of the queried hash.
+// authMiddleware enforces a constant-time Bearer token check.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	if s.authToken == "" {
+		return next
+	}
+	token := []byte(s.authToken)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.healthzExempt(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got, ok := bearerToken(r.Header.Get("Authorization"))
+		if !ok || subtle.ConstantTimeCompare([]byte(got), token) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="edgehash"`)
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// bearerToken extracts the token from a "Bearer <token>" Authorization value.
+func bearerToken(header string) (string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(header), " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return "", false
+	}
+	token := strings.TrimSpace(parts[1])
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+// rateLimitMiddleware applies a per-IP token bucket.
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	if s.rateLimit <= 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.healthzExempt(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.allow(remoteIP(r)) {
+			w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds()))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// healthzExempt reports whether the request is the exempt liveness endpoint.
+func (s *Server) healthzExempt(r *http.Request) bool {
+	return r.URL.Path == "/healthz" && !s.protectHealth
+}
+
+func (s *Server) retryAfterSeconds() int {
+	if s.rateLimit <= 0 {
+		return 1
+	}
+	seconds := int(math.Ceil(1 / s.rateLimit))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
+// allow consumes one token from ip's bucket. Limiters are retained briefly so
+// a burst of requests from one client is tracked consistently.
+func (s *Server) allow(ip string) bool {
+	now := time.Now()
+
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	if s.limiters == nil {
+		s.limiters = make(map[string]*ipLimiter)
+	}
+	if now.Sub(s.lastRateSweep) >= time.Minute {
+		for key, entry := range s.limiters {
+			if now.Sub(entry.lastSeen) > 10*time.Minute {
+				delete(s.limiters, key)
+			}
+		}
+		s.lastRateSweep = now
+	}
+	entry := s.limiters[ip]
+	if entry == nil {
+		entry = &ipLimiter{limiter: rate.NewLimiter(rate.Limit(s.rateLimit), s.rateBurst)}
+		s.limiters[ip] = entry
+	}
+	entry.lastSeen = now
+	return entry.limiter.Allow()
+}
+
+func remoteIP(r *http.Request) string {
+	addr := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
+		return host
+	}
+	if addr == "" {
+		return "unknown"
+	}
+	return addr
+}
+
+// lookupResponse is the wire form of GET /v1/lookup/{hash}.
 type lookupResponse struct {
-	Present bool           `json:"present"`
-	Proof   *edgeset.Proof `json:"proof,omitempty"`
-	Root    string         `json:"root"`
-	Prefix  string         `json:"prefix"`
+	Present      bool                  `json:"present"`
+	Proof        *edgeset.Proof        `json:"proof,omitempty"`
+	AbsenceProof *edgeset.AbsenceProof `json:"absence_proof,omitempty"`
+	Root         string                `json:"root"`
+	Prefix       string                `json:"prefix"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -167,16 +537,13 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "segment not found")
 		return
 	}
-
-	etag := quoteETag(meta.SHA256.String())
-	if etagMatches(r.Header.Get("If-None-Match"), etag) {
-		w.Header().Set("ETag", etag)
-		w.WriteHeader(http.StatusNotModified)
+	if s.maxSegmentBytes > 0 && meta.Size > s.maxSegmentBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "segment exceeds configured size limit")
 		return
 	}
 
-	// Segment verifies the bytes against the manifest checksum again. A file
-	// modified after startup is therefore rejected rather than served.
+	// Segment verifies the stored bytes against the manifest checksum again. A
+	// file modified after startup is therefore rejected rather than served.
 	data, err := s.store.Segment(prefix)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "segment unavailable")
@@ -185,11 +552,53 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Content-Type", "application/octet-stream")
-	h.Set("Content-Length", strconv.Itoa(len(data)))
-	h.Set("ETag", etag)
 	h.Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	h.Set("ETag", quoteETag(meta.SHA256.String()))
+	h.Set("Accept-Ranges", "bytes")
+
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" && !validByteRangeHeader(rangeHeader) {
+		h.Set("Content-Range", fmt.Sprintf("bytes */%d", len(data)))
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "invalid range")
+		return
+	}
+
+	// ServeContent implements single and multipart ranges, If-Range, 206/416
+	// and conditional requests. The ETag is strong and derived from SHA-256.
+	// Bytes are always served verbatim (compressed segments are not decoded).
+	http.ServeContent(w, r, filepath.Base(meta.File), time.Time{}, bytes.NewReader(data))
+}
+
+// validByteRangeHeader performs a conservative syntax check before handing the
+// request to http.ServeContent. ServeContent deliberately ignores some
+// malformed Range values; the edge API answers those with 416 instead.
+func validByteRangeHeader(header string) bool {
+	header = strings.TrimSpace(header)
+	const prefix = "bytes="
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return false
+	}
+	for _, spec := range strings.Split(header[len(prefix):], ",") {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			return false
+		}
+		dash := strings.IndexByte(spec, '-')
+		if dash < 0 || strings.IndexByte(spec[dash+1:], '-') >= 0 {
+			return false
+		}
+		start, end := spec[:dash], spec[dash+1:]
+		if start == "" && end == "" {
+			return false
+		}
+		for _, digits := range []string{start, end} {
+			for i := 0; i < len(digits); i++ {
+				if digits[i] < '0' || digits[i] > '9' {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
@@ -211,11 +620,50 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		Prefix:  fmt.Sprintf("%04x", prefix),
 	}
 	if present {
-		if meta, ok := s.store.SegmentMeta(prefix); ok {
-			resp.Root = meta.Root.String()
+		meta, ok := s.store.SegmentMeta(prefix)
+		if !ok || proof == nil || !edgeset.VerifyProof(meta.Root, h, proof) {
+			writeError(w, http.StatusInternalServerError, "invalid inclusion proof")
+			return
+		}
+		resp.Root = meta.Root.String()
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	if wantsAbsence(r) {
+		absence, err := s.store.ProveAbsent(h)
+		switch {
+		case err == nil:
+			if !edgeset.VerifyAbsence(absence.Root, h, absence) {
+				writeError(w, http.StatusInternalServerError, "invalid absence proof")
+				return
+			}
+			resp.AbsenceProof = absence
+			resp.Root = absence.Root.String()
+		case errors.Is(err, edgeset.ErrSegmentNotFound):
+			// The manifest itself proves there is no covering segment; there is
+			// no Merkle proof to build, so the response stays proof-free.
+		default:
+			writeError(w, http.StatusInternalServerError, "absence proof unavailable")
+			return
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// wantsAbsence reports whether the lookup asked for a non-membership proof.
+// "?absence" and "?absence=1" request it; 0/false/no/off disable it.
+func wantsAbsence(r *http.Request) bool {
+	query := r.URL.Query()
+	if !query.Has("absence") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(query.Get("absence"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 // parsePrefix accepts exactly four hexadecimal characters, the on-disk segment

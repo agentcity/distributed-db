@@ -29,9 +29,12 @@ Companion documents: [`README.md`](README.md), [`TESTING.md`](TESTING.md), and
 
 ## 2. Endpoints
 
-The server is read-only and currently has no authentication or rate limiting.
-Put it behind TLS and a gateway; the manifest signature is what makes the data
-trustworthy, not the transport alone.
+The server is read-only. `NewServerWithOptions` supports optional Bearer-token
+authentication, per-IP rate limiting, TLS and a segment-size cap; the zero-value
+server has none. Segment responses support byte ranges. The mobile scaffold does
+not send an auth token and does not use ranges. Put the endpoint behind TLS and
+a gateway; the manifest signature is what makes the data trustworthy, not the
+transport alone.
 
 | Method | Path | Response |
 |---|---|---|
@@ -40,6 +43,7 @@ trustworthy, not the transport alone.
 | `GET` | `/v1/manifest/version` | `{"version":1}`; informational, unsigned |
 | `GET` | `/v1/segment/{prefix}` | Raw segment bytes, `Content-Type: application/octet-stream` |
 | `GET` | `/v1/lookup/{hash}` | JSON membership answer with optional inclusion proof |
+| `GET` | `/v1/lookup/{hash}?absence=1` | Absent answer can include `absence_proof` |
 
 Details:
 
@@ -53,6 +57,11 @@ Details:
   `Cache-Control: no-cache`; conditional requests return `304`.
 - `/v1/manifest/version` is not signed and must not be used as a trust or
   freshness signal.
+- Segment requests accept a single or multipart `Range`; ranges are over the
+  stored bytes (for zstd segments, not the decoded payload). Responses may be
+  `206`/`416` and carry `Accept-Ranges: bytes`. Mobile does not use ranges.
+- Protected servers require `Authorization: Bearer <token>` on every endpoint
+  except an exempt `/healthz`; mobile has no token configuration.
 - Redirects are not part of the contract. The mobile transports do not follow
   redirects (Android) or reject a redirect that leaves HTTPS (iOS).
 
@@ -356,14 +365,59 @@ with `right = [false, true]`.
 
 ### 7.4 Absence
 
-v1 of the lookup response has no absence proof. `present=false` is an assertion
-by the server, not a client-verifiable proof. A future version may add an
-absence proof; clients must gate it on an explicit field/version and must not
-interpret unknown fields as verified absence.
+The current Go server returns a Merkle non-membership proof when the client asks
+for it:
 
-The Go library has an `AbsenceProof` type and verification helper, but it is not
-part of the HTTP protocol described here yet. The mobile scaffold does not
-verify absence proofs.
+```http
+GET /v1/lookup/<hash>?absence=1
+```
+
+If the hash is absent and its routing prefix has a segment, the response is:
+
+```json
+{
+  "present": false,
+  "absence_proof": {
+    "Prefix": 4660,
+    "Root": "<64 hex>",
+    "Left": {
+      "Hash": "<64 hex>",
+      "Index": 2,
+      "Path": ["<emptyLeaf>", "<node>"],
+      "Right": [true, false]
+    },
+    "Right": null
+  },
+  "root": "<64 hex>",
+  "prefix": "1234"
+}
+```
+
+`AbsenceProof` has no JSON tags in the Go type, so its field names are
+capitalized (`Prefix`, `Root`, `Left`, `Right`), like the nested `Proof` fields.
+`Left`/`Right` are null when that neighbour does not exist.
+
+Verification, against the authenticated segment root:
+
+- `proof.Root` must equal the root from the signed segment metadata, and
+  `proof.Prefix` must be the prefix that routes the queried hash.
+- If both `Left` and `Right` are present: each is a normal inclusion proof
+  against the root, `Right.Index == Left.Index + 1`, and
+  `Left.Hash < hash < Right.Hash`.
+- If only `Right` is present: it proves index 0 and `hash < Right.Hash`.
+- If only `Left` is present: it proves the last leaf and `Left.Hash < hash`.
+  "Last leaf" is checked by requiring every right-hand sibling on the path to be
+  the canonical root of an all-empty subtree at that level:
+  `emptyRoot[0] = emptyLeaf`, `emptyRoot[i] = node(emptyRoot[i-1], emptyRoot[i-1])`.
+  This prevents using an arbitrary leaf as the "last" leaf.
+- The server returns no absence proof when the hash's prefix has no segment;
+  the signed manifest itself is the evidence for that case.
+
+**The mobile scaffold does not implement this verification or request
+`?absence=1`.** A plain `present=false` must be reported as unverified. The
+server can be used for presence-only applications, or absence verification can
+be added as a production item. The proof is only as fresh as the manifest root
+it verifies against; a later generation may contain the hash.
 
 ## 8. Bloom filter
 
@@ -421,11 +475,14 @@ Present:
 }
 ```
 
-Absent (current server):
+Absent without `?absence=1` (current server):
 
 ```json
 {"present":false,"root":"","prefix":"1234"}
 ```
+
+Absent with `?absence=1` and an existing segment includes `absence_proof` and
+the segment root (see §7.4).
 
 Current Go emits `proof` with capitalized keys as noted in §7.3 and may omit
 `root` for absent lookup. The mobile client:
@@ -440,10 +497,10 @@ Current Go emits `proof` with capitalized keys as noted in §7.3 and may omit
    mismatch is reported as `staleManifest` so the caller can re-sync rather than
    accepting a proof from a newer generation.
 
-`404` is treated as absent for compatibility with older servers. Absence is not
-verified in v1. A local `NO_SEGMENT` answer (no segment for the routing prefix
-in the signed manifest) is stronger: it is evidence from the signed manifest
-itself.
+`404` is treated as absent for compatibility with older servers. Without
+`?absence=1` (and without client-side verification), absence is not verified. A
+local `NO_SEGMENT` answer (no segment for the routing prefix in the signed
+manifest) is stronger: it is evidence from the signed manifest itself.
 
 ## 10. Cache semantics (why Bloom can lie)
 
@@ -496,18 +553,20 @@ Consequences:
 | Server output | Mobile scaffold | Notes |
 |---|---|---|
 | Manifest v1 HMAC-SHA256, absent `signature_alg` | Supported with explicit `hmacLegacy` trust | Current Go default; development only |
-| Manifest v1 Ed25519, `signature_alg:"ed25519"` | Supported with pinned Ed25519 key | Go library supports signing/verify; HTTP/CLI wiring may lag |
+| Manifest v1 Ed25519, `signature_alg:"ed25519"` | Supported with pinned Ed25519 key | Go library/HTTP options support verify; CLI signing flags may lag |
 | Segment format v1 | Supported | Legacy stores |
 | Segment format v2, `compression:"none"` | Supported | Recommended for mobile offline cache |
 | Segment format v2, `compression:"zstd"` | Manifest accepted; segment skipped; remote proofs still work | No zstd dependency in mobile scaffold |
-| `present=false` | Accepted as unverified absence | No absence proof yet |
+| `present=false` without absence proof | Accepted as unverified absence | Mobile does not request `?absence=1` yet |
+| `absence_proof` | Not consumed by mobile | Server supports `?absence=1`; production gap |
 | Lower-case proof keys | Supported | Canonical target |
 | Capitalized proof keys | Supported | Current Go encoder |
 | Unknown manifest field/version | Rejected | Fail closed |
 
-At the time this scaffold was written, `cmd/edgehash` exposed HMAC
-`-key` but not Ed25519/compression flags, and `internal/edgehttp` still loaded
-stores with the HMAC path. Check `edgehash build -h` and the served manifest:
-if it has no `signature_alg:"ed25519"`, do not ship the Ed25519 trust mode
-against that server. This is a server integration gap, not something the mobile
-client can fix.
+At the time this scaffold was written, `cmd/edgehash` exposed HMAC `-key` but
+not Ed25519/compression flags, while `internal/edgehttp` already accepted a
+custom `Verifier`, optional auth/rate/TLS/range, and `?absence=1`. Check
+`edgehash build -h` and the served manifest: if it has no
+`signature_alg:"ed25519"`, do not ship the Ed25519 trust mode against that
+server. This is a server integration gap, not something the mobile client can
+fix.

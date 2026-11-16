@@ -1,10 +1,13 @@
 # EdgeHash mobile SDK scaffold
 
-Status: **scaffold, not a shipped app or SDK**. The Android file has not been
-compiled with an Android toolchain and the iOS file has not been built as an
-iOS app or run on a device. The Swift file was typechecked with
-`swiftc -typecheck` during authoring; that is not an iOS build, an integration
-test, or a correctness proof. See [`TESTING.md`](TESTING.md).
+Status: **scaffold, not a shipped app or SDK**. Neither file was built as an
+Android or iOS application, linked into an app, or run on a device. The Android
+file was compiled on the JVM with Kotlin 2.0.21 against minimal `org.json`
+stubs, and the Swift file was typechecked against the iOS 16 simulator SDK with
+`swiftc -typecheck`; both were exercised against reference vectors in temporary
+harnesses. Those checks catch syntax/type errors and primitive mistakes, not
+Android/iOS integration, HTTP, cache, or device behavior. See
+[`TESTING.md`](TESTING.md).
 
 `mobile/` contains a small, read-only membership client for the immutable edge
 hash set served by `cmd/edgehash`:
@@ -95,12 +98,15 @@ local heuristic. Before production, add a signed monotonic generation or pin a
 minimum fingerprint/checkpoint. See
 [`protocol.md` §11](protocol.md#11-versioning-and-rollback).
 
-Absence is also weaker than presence: v1 has no verifiable absence proof. A
-remote `present=false` is a server assertion. A `NO_SEGMENT` result (the signed
-manifest has no segment for the hash's routing prefix) is evidence from the
-signed manifest itself. Bloom-negative answers are exact for the manifest
-generation they were verified against, but can become false negatives if the
-cached manifest is stale.
+Absence is weaker than presence. A plain remote `present=false` is a server
+assertion. The current Go server can additionally return an `absence_proof` for
+`GET /v1/lookup/{hash}?absence=1` (Merkle non-membership proof, see
+[`protocol.md` §7.4](protocol.md#74-absence)), but **this mobile scaffold does
+not request or verify it yet**. A `NO_SEGMENT` result (the signed manifest has
+no segment for the hash's routing prefix) is evidence from the signed manifest
+itself. Bloom-negative answers are exact for the manifest generation they were
+verified against, but can become false negatives if the cached manifest is
+stale.
 
 ## Cache policy
 
@@ -172,6 +178,9 @@ Add `INTERNET` and `ACCESS_NETWORK_STATE` permissions. Do not use
 iOS:
 
 ```swift
+import Network
+import UIKit
+
 final class DeviceConditionsAdapter: DeviceConditions {
     private let monitor = NWPathMonitor()
     private var path: NWPath?
@@ -311,10 +320,11 @@ scaffolding to adapt, not as a build verified in this repository.
 
 Serve an HTTPS endpoint whose manifest has `signature_alg:"ed25519"` and whose
 segments are v1 or v2 `"none"` if you want an offline mobile cache. The current
-Go tree has Ed25519 and v2 compression support in `internal/edgeset`, but the
-`edgehash` CLI/HTTP wiring may still expose only the HMAC path. Check
-`edgehash build -h`, `edgehash serve -h`, and the actual `/v1/manifest` body
-before choosing `TrustConfig.ed25519`. For development, use `hmacLegacy` and a
+Go tree has Ed25519 and v2 compression support in `internal/edgeset`, and
+`edgehttp.NewServerWithOptions` accepts an Ed25519 verifier, but the `edgehash`
+CLI may still expose only the HMAC path. Check `edgehash build -h`,
+`edgehash serve -h`, and the actual `/v1/manifest` body before choosing
+`TrustConfig.ed25519`. For development, use `hmacLegacy` and a
 tiny 3-hash store (small segments auto-select uncompressed v2).
 
 See [`TESTING.md`](TESTING.md) for `curl` commands and emulator/simulator host
@@ -324,21 +334,31 @@ mapping.
 
 Protocol / server integration:
 
-- Ed25519 signing exists in the Go library but the HTTP/CLI path is not
-  guaranteed to expose it yet. Do not ship until `signature_alg:"ed25519"` is
-  actually served and tested end to end.
+- Ed25519 signing/verification exists in the Go library and
+  `edgehttp.NewServerWithOptions` accepts an Ed25519 verifier, but the
+  `edgehash` CLI flags may still expose only HMAC. Do not ship until
+  `signature_alg:"ed25519"` is actually served and tested end to end.
 - The current Go proof JSON uses capitalized keys; the SDK accepts both. New
   servers should emit lower-case keys.
 - `signature` is base64 in the current Go JSON; the SDK accepts base64 and hex.
   Pick one in the next wire revision.
-- No absence proof over HTTP yet. `present=false` is unverified.
+- The current Go server supports `GET /v1/lookup/{hash}?absence=1` and
+  `absence_proof`; the mobile scaffold neither requests nor verifies absence
+  proofs. A plain remote `present=false` remains unverified. Add an
+  `AbsenceProof` model and verify it against the signed segment root before
+  treating absence as proof (production TODO).
 - No signed generation/timestamp/expiry/rollback protection; no key rotation.
-- No TLS certificate pinning, auth, rate limiting or server-side quota.
+- The mobile transports do not send an `Authorization: Bearer` token and do not
+  use HTTP Range requests. The server supports optional bearer auth, per-IP
+  rate limiting, TLS, byte ranges and a segment-size cap via
+  `edgehttp.Options`; protected endpoints require adding a token header to the
+  transport, and CDN/range optimization is not implemented.
+- No TLS certificate pinning or client-side rate limiting.
 - No zstd decoder in the mobile scaffold. zstd segments are skipped for local
   caching and resolved remotely. This means offline coverage is limited to v1
   or v2 `"none"` segments.
 - `version` is schema version, not a data generation. Use the fingerprint.
-- No multi-server failover, CDN discovery, or range requests.
+- No multi-server failover or CDN discovery.
 
 Client / app integration:
 
@@ -374,7 +394,9 @@ Before production:
    with the vectors.
 3. Decide zstd support (platform library or server `"none"` policy) and prove
    it with decompression-bomb and size-limit tests.
-4. Add freshness/rollback protection and key rotation.
-5. Harden file I/O, quota accounting, and background/network transitions on
+4. Add absence-proof request/verification (`?absence=1`) if offline absence
+   matters to the product.
+5. Add freshness/rollback protection and key rotation.
+6. Harden file I/O, quota accounting, and background/network transitions on
    real devices.
-6. Perform a security review of trust, replay, absence, and cache poisoning.
+7. Perform a security review of trust, replay, absence, and cache poisoning.

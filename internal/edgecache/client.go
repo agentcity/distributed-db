@@ -2,6 +2,7 @@ package edgecache
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -17,19 +18,26 @@ import (
 
 // lookupResponse mirrors the server's GET /v1/lookup/{hash} response.
 type lookupResponse struct {
-	Present bool           `json:"present"`
-	Proof   *edgeset.Proof `json:"proof"`
-	Root    string         `json:"root"`
-	Prefix  string         `json:"prefix"`
+	Present      bool                  `json:"present"`
+	Proof        *edgeset.Proof        `json:"proof"`
+	AbsenceProof *edgeset.AbsenceProof `json:"absence_proof"`
+	Root         string                `json:"root"`
+	Prefix       string                `json:"prefix"`
 }
 
 // RemoteLookup asks a server directly for h, without materializing a cache. It
-// verifies the manifest signature (when key is non-empty) and any returned
-// Merkle proof against the manifest root. It is used by the lookup CLI and is
-// suitable for one-off checks; long-lived clients should use New/Sync.
+// verifies the manifest signature (with opts.Verifier or the legacy HMAC key)
+// and any returned Merkle proof against the manifest root. Absence proofs are
+// requested and verified when the server returns one.
+//
+// It is used by the lookup CLI and is suitable for one-off checks; long-lived
+// clients should use New/Sync.
 func RemoteLookup(ctx context.Context, serverURL string, key []byte, h edgeset.Hash, opts Options) (LookupResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := validateOptions(opts); err != nil {
+		return LookupResult{}, err
 	}
 	baseURL, err := normalizeServerURL(serverURL)
 	if err != nil {
@@ -39,7 +47,7 @@ func RemoteLookup(ctx context.Context, serverURL string, key []byte, h edgeset.H
 	if err != nil {
 		return LookupResult{}, err
 	}
-	_, manifest, err := fetchManifest(ctx, baseURL, client, key)
+	_, manifest, err := fetchManifest(ctx, baseURL, client, opts.AuthToken, verifierFor(key, opts))
 	if err != nil {
 		return LookupResult{}, err
 	}
@@ -48,21 +56,21 @@ func RemoteLookup(ctx context.Context, serverURL string, key []byte, h edgeset.H
 	if !ok {
 		return LookupResult{Prefix: prefix}, nil
 	}
-	return lookupRemote(ctx, baseURL, client, h, prefix, meta)
+	return lookupRemote(ctx, baseURL, client, opts.AuthToken, h, prefix, meta)
 }
 
 func (c *Cache) lookupRemote(ctx context.Context, h edgeset.Hash, prefix uint16, meta edgeset.SegmentMeta) (LookupResult, error) {
-	return lookupRemote(ctx, c.baseURL, c.client, h, prefix, meta)
+	return lookupRemote(ctx, c.baseURL, c.client, c.authToken, h, prefix, meta)
 }
 
-func lookupRemote(ctx context.Context, baseURL string, client *http.Client, h edgeset.Hash, prefix uint16, meta edgeset.SegmentMeta) (LookupResult, error) {
-	requestURL := baseURL + "/v1/lookup/" + h.String()
+func lookupRemote(ctx context.Context, baseURL string, client *http.Client, authToken string, h edgeset.Hash, prefix uint16, meta edgeset.SegmentMeta) (LookupResult, error) {
+	requestURL := baseURL + "/v1/lookup/" + h.String() + "?absence=1"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return LookupResult{}, fmt.Errorf("edgecache: build lookup request: %w", err)
 	}
+	setRequestHeaders(req, authToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "edgehash-cache/1")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -86,21 +94,39 @@ func lookupRemote(ctx context.Context, baseURL string, client *http.Client, h ed
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return LookupResult{}, fmt.Errorf("edgecache: decode lookup response: %w", err)
 	}
-	result := LookupResult{Prefix: prefix}
-	if !wire.Present {
-		return result, nil
-	}
-	if wire.Proof == nil {
-		return LookupResult{}, fmt.Errorf("%w: server returned present without a proof", ErrInvalidProof)
-	}
-	if wire.Proof.Hash != h {
-		return LookupResult{}, fmt.Errorf("%w: proof is for a different hash", ErrInvalidProof)
-	}
 	if wire.Prefix != "" {
 		want := fmt.Sprintf("%04x", prefix)
 		if !strings.EqualFold(wire.Prefix, want) {
 			return LookupResult{}, fmt.Errorf("%w: response prefix %q, want %q", ErrInvalidProof, wire.Prefix, want)
 		}
+	}
+
+	result := LookupResult{Prefix: prefix}
+	if !wire.Present {
+		if wire.Root != "" {
+			root, err := edgeset.ParseHash(wire.Root)
+			if err != nil {
+				return LookupResult{}, fmt.Errorf("%w: invalid response root", ErrInvalidProof)
+			}
+			if root != meta.Root {
+				return LookupResult{}, ErrStaleManifest
+			}
+		}
+		if wire.AbsenceProof != nil {
+			if !edgeset.VerifyAbsence(meta.Root, h, wire.AbsenceProof) {
+				return LookupResult{}, fmt.Errorf("%w: absence proof does not verify", ErrInvalidProof)
+			}
+			result.AbsenceProof = wire.AbsenceProof
+			result.Root = meta.Root
+		}
+		return result, nil
+	}
+
+	if wire.Proof == nil {
+		return LookupResult{}, fmt.Errorf("%w: server returned present without a proof", ErrInvalidProof)
+	}
+	if wire.Proof.Hash != h {
+		return LookupResult{}, fmt.Errorf("%w: proof is for a different hash", ErrInvalidProof)
 	}
 	if wire.Root != "" {
 		root, err := edgeset.ParseHash(wire.Root)
@@ -120,14 +146,14 @@ func lookupRemote(ctx context.Context, baseURL string, client *http.Client, h ed
 	return result, nil
 }
 
-func fetchManifest(ctx context.Context, baseURL string, client *http.Client, key []byte) ([]byte, *edgeset.Manifest, error) {
+func fetchManifest(ctx context.Context, baseURL string, client *http.Client, authToken string, verifier edgeset.Verifier) ([]byte, *edgeset.Manifest, error) {
 	requestURL := baseURL + "/v1/manifest"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("edgecache: build manifest request: %w", err)
 	}
+	setRequestHeaders(req, authToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "edgehash-cache/1")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -141,23 +167,23 @@ func fetchManifest(ctx context.Context, baseURL string, client *http.Client, key
 	if err != nil {
 		return nil, nil, fmt.Errorf("edgecache: read manifest: %w", err)
 	}
-	manifest, err := decodeManifest(raw, key)
+	manifest, err := decodeManifest(raw, verifier)
 	if err != nil {
 		return nil, nil, err
 	}
 	return raw, manifest, nil
 }
 
-func (c *Cache) downloadSegment(ctx context.Context, meta edgeset.SegmentMeta, dst string) error {
-	requestURL := fmt.Sprintf("%s/v1/segment/%04x", c.baseURL, meta.Prefix)
+func downloadSegment(ctx context.Context, baseURL string, client *http.Client, authToken string, meta edgeset.SegmentMeta, dst string) error {
+	requestURL := fmt.Sprintf("%s/v1/segment/%04x", baseURL, meta.Prefix)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return fmt.Errorf("edgecache: build segment request: %w", err)
 	}
+	setRequestHeaders(req, authToken)
 	req.Header.Set("Accept", "application/octet-stream")
-	req.Header.Set("User-Agent", "edgehash-cache/1")
 
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("edgecache: fetch segment %04x: %w", meta.Prefix, err)
 	}
@@ -206,13 +232,69 @@ func (c *Cache) downloadSegment(ctx context.Context, meta edgeset.SegmentMeta, d
 	return nil
 }
 
-func decodeManifest(raw []byte, key []byte) (*edgeset.Manifest, error) {
+// reuseSegment hard-links an already verified segment from the previous
+// generation into the staging generation, falling back to a verified copy.
+func reuseSegment(sourceDir, dst string, meta edgeset.SegmentMeta) error {
+	src := filepath.Join(sourceDir, filepath.FromSlash(meta.File))
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	return copyVerifiedSegment(src, dst, meta)
+}
+
+// copyVerifiedSegment copies and checksum-verifies a segment when hard-linking
+// is not possible (for example across filesystems).
+func copyVerifiedSegment(src, dst string, meta edgeset.SegmentMeta) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	remove := true
+	defer func() {
+		if remove {
+			_ = os.Remove(dst)
+		}
+	}()
+	hasher := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(out, hasher), io.LimitReader(in, meta.Size+1))
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	switch {
+	case copyErr != nil:
+		return copyErr
+	case syncErr != nil:
+		return syncErr
+	case closeErr != nil:
+		return closeErr
+	case written != meta.Size:
+		return fmt.Errorf("edgecache: reused segment %04x has %d bytes, want %d", meta.Prefix, written, meta.Size)
+	}
+	var sum edgeset.Hash
+	copy(sum[:], hasher.Sum(nil))
+	if sum != meta.SHA256 {
+		return fmt.Errorf("edgecache: reused segment %04x checksum mismatch", meta.Prefix)
+	}
+	if err := os.Chmod(dst, 0o644); err != nil {
+		return err
+	}
+	remove = false
+	return nil
+}
+
+func decodeManifest(raw []byte, verifier edgeset.Verifier) (*edgeset.Manifest, error) {
 	var manifest edgeset.Manifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, fmt.Errorf("%w: decode: %w", ErrInvalidManifest, err)
 	}
-	if err := edgeset.VerifyManifest(&manifest, key); err != nil {
-		return nil, fmt.Errorf("edgecache: verify manifest: %w", err)
+	if verifier != nil {
+		if err := verifier.VerifyManifest(&manifest); err != nil {
+			return nil, fmt.Errorf("edgecache: verify manifest: %w", err)
+		}
 	}
 	if err := validateManifest(&manifest); err != nil {
 		return nil, err
@@ -230,8 +312,17 @@ func validateManifest(manifest *edgeset.Manifest) error {
 	if manifest.PrefixBytes < 1 || manifest.PrefixBytes > 4 {
 		return fmt.Errorf("%w: prefix bytes %d outside 1..4", ErrInvalidManifest, manifest.PrefixBytes)
 	}
-	if len(manifest.Signature) != 0 && len(manifest.Signature) != sha256.Size {
-		return fmt.Errorf("%w: signature length %d, want 0 or %d", ErrInvalidManifest, len(manifest.Signature), sha256.Size)
+	switch manifest.SignatureAlg {
+	case "", edgeset.SignatureAlgHMACSHA256:
+		if len(manifest.Signature) != 0 && len(manifest.Signature) != sha256.Size {
+			return fmt.Errorf("%w: HMAC signature length %d, want 0 or %d", ErrInvalidManifest, len(manifest.Signature), sha256.Size)
+		}
+	case edgeset.SignatureAlgEd25519:
+		if len(manifest.Signature) != ed25519.SignatureSize {
+			return fmt.Errorf("%w: ed25519 signature length %d, want %d", ErrInvalidManifest, len(manifest.Signature), ed25519.SignatureSize)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported signature algorithm %q", ErrInvalidManifest, manifest.SignatureAlg)
 	}
 
 	maxSegments := 1 << 8
@@ -262,6 +353,11 @@ func validateManifest(manifest *edgeset.Manifest) error {
 		}
 		if meta.Size <= 0 || meta.Size > maxSegmentBytes {
 			return fmt.Errorf("%w: segment %04x has invalid size %d", ErrInvalidManifest, meta.Prefix, meta.Size)
+		}
+		switch meta.Compression {
+		case "", edgeset.CompressionNone, edgeset.CompressionZstd:
+		default:
+			return fmt.Errorf("%w: segment %04x has unknown compression %q", ErrInvalidManifest, meta.Prefix, meta.Compression)
 		}
 		wantFile := fmt.Sprintf("segments/%04x.seg", meta.Prefix)
 		if meta.File != wantFile {
@@ -323,6 +419,13 @@ func newHTTPClient(opts Options) (*http.Client, error) {
 	return client, nil
 }
 
+func setRequestHeaders(req *http.Request, authToken string) {
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	req.Header.Set("User-Agent", "edgehash-cache/2")
+}
+
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	raw, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
@@ -352,6 +455,7 @@ func prefixFor(h edgeset.Hash, prefixBytes int) uint16 {
 
 // writeFileAtomic writes data to a temporary file in the destination directory
 // and renames it into place, so readers see either the old or the new file.
+// The containing directory is fsynced after the rename.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
@@ -384,5 +488,8 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("edgecache: install %s: %w", filepath.Base(path), err)
 	}
 	cleanup = false
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("edgecache: sync directory for %s: %w", filepath.Base(path), err)
+	}
 	return nil
 }

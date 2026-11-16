@@ -324,7 +324,7 @@ enum class LookupSource {
     /** Remote lookup returned an inclusion proof that verified against the signed root. */
     REMOTE_PROOF,
 
-    /** Remote lookup said present=false. v1 has no verifiable absence proof. */
+    /** Remote lookup said present=false without a verified absence proof. */
     REMOTE_ABSENT,
 }
 
@@ -335,7 +335,8 @@ data class LookupResult(
     val source: LookupSource,
     /**
      * True when the answer is derived from a verified manifest/segment/proof.
-     * v1 remote absence and (by policy) stale answers are not verified.
+     * Remote absence without an absence proof (not implemented here) and stale
+     * negative answers are not treated as verified.
      */
     val verified: Boolean,
     val staleManifest: Boolean,
@@ -1895,7 +1896,7 @@ class EdgeHashClient(
             null,
         )
         if (response.statusCode == HttpURLConnection.HTTP_NOT_FOUND) {
-            // Compatibility with older servers; v1 absence is not verifiable.
+            // Compatibility with older servers; absence is unverified here.
             return LookupResult(
                 present = false,
                 prefix = prefix,

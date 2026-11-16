@@ -58,22 +58,26 @@ func (h *countingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.next.ServeHTTP(w, r)
 }
 
+type handlerHolder struct {
+	next http.Handler
+}
+
 type switchHandler struct {
-	handler atomic.Value
+	handler atomic.Value // stores handlerHolder
 }
 
 func newSwitchHandler(next http.Handler) *switchHandler {
 	h := &switchHandler{}
-	h.handler.Store(next)
+	h.handler.Store(handlerHolder{next: next})
 	return h
 }
 
 func (h *switchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.handler.Load().(http.Handler).ServeHTTP(w, r)
+	h.handler.Load().(handlerHolder).next.ServeHTTP(w, r)
 }
 
 func (h *switchHandler) Set(next http.Handler) {
-	h.handler.Store(next)
+	h.handler.Store(handlerHolder{next: next})
 }
 
 func newCache(t *testing.T, serverURL, dir string, key []byte, opts edgecache.Options) *edgecache.Cache {
@@ -107,9 +111,9 @@ func TestSyncAllAndLocalLookups(t *testing.T) {
 		t.Fatal("cache not synced after Sync")
 	}
 
-	// With the default all-segment policy the materialized cache is a fully
+	// With the default all-segment policy the active generation is a fully
 	// signed edgeset store loadable with the key.
-	materialized, loaded, err := edgeset.LoadStore(cacheDir, key)
+	materialized, loaded, err := edgeset.LoadStore(cache.GenerationDir(), key)
 	if err != nil {
 		t.Fatalf("LoadStore(materialized): %v", err)
 	}
@@ -201,7 +205,7 @@ func TestSyncPrefixFilterAndRemoteLookups(t *testing.T) {
 
 	// Only the selected segment is materialized. The partial manifest is
 	// unsigned, so it is loaded without a key.
-	local, materialized, err := edgeset.LoadStore(cacheDir, nil)
+	local, materialized, err := edgeset.LoadStore(cache.GenerationDir(), nil)
 	if err != nil {
 		t.Fatalf("LoadStore(filtered): %v", err)
 	}
@@ -211,7 +215,7 @@ func TestSyncPrefixFilterAndRemoteLookups(t *testing.T) {
 	if local.TotalCount() != 2 {
 		t.Fatalf("filtered total = %d, want 2", local.TotalCount())
 	}
-	if _, err := os.Stat(filepath.Join(cacheDir, "segments", "1111.seg")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(cache.GenerationDir(), "segments", "1111.seg")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unselected segment was downloaded: %v", err)
 	}
 
@@ -323,8 +327,9 @@ func TestSyncStaleManifestUpdate(t *testing.T) {
 		t.Fatal("old hash still reported present after update")
 	}
 
-	// The single segment file must have been replaced, not duplicated.
-	files, err := filepath.Glob(filepath.Join(cacheDir, "segments", "*.seg"))
+	// The active generation must contain exactly the new segment. The previous
+	// generation remains on disk as the crash-recovery fallback.
+	files, err := filepath.Glob(filepath.Join(cache.GenerationDir(), "segments", "*.seg"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +408,7 @@ func TestLocalTamperRejectedThenRepaired(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 
-	path := filepath.Join(cacheDir, filepath.FromSlash(manifest.Segments[0].File))
+	path := filepath.Join(first.GenerationDir(), filepath.FromSlash(manifest.Segments[0].File))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
