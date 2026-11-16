@@ -494,3 +494,160 @@ func TestParseGroupBy(t *testing.T) {
 		}
 	}
 }
+
+func TestParseJoin(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want *Select
+	}{
+		{
+			name: "join with aliases where and limit",
+			sql:  `SELECT u.name, o.total FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE o.total = 100 LIMIT 5`,
+			want: &Select{
+				Table:   "users",
+				Columns: []string{"u.name", "o.total"},
+				Join: &JoinClause{
+					LeftTable:   "users",
+					RightTable:  "orders",
+					LeftAlias:   "u",
+					RightAlias:  "o",
+					LeftColumn:  "u.id",
+					RightColumn: "o.user_id",
+				},
+				Where: &Condition{Column: "o.total", Value: Value{Kind: ValueInt, Int: 100}},
+				Limit: 5,
+			},
+		},
+		{
+			name: "select star join without aliases",
+			sql:  `select * from users join orders on users.id = orders.user_id limit 2`,
+			want: &Select{
+				Table:   "users",
+				Columns: []string{"*"},
+				Join: &JoinClause{
+					LeftTable:   "users",
+					RightTable:  "orders",
+					LeftColumn:  "users.id",
+					RightColumn: "orders.user_id",
+				},
+				Limit: 2,
+			},
+		},
+		{
+			name: "inner join keyword",
+			sql:  `SELECT u.id FROM users AS u INNER JOIN orders AS o ON u.id = o.user_id`,
+			want: &Select{
+				Table:   "users",
+				Columns: []string{"u.id"},
+				Join: &JoinClause{
+					LeftTable:   "users",
+					RightTable:  "orders",
+					LeftAlias:   "u",
+					RightAlias:  "o",
+					LeftColumn:  "u.id",
+					RightColumn: "o.user_id",
+				},
+			},
+		},
+		{
+			name: "unqualified on columns",
+			sql:  `SELECT * FROM a JOIN b ON id = ref`,
+			want: &Select{
+				Table:   "a",
+				Columns: []string{"*"},
+				Join: &JoinClause{
+					LeftTable:   "a",
+					RightTable:  "b",
+					LeftColumn:  "id",
+					RightColumn: "ref",
+				},
+			},
+		},
+		{
+			name: "mixed case join keywords",
+			sql:  `SeLeCt U.Name FrOm Users AS U jOiN Orders As O oN U.Id = O.User_Id WhErE U.Id = 1;`,
+			want: &Select{
+				Table:   "Users",
+				Columns: []string{"U.Name"},
+				Join: &JoinClause{
+					LeftTable:   "Users",
+					RightTable:  "Orders",
+					LeftAlias:   "U",
+					RightAlias:  "O",
+					LeftColumn:  "U.Id",
+					RightColumn: "O.User_Id",
+				},
+				Where: &Condition{Column: "U.Id", Value: Value{Kind: ValueInt, Int: 1}},
+			},
+		},
+		{
+			name: "left alias only",
+			sql:  `SELECT * FROM users AS u JOIN orders ON u.id = orders.user_id`,
+			want: &Select{
+				Table:   "users",
+				Columns: []string{"*"},
+				Join: &JoinClause{
+					LeftTable:   "users",
+					RightTable:  "orders",
+					LeftAlias:   "u",
+					LeftColumn:  "u.id",
+					RightColumn: "orders.user_id",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt, err := Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tt.sql, err)
+			}
+			if !reflect.DeepEqual(stmt, tt.want) {
+				t.Fatalf("Parse(%q)\n got: %#v\nwant: %#v", tt.sql, stmt, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseJoinErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{name: "missing on", sql: `SELECT * FROM a JOIN b`},
+		{name: "missing equals", sql: `SELECT * FROM a JOIN b ON a.id`},
+		{name: "missing right column", sql: `SELECT * FROM a JOIN b ON a.id =`},
+		{name: "missing left column", sql: `SELECT * FROM a JOIN b ON = b.id`},
+		{name: "missing right table", sql: `SELECT * FROM a JOIN ON a.id = b.id`},
+		{name: "second join", sql: `SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id`},
+		{name: "second inner join", sql: `SELECT * FROM a JOIN b ON a.id = b.id INNER JOIN c ON b.id = c.id`},
+		{name: "left join unsupported", sql: `SELECT * FROM a LEFT JOIN b ON a.id = b.id`},
+		{name: "right join unsupported", sql: `SELECT * FROM a RIGHT JOIN b ON a.id = b.id`},
+		{name: "cross join unsupported", sql: `SELECT * FROM a CROSS JOIN b ON a.id = b.id`},
+		{name: "self join without aliases", sql: `SELECT * FROM t JOIN t ON t.id = t.id`},
+		{name: "duplicate alias", sql: `SELECT * FROM a AS x JOIN b AS x ON x.id = x.id`},
+		{name: "alias without join", sql: `SELECT * FROM a AS x`},
+		{name: "join target qualified", sql: `SELECT * FROM a JOIN db.b ON a.id = b.id`},
+		{name: "non equality operator", sql: `SELECT * FROM a JOIN b ON a.id != b.id`},
+		{name: "non equality greater", sql: `SELECT * FROM a JOIN b ON a.id > b.id`},
+		{name: "double equals", sql: `SELECT * FROM a JOIN b ON a.id = b.id = c.id`},
+		{name: "and after on", sql: `SELECT * FROM a JOIN b ON a.id = b.id AND a.x = 1`},
+		{name: "star plus column", sql: `SELECT *, a.id FROM a JOIN b ON a.id = b.id`},
+		{name: "qualified star", sql: `SELECT a.* FROM a JOIN b ON a.id = b.id`},
+		{name: "where and", sql: `SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x = 1 AND b.y = 2`},
+		{name: "group by with join", sql: `SELECT COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY a.x`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt, err := Parse(tt.sql)
+			if err == nil {
+				t.Fatalf("Parse(%q) = %#v, want error", tt.sql, stmt)
+			}
+			var pe *ParseError
+			if !errors.As(err, &pe) {
+				t.Fatalf("Parse(%q) error type = %T, want *ParseError", tt.sql, err)
+			}
+		})
+	}
+}

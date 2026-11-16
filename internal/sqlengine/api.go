@@ -5,8 +5,9 @@
 //	row:     0x02 | tableID(8 BE) | pk -> JSON row
 //
 // P0 supports a single-column primary key (INT or TEXT), point lookups by
-// primary key and full-table scans. It deliberately has no joins, secondary
-// indexes or SQL planner.
+// primary key, full-table scans and one INNER JOIN with an equality predicate.
+// It deliberately has no join planner, multiple joins or non-equality join
+// conditions.
 package sqlengine
 
 import "context"

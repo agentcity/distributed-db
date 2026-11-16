@@ -23,6 +23,7 @@ const (
 	tokenEq
 	tokenPlus
 	tokenMinus
+	tokenDot
 )
 
 // token is one lexical token and its byte offset in the input.
@@ -100,6 +101,8 @@ func lex(sql string) ([]token, *ParseError) {
 				kind = tokenPlus
 			case '-':
 				kind = tokenMinus
+			case '.':
+				kind = tokenDot
 			default:
 				return nil, &ParseError{Pos: i, Msg: fmt.Sprintf("unexpected character %q", c)}
 			}

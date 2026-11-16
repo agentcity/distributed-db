@@ -347,7 +347,8 @@ func (p *parser) tryParseAggregate() (*Aggregate, bool, error) {
 	return agg, true, nil
 }
 
-// parseSelect parses SELECT *|col[, ...] FROM name [WHERE ...]
+// parseSelect parses SELECT *|col[, ...] FROM name [AS alias]
+// [INNER] JOIN name [AS alias] ON col = col [WHERE ...]
 // [GROUP BY col] [LIMIT n]. GROUP BY is only valid with an aggregate.
 func (p *parser) parseSelect() (Statement, error) {
 	sel := &Select{}
@@ -360,11 +361,11 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.Aggregate = agg
 	} else {
 		for {
-			col, err := p.expectIdent("column name")
+			col, err := p.parseColumnRef("column name")
 			if err != nil {
 				return nil, err
 			}
-			sel.Columns = append(sel.Columns, col.text)
+			sel.Columns = append(sel.Columns, col)
 			if p.peek().kind == tokenComma {
 				p.next()
 				continue
@@ -382,6 +383,39 @@ func (p *parser) parseSelect() (Statement, error) {
 	}
 	sel.Table = table.text
 
+	leftAlias := ""
+	aliasTok := p.peek()
+	if p.matchKeyword("AS") {
+		alias, err := p.expectIdent("table alias")
+		if err != nil {
+			return nil, err
+		}
+		leftAlias = alias.text
+	}
+
+	joined := false
+	switch {
+	case p.matchKeyword("INNER"):
+		if err := p.expectKeyword("JOIN", " after INNER"); err != nil {
+			return nil, err
+		}
+		joined = true
+	case p.matchKeyword("JOIN"):
+		joined = true
+	case isJoinStartToken(p.peek()):
+		return nil, p.errorf(p.peek().pos, "only INNER JOIN is supported")
+	case leftAlias != "":
+		return nil, p.errorf(aliasTok.pos, "table alias requires a JOIN")
+	}
+
+	if joined {
+		join, err := p.parseJoin(sel.Table, leftAlias)
+		if err != nil {
+			return nil, err
+		}
+		sel.Join = join
+	}
+
 	if p.matchKeyword("WHERE") {
 		cond, err := p.parseCondition()
 		if err != nil {
@@ -390,6 +424,9 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.Where = cond
 	}
 	if groupTok := p.peek(); isKeyword(groupTok, "GROUP") {
+		if sel.Join != nil {
+			return nil, p.errorf(groupTok.pos, "GROUP BY is not supported with JOIN")
+		}
 		if sel.Aggregate == nil {
 			return nil, p.errorf(groupTok.pos, "GROUP BY requires an aggregate")
 		}
@@ -414,6 +451,76 @@ func (p *parser) parseSelect() (Statement, error) {
 		sel.Limit = limit
 	}
 	return sel, nil
+}
+
+// parseJoin parses the tail of the one supported join after FROM/table/alias:
+// [INNER] JOIN table [AS alias] ON col = col. It rejects a second JOIN.
+func (p *parser) parseJoin(leftTable, leftAlias string) (*JoinClause, error) {
+	rightTable, err := p.expectIdent("table name after JOIN")
+	if err != nil {
+		return nil, err
+	}
+	rightAlias := ""
+	if p.matchKeyword("AS") {
+		alias, err := p.expectIdent("table alias after JOIN")
+		if err != nil {
+			return nil, err
+		}
+		rightAlias = alias.text
+	}
+	if p.peek().kind == tokenDot {
+		return nil, p.errorf(p.peek().pos, "unexpected '.' after JOIN target")
+	}
+
+	leftQualifier := leftAlias
+	if leftQualifier == "" {
+		leftQualifier = leftTable
+	}
+	rightQualifier := rightAlias
+	if rightQualifier == "" {
+		rightQualifier = rightTable.text
+	}
+	// Without distinct qualifiers there is no way to say which side a
+	// qualified reference belongs to, so require aliases for self-joins.
+	if strings.EqualFold(leftQualifier, rightQualifier) {
+		return nil, p.errorf(rightTable.pos, "JOIN requires distinct aliases for table %q", rightQualifier)
+	}
+
+	if err := p.expectKeyword("ON", " after JOIN target"); err != nil {
+		return nil, err
+	}
+	leftCol, err := p.parseColumnRef("left column in JOIN ON")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKind(tokenEq, "'=' in JOIN ON condition"); err != nil {
+		return nil, err
+	}
+	rightCol, err := p.parseColumnRef("right column in JOIN ON")
+	if err != nil {
+		return nil, err
+	}
+	if t := p.peek(); isJoinStartToken(t) {
+		return nil, p.errorf(t.pos, "only one JOIN is supported")
+	}
+	return &JoinClause{
+		LeftTable:   leftTable,
+		RightTable:  rightTable.text,
+		LeftAlias:   leftAlias,
+		RightAlias:  rightAlias,
+		LeftColumn:  leftCol,
+		RightColumn: rightCol,
+	}, nil
+}
+
+// isJoinStartToken reports whether t begins a join clause (including the
+// unsupported variants), so the parser can reject it with a clear message.
+func isJoinStartToken(t token) bool {
+	switch strings.ToUpper(t.text) {
+	case "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER":
+		return t.kind == tokenIdent
+	}
+	return false
 }
 
 // parseUpdate parses UPDATE name SET col = literal[, ...] [WHERE ...].
@@ -476,9 +583,28 @@ func (p *parser) parseDelete() (Statement, error) {
 	return del, nil
 }
 
+// parseColumnRef parses a column reference, optionally qualified with a table
+// name or alias ("alias.column"). The original spelling is preserved so the
+// engine can resolve it against the select's tables.
+func (p *parser) parseColumnRef(what string) (string, *ParseError) {
+	first, err := p.expectIdent(what)
+	if err != nil {
+		return "", err
+	}
+	if p.peek().kind != tokenDot {
+		return first.text, nil
+	}
+	p.next()
+	second, err := p.expectIdent("column name after '.'")
+	if err != nil {
+		return "", err
+	}
+	return first.text + "." + second.text, nil
+}
+
 // parseCondition parses the only supported WHERE form: col = literal.
 func (p *parser) parseCondition() (*Condition, error) {
-	col, err := p.expectIdent("column name in WHERE")
+	col, err := p.parseColumnRef("column name in WHERE")
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +615,7 @@ func (p *parser) parseCondition() (*Condition, error) {
 	if litErr != nil {
 		return nil, litErr
 	}
-	return &Condition{Column: col.text, Value: v}, nil
+	return &Condition{Column: col, Value: v}, nil
 }
 
 // parseLiteral parses a signed decimal integer or a single-quoted string.
@@ -563,6 +689,8 @@ func describeToken(t token) string {
 		return "'+'"
 	case tokenMinus:
 		return "'-'"
+	case tokenDot:
+		return "'.'"
 	default:
 		return "token"
 	}

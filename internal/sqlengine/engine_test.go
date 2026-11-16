@@ -435,3 +435,181 @@ func TestSQLGroupBy(t *testing.T) {
 		}
 	}
 }
+
+// joinFixture builds the users/orders data set used by the join tests.
+//
+//	users:  (1, alice) (2, bob) (3, carol)
+//	orders: (10, user 1, 100) (11, user 1, 150) (12, user 2, 200) (13, user 4, 50)
+func joinFixture(t *testing.T) *Engine {
+	t.Helper()
+	e := New(newFakeClient())
+	exec(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	exec(t, e, "INSERT INTO users VALUES (1, 'alice')")
+	exec(t, e, "INSERT INTO users VALUES (2, 'bob')")
+	exec(t, e, "INSERT INTO users VALUES (3, 'carol')")
+	exec(t, e, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT)")
+	exec(t, e, "INSERT INTO orders VALUES (10, 1, 100)")
+	exec(t, e, "INSERT INTO orders VALUES (11, 1, 150)")
+	exec(t, e, "INSERT INTO orders VALUES (12, 2, 200)")
+	exec(t, e, "INSERT INTO orders VALUES (13, 4, 50)")
+	exec(t, e, "CREATE TABLE empty_orders (id INT PRIMARY KEY, user_id INT)")
+	exec(t, e, "CREATE TABLE codes (id INT PRIMARY KEY, code TEXT)")
+	exec(t, e, "CREATE TABLE nicknames (id INT PRIMARY KEY, nick TEXT)")
+	exec(t, e, "INSERT INTO nicknames VALUES (1, 'alice')")
+	exec(t, e, "INSERT INTO nicknames VALUES (2, 'bob')")
+	return e
+}
+
+func TestSQLJoin(t *testing.T) {
+	e := joinFixture(t)
+	cases := []struct {
+		name string
+		sql  string
+		cols []string
+		rows [][]any
+	}{
+		{
+			name: "basic join without aliases",
+			sql:  "SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id",
+			cols: []string{"name", "total"},
+			rows: [][]any{{"alice", int64(100)}, {"alice", int64(150)}, {"bob", int64(200)}},
+		},
+		{
+			name: "aliases",
+			sql:  "SELECT u.name, o.total FROM users AS u JOIN orders AS o ON u.id = o.user_id",
+			cols: []string{"name", "total"},
+			rows: [][]any{{"alice", int64(100)}, {"alice", int64(150)}, {"bob", int64(200)}},
+		},
+		{
+			name: "inner join keyword",
+			sql:  "SELECT u.name, o.total FROM users AS u INNER JOIN orders AS o ON u.id = o.user_id",
+			cols: []string{"name", "total"},
+			rows: [][]any{{"alice", int64(100)}, {"alice", int64(150)}, {"bob", int64(200)}},
+		},
+		{
+			name: "select star qualified left then right",
+			sql:  "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id",
+			cols: []string{"u.id", "u.name", "o.id", "o.user_id", "o.total"},
+			rows: [][]any{
+				{int64(1), "alice", int64(10), int64(1), int64(100)},
+				{int64(1), "alice", int64(11), int64(1), int64(150)},
+				{int64(2), "bob", int64(12), int64(2), int64(200)},
+			},
+		},
+		{
+			name: "select star without aliases uses table names",
+			sql:  "SELECT * FROM users JOIN orders ON users.id = orders.user_id",
+			cols: []string{"users.id", "users.name", "orders.id", "orders.user_id", "orders.total"},
+			rows: [][]any{
+				{int64(1), "alice", int64(10), int64(1), int64(100)},
+				{int64(1), "alice", int64(11), int64(1), int64(150)},
+				{int64(2), "bob", int64(12), int64(2), int64(200)},
+			},
+		},
+		{
+			name: "explicit unqualified columns",
+			sql:  "SELECT name, total FROM users JOIN orders ON users.id = orders.user_id",
+			cols: []string{"name", "total"},
+			rows: [][]any{{"alice", int64(100)}, {"alice", int64(150)}, {"bob", int64(200)}},
+		},
+		{
+			name: "where qualified right column",
+			sql:  "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE o.total = 150",
+			cols: []string{"name"},
+			rows: [][]any{{"alice"}},
+		},
+		{
+			name: "where unqualified unique column",
+			sql:  "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE total = 200",
+			cols: []string{"name"},
+			rows: [][]any{{"bob"}},
+		},
+		{
+			name: "where qualified left column",
+			sql:  "SELECT u.name, o.total FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE u.id = 1",
+			cols: []string{"name", "total"},
+			rows: [][]any{{"alice", int64(100)}, {"alice", int64(150)}},
+		},
+		{
+			name: "where no matches",
+			sql:  "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE o.total = 999",
+			cols: []string{"name"},
+			rows: [][]any{},
+		},
+		{
+			name: "limit after join",
+			sql:  "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id LIMIT 2",
+			cols: []string{"name"},
+			rows: [][]any{{"alice"}, {"alice"}},
+		},
+		{
+			name: "join against empty table",
+			sql:  "SELECT * FROM users AS u JOIN empty_orders AS e ON u.id = e.user_id",
+			cols: []string{"u.id", "u.name", "e.id", "e.user_id"},
+			rows: [][]any{},
+		},
+		{
+			name: "self join with aliases",
+			sql:  "SELECT a.name, b.name FROM users AS a JOIN users AS b ON a.id = b.id",
+			cols: []string{"name", "name"},
+			rows: [][]any{{"alice", "alice"}, {"bob", "bob"}, {"carol", "carol"}},
+		},
+		{
+			name: "join on text columns",
+			sql:  "SELECT u.name, n.id FROM users AS u JOIN nicknames AS n ON u.name = n.nick",
+			cols: []string{"name", "id"},
+			rows: [][]any{{"alice", int64(1)}, {"bob", int64(2)}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := e.Execute(context.Background(), tc.sql)
+			if err != nil {
+				t.Fatalf("%q: %v", tc.sql, err)
+			}
+			if !reflect.DeepEqual(res.Columns, tc.cols) {
+				t.Fatalf("%q columns = %v, want %v", tc.sql, res.Columns, tc.cols)
+			}
+			if !reflect.DeepEqual(res.Rows, tc.rows) {
+				t.Fatalf("%q rows = %v, want %v", tc.sql, res.Rows, tc.rows)
+			}
+		})
+	}
+}
+
+func TestSQLJoinErrors(t *testing.T) {
+	e := joinFixture(t)
+	ctx := context.Background()
+	cases := []struct {
+		sql string
+		err error
+	}{
+		{"SELECT u.nope FROM users AS u JOIN orders AS o ON u.id = o.user_id", ErrBadColumn},
+		{"SELECT x.name FROM users AS u JOIN orders AS o ON u.id = o.user_id", ErrBadColumn},
+		{"SELECT id FROM users JOIN orders ON users.id = orders.user_id", ErrBadColumn},
+		{"SELECT users.name FROM users JOIN orders ON users.id = orders.user_id WHERE id = 1", ErrBadColumn},
+		{"SELECT * FROM users JOIN orders ON users.id = orders.nope", ErrBadColumn},
+		{"SELECT * FROM users JOIN orders ON users.id = users.id", ErrBadColumn},
+		{"SELECT * FROM users AS u JOIN codes AS c ON u.id = c.code", ErrBadColumn},
+		{"SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE u.name = 1", ErrBadColumn},
+		{"SELECT COUNT(*) FROM users AS u JOIN orders AS o ON u.id = o.user_id", ErrUnsupported},
+		{"SELECT * FROM missing JOIN orders ON missing.id = orders.user_id", ErrTableNotFound},
+	}
+	for _, tc := range cases {
+		if _, err := e.Execute(ctx, tc.sql); !errors.Is(err, tc.err) {
+			t.Errorf("%q: err = %v, want %v", tc.sql, err, tc.err)
+		}
+	}
+
+	// Parse-level join limits are reported as syntax errors.
+	for _, sql := range []string{
+		"SELECT * FROM users JOIN orders ON users.id != orders.user_id",
+		"SELECT * FROM users JOIN orders ON users.id = orders.user_id JOIN users ON users.id = orders.user_id",
+		"SELECT * FROM users AS x JOIN orders AS x ON x.id = x.id",
+		"SELECT * FROM users JOIN users ON users.id = users.id",
+	} {
+		if _, err := e.Execute(ctx, sql); err == nil {
+			t.Errorf("%q: expected error", sql)
+		}
+	}
+}

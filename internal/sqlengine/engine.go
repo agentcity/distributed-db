@@ -358,6 +358,9 @@ func (e *Engine) selectRows(ctx context.Context, tx Txn, s sqlparser.Select) (*R
 	if err != nil {
 		return nil, err
 	}
+	if s.Join != nil {
+		return e.selectJoin(ctx, tx, schema, s)
+	}
 	if s.Aggregate != nil {
 		return e.aggregate(ctx, tx, schema, s)
 	}
@@ -382,6 +385,276 @@ func (e *Engine) selectRows(ctx context.Context, tx Txn, s sqlparser.Select) (*R
 		names = append(names, col.Name)
 	}
 	return &Result{Columns: names, Rows: out}, nil
+}
+
+// Bounds on the in-memory nested-loop join. The P0 planner never pushes the
+// join down, so it scans both tables and hashes the right side.
+const (
+	maxJoinScanRows   = 100_000
+	maxJoinResultRows = 1_000_000
+)
+
+const (
+	joinSideLeft = iota
+	joinSideRight
+)
+
+// joinProjection is one output column of a join and the side it comes from.
+type joinProjection struct {
+	side   int
+	column Column
+	name   string
+}
+
+// joinCondition is a WHERE column = literal resolved against one join side.
+type joinCondition struct {
+	side   int
+	column Column
+	value  sqlparser.Value
+}
+
+// selectJoin executes one INNER JOIN with an equality predicate and an
+// optional single-column WHERE condition, followed by LIMIT. Both inputs are
+// scanned in primary-key order, so output order is deterministic: left rows in
+// key order, and for each left row its right matches in key order.
+func (e *Engine) selectJoin(ctx context.Context, tx Txn, leftSchema *Schema, s sqlparser.Select) (*Result, error) {
+	if s.Aggregate != nil {
+		return nil, fmt.Errorf("%w: aggregates with JOIN", ErrUnsupported)
+	}
+	if s.GroupBy != "" {
+		return nil, fmt.Errorf("%w: GROUP BY with JOIN", ErrUnsupported)
+	}
+	join := s.Join
+	if join == nil {
+		return nil, fmt.Errorf("%w: missing JOIN clause", ErrUnsupported)
+	}
+	if s.Limit < 0 {
+		return nil, fmt.Errorf("%w: negative LIMIT", ErrBadColumn)
+	}
+	rightSchema, err := e.loadSchema(ctx, tx, join.RightTable)
+	if err != nil {
+		return nil, err
+	}
+
+	leftAlias := joinQualifier(join.LeftAlias, leftSchema.Name)
+	rightAlias := joinQualifier(join.RightAlias, rightSchema.Name)
+
+	leftJoinCol, err := resolveJoinSideColumn(join.LeftColumn, leftSchema, leftAlias, "left")
+	if err != nil {
+		return nil, err
+	}
+	rightJoinCol, err := resolveJoinSideColumn(join.RightColumn, rightSchema, rightAlias, "right")
+	if err != nil {
+		return nil, err
+	}
+	if leftJoinCol.Type != rightJoinCol.Type {
+		return nil, fmt.Errorf("%w: JOIN columns %q and %q have different types", ErrBadColumn, join.LeftColumn, join.RightColumn)
+	}
+
+	projections, err := joinProjections(s.Columns, leftSchema, rightSchema, leftAlias, rightAlias)
+	if err != nil {
+		return nil, err
+	}
+	var where *joinCondition
+	if s.Where != nil {
+		where, err = resolveJoinCondition(*s.Where, leftSchema, rightSchema, leftAlias, rightAlias)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Scan both sides bounded; the extra row lets us detect an oversized input.
+	leftRows, err := e.readRows(ctx, tx, leftSchema, nil, maxJoinScanRows+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(leftRows) > maxJoinScanRows {
+		return nil, fmt.Errorf("%w: JOIN input table %q exceeds %d rows", ErrUnsupported, leftSchema.Name, maxJoinScanRows)
+	}
+	rightRows, err := e.readRows(ctx, tx, rightSchema, nil, maxJoinScanRows+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(rightRows) > maxJoinScanRows {
+		return nil, fmt.Errorf("%w: JOIN input table %q exceeds %d rows", ErrUnsupported, rightSchema.Name, maxJoinScanRows)
+	}
+
+	// Hash the right side by join value, preserving scan order per value.
+	rightByKey := make(map[any][]map[string]any, len(rightRows))
+	for _, row := range rightRows {
+		key, err := joinKey(rightJoinCol, row)
+		if err != nil {
+			return nil, err
+		}
+		rightByKey[key] = append(rightByKey[key], row)
+	}
+
+	names := make([]string, len(projections))
+	for i, p := range projections {
+		names[i] = p.name
+	}
+	out := make([][]any, 0)
+	for _, leftRow := range leftRows {
+		key, err := joinKey(leftJoinCol, leftRow)
+		if err != nil {
+			return nil, err
+		}
+		for _, rightRow := range rightByKey[key] {
+			if where != nil {
+				ok, err := where.matches(leftRow, rightRow)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+			}
+			if s.Limit > 0 && len(out) == s.Limit {
+				return &Result{Columns: names, Rows: out}, nil
+			}
+			line := make([]any, len(projections))
+			for i, p := range projections {
+				if p.side == joinSideLeft {
+					line[i] = leftRow[p.column.Name]
+				} else {
+					line[i] = rightRow[p.column.Name]
+				}
+			}
+			out = append(out, line)
+			if len(out) > maxJoinResultRows {
+				return nil, fmt.Errorf("%w: JOIN produces more than %d rows", ErrUnsupported, maxJoinResultRows)
+			}
+		}
+	}
+	return &Result{Columns: names, Rows: out}, nil
+}
+
+// joinQualifier returns the lower-case qualifier used for one join side.
+func joinQualifier(alias, table string) string {
+	if alias != "" {
+		return strings.ToLower(alias)
+	}
+	return strings.ToLower(table)
+}
+
+// splitColumnRef splits "qualifier.column" into its parts.
+func splitColumnRef(ref string) (qualifier, column string, qualified bool) {
+	pos := strings.IndexByte(ref, '.')
+	if pos < 0 {
+		return "", ref, false
+	}
+	return ref[:pos], ref[pos+1:], true
+}
+
+// resolveJoinSideColumn resolves an ON operand against the given side. A
+// qualified operand must name that side's alias (or the table name when it
+// has no alias); an unqualified operand is looked up in that side's schema.
+func resolveJoinSideColumn(ref string, schema *Schema, alias, side string) (Column, error) {
+	qualifier, name, qualified := splitColumnRef(ref)
+	if qualified && !strings.EqualFold(qualifier, alias) {
+		return Column{}, fmt.Errorf("%w: column %q is not from the %s table", ErrBadColumn, ref, side)
+	}
+	idx, ok := columnIndex(schema, strings.ToLower(name))
+	if !ok {
+		return Column{}, fmt.Errorf("%w: unknown column %q", ErrBadColumn, ref)
+	}
+	return schema.Columns[idx], nil
+}
+
+// resolveJoinColumn resolves a SELECT or WHERE column reference against either
+// join side. An unqualified name that exists on both sides is ambiguous.
+func resolveJoinColumn(ref string, left, right *Schema, leftAlias, rightAlias string) (int, Column, error) {
+	qualifier, name, qualified := splitColumnRef(ref)
+	column := strings.ToLower(name)
+	if qualified {
+		switch {
+		case strings.EqualFold(qualifier, leftAlias):
+			idx, ok := columnIndex(left, column)
+			if !ok {
+				return 0, Column{}, fmt.Errorf("%w: unknown column %q", ErrBadColumn, ref)
+			}
+			return joinSideLeft, left.Columns[idx], nil
+		case strings.EqualFold(qualifier, rightAlias):
+			idx, ok := columnIndex(right, column)
+			if !ok {
+				return 0, Column{}, fmt.Errorf("%w: unknown column %q", ErrBadColumn, ref)
+			}
+			return joinSideRight, right.Columns[idx], nil
+		default:
+			return 0, Column{}, fmt.Errorf("%w: unknown table qualifier %q in column %q", ErrBadColumn, qualifier, ref)
+		}
+	}
+	leftIdx, leftOK := columnIndex(left, column)
+	rightIdx, rightOK := columnIndex(right, column)
+	switch {
+	case leftOK && rightOK:
+		return 0, Column{}, fmt.Errorf("%w: ambiguous column %q", ErrBadColumn, ref)
+	case leftOK:
+		return joinSideLeft, left.Columns[leftIdx], nil
+	case rightOK:
+		return joinSideRight, right.Columns[rightIdx], nil
+	default:
+		return 0, Column{}, fmt.Errorf("%w: unknown column %q", ErrBadColumn, ref)
+	}
+}
+
+// joinProjections resolves the SELECT list. "*" expands to every left column
+// followed by every right column, with qualified names; explicit columns keep
+// their unqualified column name.
+func joinProjections(refs []string, left, right *Schema, leftAlias, rightAlias string) ([]joinProjection, error) {
+	if len(refs) == 0 || (len(refs) == 1 && refs[0] == "*") {
+		out := make([]joinProjection, 0, len(left.Columns)+len(right.Columns))
+		for _, col := range left.Columns {
+			out = append(out, joinProjection{side: joinSideLeft, column: col, name: leftAlias + "." + col.Name})
+		}
+		for _, col := range right.Columns {
+			out = append(out, joinProjection{side: joinSideRight, column: col, name: rightAlias + "." + col.Name})
+		}
+		return out, nil
+	}
+	out := make([]joinProjection, 0, len(refs))
+	for _, ref := range refs {
+		side, col, err := resolveJoinColumn(ref, left, right, leftAlias, rightAlias)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, joinProjection{side: side, column: col, name: col.Name})
+	}
+	return out, nil
+}
+
+// resolveJoinCondition resolves a WHERE column = literal for the join output.
+func resolveJoinCondition(cond sqlparser.Condition, left, right *Schema, leftAlias, rightAlias string) (*joinCondition, error) {
+	side, col, err := resolveJoinColumn(cond.Column, left, right, leftAlias, rightAlias)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkLiteralType(col, cond.Value); err != nil {
+		return nil, err
+	}
+	return &joinCondition{side: side, column: col, value: cond.Value}, nil
+}
+
+// matches reports whether the joined row satisfies the WHERE condition.
+func (c *joinCondition) matches(leftRow, rightRow map[string]any) (bool, error) {
+	row := leftRow
+	if c.side == joinSideRight {
+		row = rightRow
+	}
+	lit, err := anyToLiteral(c.column, row[c.column.Name])
+	if err != nil {
+		return false, err
+	}
+	return lit.AsAny() == c.value.AsAny(), nil
+}
+
+// joinKey returns the comparable hash key for a row's join column.
+func joinKey(col Column, row map[string]any) (any, error) {
+	lit, err := anyToLiteral(col, row[col.Name])
+	if err != nil {
+		return nil, err
+	}
+	return lit.AsAny(), nil
 }
 
 func (e *Engine) aggregate(ctx context.Context, tx Txn, schema *Schema, s sqlparser.Select) (*Result, error) {

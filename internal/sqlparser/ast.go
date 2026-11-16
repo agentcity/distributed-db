@@ -1,6 +1,8 @@
 // Package sqlparser implements the small PostgreSQL-like SQL subset used by
-// the v2 SQL layer: CREATE/DROP TABLE, INSERT, SELECT, UPDATE, DELETE with a
-// primary-key equality WHERE clause. It is intentionally not a general parser.
+// the v2 SQL layer: CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT,
+// UPDATE and DELETE with a primary-key equality WHERE clause. SELECT also
+// supports one INNER JOIN with an equality ON predicate. It is intentionally
+// not a general parser.
 package sqlparser
 
 import "fmt"
@@ -61,11 +63,29 @@ type Aggregate struct {
 	Star   bool
 }
 
+// JoinClause describes the single supported INNER JOIN:
+//
+//	... FROM LeftTable [AS LeftAlias]
+//	    JOIN RightTable [AS RightAlias]
+//	    ON LeftColumn = RightColumn
+//
+// Column references keep the spelling from the input and may be qualified
+// ("alias.column") or unqualified ("column").
+type JoinClause struct {
+	LeftTable   string
+	RightTable  string
+	LeftAlias   string // empty when the left table has no alias
+	RightAlias  string // empty when the right table has no alias
+	LeftColumn  string
+	RightColumn string
+}
+
 // Select reads rows.
 type Select struct {
 	Table     string
 	Columns   []string // empty or ["*"] means all columns
 	Aggregate *Aggregate
+	Join      *JoinClause // nil for a single-table SELECT
 	Where     *Condition
 	GroupBy   string // empty means no grouping
 	Limit     int
