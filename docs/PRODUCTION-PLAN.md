@@ -175,11 +175,11 @@ TLS/Bearer.
 |---|---|---|
 | 0 | Заморозить ICP, production-профиль, crash/SLO harness | 2–4 недели |
 | 1 | Durability + membership safety | 10–14 недель (G2 alone 14–19.5 pw) |
-| 2 | PITR/backup + restore drills | 4–6 недель |
+| 2 | PITR/backup + restore drills | 12–20 недель (ADR 0006: 20.5–27.5 pw production) |
 | 3 | Security (TLS/mTLS/RBAC/audit/encryption) | 4–6 недель |
 | 4 | Upgrade/operator/observability | 4–6 недель |
 | 5 | 1 ТБ soak, chaos, SLO, security review | 4–8 недель |
-| **Итого** | private single-tenant production | **9–12 месяцев** |
+| **Итого** | private single-tenant production | **12–15 месяцев** |
 | SQL | P0+ до production-уровня | +6–12 месяцев |
 | DBaaS | multi-tenant/compliance/billing | +12 месяцев и больше |
 
