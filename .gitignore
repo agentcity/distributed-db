@@ -5,3 +5,7 @@ data/
 coverage.txt
 .DS_Store
 .idea/
+
+# local Go build cache created by sandboxed test runs
+.gocache/
+.tmp-go/

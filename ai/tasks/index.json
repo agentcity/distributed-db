@@ -82,5 +82,11 @@
     "title": "M2.5 — epoch/fencing и meta scheduler",
     "status": "done",
     "file": "0014-epoch-scheduler.md"
+  },
+  {
+    "id": "0015",
+    "title": "Stage 1 — group commit, TSO batch, 1PC и range cache",
+    "status": "done",
+    "file": "0015-stage1-speed.md"
   }
 ]
