@@ -81,7 +81,7 @@ func (n *Node) TransferLeadership(ctx context.Context, target string) error {
 		for !caughtUp {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("%w: %v", ErrTargetNotCaughtUp, ctx.Err())
+				return errors.Join(ErrTargetNotCaughtUp, ctx.Err())
 			case <-n.stopCh:
 				return ErrStopped
 			case <-ticker.C:
@@ -126,10 +126,17 @@ func (n *Node) TransferLeadership(ctx context.Context, target string) error {
 		return fmt.Errorf("%w: %s match index %d, leader last index %d",
 			ErrTargetNotCaughtUp, target, match, last)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	req := &TimeoutNowRequest{Term: term, LeaderID: n.cfg.ID}
 	rpcCtx, cancel := n.rpcContext(n.voteTimeout())
 	defer cancel()
+	// A caller cancellation must abort the RPC too; n.rpcContext is tied to
+	// the node lifetime, not to this caller.
+	stopCancel := context.AfterFunc(ctx, cancel)
+	defer stopCancel()
 	resp, err := tr.TimeoutNow(rpcCtx, target, req)
 	if err != nil {
 		return fmt.Errorf("raft: TimeoutNow to %s: %w", target, err)

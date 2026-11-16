@@ -3,16 +3,24 @@ package raft_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"distributed-db/internal/model"
 	"distributed-db/internal/raft"
 )
+
+// chunkFault lets a test intercept one chunk RPC before it reaches the network.
+// handled=false forwards the request normally; handled=true returns resp/err
+// instead, after the callback has optionally delivered the request itself (to
+// simulate a response that was lost after the follower accepted the chunk).
+type chunkFault func(peer string, req *raft.InstallSnapshotChunkRequest) (handled bool, resp *raft.InstallSnapshotChunkResponse, err error)
 
 // chunkSnapshotTransport augments the legacy in-memory transport with the
 // chunked snapshot capability and records the chunks the leader actually sent.
@@ -22,6 +30,7 @@ type chunkSnapshotTransport struct {
 	mu     sync.Mutex
 	chunks map[string][]raft.InstallSnapshotChunkRequest
 	legacy map[string]int
+	fault  chunkFault
 }
 
 func newChunkSnapshotTransport(net *snapshotNetwork, from string) *chunkSnapshotTransport {
@@ -44,13 +53,26 @@ func (t *chunkSnapshotTransport) InstallSnapshotChunk(ctx context.Context, peer 
 	cp.Data = append([]byte(nil), req.Data...)
 	t.mu.Lock()
 	t.chunks[peer] = append(t.chunks[peer], cp)
+	fault := t.fault
 	t.mu.Unlock()
 
+	if fault != nil {
+		if handled, resp, err := fault(peer, req); handled {
+			return resp, err
+		}
+	}
 	h, err := t.net.handler(t.from, peer)
 	if err != nil {
 		return nil, err
 	}
 	return h.HandleInstallSnapshotChunk(ctx, req)
+}
+
+// setFault installs (or removes) the per-chunk fault injector.
+func (t *chunkSnapshotTransport) setFault(fault chunkFault) {
+	t.mu.Lock()
+	t.fault = fault
+	t.mu.Unlock()
 }
 
 func (t *chunkSnapshotTransport) chunkRequests(peer string) []raft.InstallSnapshotChunkRequest {
@@ -88,6 +110,21 @@ func assertNoSnapshotRecvTemps(t *testing.T, dir string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// hasSnapshotRecvTemp reports whether dir holds an in-progress chunk upload.
+func hasSnapshotRecvTemp(t *testing.T, dir string) bool {
+	t.Helper()
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read data dir: %v", err)
+	}
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), "raft-snapshot-recv-") {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -518,4 +555,331 @@ func TestInstallSnapshotChunkRejectsStaleTermAndBadChunks(t *testing.T) {
 	if resp.Success || !strings.Contains(resp.Error, "exceeds") {
 		t.Fatalf("oversized chunk response = %+v", resp)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Resume: receiver reports the accepted offset
+// ---------------------------------------------------------------------------
+
+func TestInstallSnapshotChunkResponsesCarryNextOffset(t *testing.T) {
+	f := newChunkRecvFixture(t)
+	reqs := chunkRequests(3, f.meta, f.data, 7)
+	if len(reqs) < 5 {
+		t.Fatalf("fixture produced %d requests, need at least 5", len(reqs))
+	}
+
+	// An accepted chunk reports the number of bytes accepted so far.
+	resp := requireChunkSuccess(t, f.node, reqs[0])
+	if want := reqs[0].Offset + uint64(len(reqs[0].Data)); resp.NextOffset != int64(want) {
+		t.Fatalf("accepted chunk NextOffset = %d, want %d", resp.NextOffset, want)
+	}
+	resp = requireChunkSuccess(t, f.node, reqs[1])
+	current := reqs[1].Offset + uint64(len(reqs[1].Data))
+	if resp.NextOffset != int64(current) {
+		t.Fatalf("accepted chunk NextOffset = %d, want %d", resp.NextOffset, current)
+	}
+
+	// An idempotent retry reports the same current offset.
+	dup := requireChunkSuccess(t, f.node, reqs[1])
+	if dup.NextOffset != int64(current) {
+		t.Fatalf("duplicate chunk NextOffset = %d, want current offset %d", dup.NextOffset, current)
+	}
+
+	// A gap carries the current offset too: it is the resume point, not the
+	// offset the rejected request asked for.
+	gap := sendChunk(t, f.node, reqs[3])
+	if gap.Success {
+		t.Fatal("gapped chunk was accepted")
+	}
+	if !strings.Contains(gap.Error, "offset gap") {
+		t.Fatalf("gap error = %q, want offset gap", gap.Error)
+	}
+	if gap.NextOffset != int64(current) {
+		t.Fatalf("gap NextOffset = %d, want current offset %d", gap.NextOffset, current)
+	}
+	if !hasSnapshotRecvTemp(t, f.dir) {
+		t.Fatal("gap rejection removed the partial upload file")
+	}
+
+	// The chunk at the reported offset is accepted and appended.
+	resp = requireChunkSuccess(t, f.node, reqs[2])
+	if want := reqs[2].Offset + uint64(len(reqs[2].Data)); resp.NextOffset != int64(want) {
+		t.Fatalf("resumed chunk NextOffset = %d, want %d", resp.NextOffset, want)
+	}
+	for _, req := range reqs[3:] {
+		resp = requireChunkSuccess(t, f.node, req)
+	}
+	if resp.NextOffset != int64(len(f.data)) {
+		t.Fatalf("done NextOffset = %d, want final size %d", resp.NextOffset, len(f.data))
+	}
+	if resp.LastIndex != f.meta.Index {
+		t.Fatalf("done LastIndex = %d, want %d", resp.LastIndex, f.meta.Index)
+	}
+	assertNoSnapshotRecvTemps(t, f.dir)
+}
+
+func TestInstallSnapshotChunkResumesAfterGap(t *testing.T) {
+	f := newChunkRecvFixture(t)
+	reqs := chunkRequests(3, f.meta, f.data, 7)
+	if len(reqs) < 6 {
+		t.Fatalf("fixture produced %d requests, need at least 6", len(reqs))
+	}
+
+	// Send the first two data chunks, then skip one and ask for the next.
+	for _, req := range reqs[:2] {
+		requireChunkSuccess(t, f.node, req)
+	}
+	current := reqs[1].Offset + uint64(len(reqs[1].Data))
+	resp := sendChunk(t, f.node, reqs[3])
+	if resp.Success {
+		t.Fatal("gapped chunk was accepted")
+	}
+	if resp.NextOffset != int64(current) {
+		t.Fatalf("gap NextOffset = %d, want %d", resp.NextOffset, current)
+	}
+
+	// The partial upload survived the rejected chunk: resume with the chunk
+	// that starts exactly at NextOffset and finish the install.
+	if !hasSnapshotRecvTemp(t, f.dir) {
+		t.Fatal("gap rejection removed the partial upload file")
+	}
+	if reqs[2].Offset != uint64(resp.NextOffset) {
+		t.Fatalf("resume chunk offset = %d, want NextOffset %d", reqs[2].Offset, resp.NextOffset)
+	}
+	for _, req := range reqs[2:] {
+		requireChunkSuccess(t, f.node, req)
+	}
+
+	st := f.node.Status()
+	if st.LastApplied != f.meta.Index || st.CommitIndex != f.meta.Index {
+		t.Fatalf("resumed install applied %d commit %d, want %d", st.LastApplied, st.CommitIndex, f.meta.Index)
+	}
+	stored, err := f.store.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	if stored.Index != f.meta.Index || !bytes.Equal(stored.Data, f.data) {
+		t.Fatalf("stored snapshot = {%d, %d bytes}, want {%d, %d bytes}",
+			stored.Index, len(stored.Data), f.meta.Index, len(f.data))
+	}
+	assertNoSnapshotRecvTemps(t, f.dir)
+}
+
+// ---------------------------------------------------------------------------
+// Resume: leader continues from the receiver's NextOffset
+// ---------------------------------------------------------------------------
+
+// chunkInstallSetup creates a chunked cluster with one lagging follower,
+// writes a payload larger than one chunk and compacts it into a snapshot on
+// the leader. The follower stays isolated so the caller can install a fault
+// injector before healing the link and letting the transfer start.
+func chunkInstallSetup(t *testing.T, key string, payload []byte) (*snapshotCluster, string, raft.Snapshot, *chunkSnapshotTransport) {
+	t.Helper()
+	c := newSnapshotChunkCluster(t, 3)
+	leader, leaderID := c.waitLeader(c.ids)
+	lagging := ""
+	for _, id := range c.ids {
+		if id != leaderID {
+			lagging = id
+			break
+		}
+	}
+	if lagging == "" {
+		t.Fatal("no lagging follower")
+	}
+
+	c.net.partition(lagging, leaderID)
+	c.net.partition(leaderID, lagging)
+	_, leader, leaderID = c.proposeOnLeader(leader, model.Entry{Type: model.CommandPut, Key: key, Value: payload})
+	snap, err := leader.Snapshot()
+	if err != nil {
+		t.Fatalf("leader Snapshot: %v", err)
+	}
+	if int64(len(snap.Data)) <= raft.SnapshotChunkSize {
+		t.Fatalf("snapshot payload %d bytes does not exceed one chunk", len(snap.Data))
+	}
+
+	tr := c.chunkTrs[leaderID]
+	if tr == nil {
+		t.Fatal("leader has no chunk transport")
+	}
+	return c, lagging, snap, tr
+}
+
+// requireSucceededChunks mirrors the successful transfer shape: every data
+// offset is sent once (except retriedOffset, which is sent retried times), the
+// payload of every request matches the snapshot, and the final request is the
+// Done marker at the snapshot size.
+func requireSucceededChunks(t *testing.T, reqs []raft.InstallSnapshotChunkRequest, data []byte, retriedOffset uint64, retried int) {
+	t.Helper()
+	if len(reqs) == 0 {
+		t.Fatal("leader sent no chunk requests")
+	}
+	expected := make(map[uint64]int)
+	for off := uint64(0); off < uint64(len(data)); {
+		n := uint64(raft.SnapshotChunkSize)
+		if rem := uint64(len(data)) - off; rem < n {
+			n = rem
+		}
+		expected[off] = 1
+		off += n
+	}
+	expected[retriedOffset] = retried
+
+	counts := make(map[uint64]int)
+	for i, req := range reqs {
+		if req.Done {
+			if i != len(reqs)-1 {
+				t.Fatalf("Done marker at request %d of %d", i, len(reqs))
+			}
+			if req.Offset != uint64(len(data)) {
+				t.Fatalf("Done offset = %d, want %d", req.Offset, len(data))
+			}
+			continue
+		}
+		end := req.Offset + uint64(len(req.Data))
+		if end > uint64(len(data)) || !bytes.Equal(req.Data, data[req.Offset:end]) {
+			t.Fatalf("chunk %d at offset %d does not match the snapshot payload", i, req.Offset)
+		}
+		counts[req.Offset]++
+	}
+	if len(counts) != len(expected) {
+		t.Fatalf("chunk offsets sent = %v, want %v (retried offset %d)", counts, expected, retriedOffset)
+	}
+	for off, want := range expected {
+		if got := counts[off]; got != want {
+			t.Fatalf("offset %d sent %d times, want %d (all offsets %v)", off, got, want, counts)
+		}
+	}
+}
+
+func TestInstallSnapshotChunkResumesAfterLostResponse(t *testing.T) {
+	payload := bytes.Repeat([]byte("y"), 2*raft.SnapshotChunkSize+(300<<10))
+	c, lagging, snap, tr := chunkInstallSetup(t, "resume-lost", payload)
+
+	// The follower accepts the second chunk (around the middle of the upload),
+	// but its response never reaches the leader. The leader must retry that
+	// chunk, then continue from the offset the follower confirms instead of
+	// re-sending the bytes that came before it.
+	var dropped atomic.Bool
+	tr.setFault(func(peer string, req *raft.InstallSnapshotChunkRequest) (bool, *raft.InstallSnapshotChunkResponse, error) {
+		if peer != lagging || req.Done || req.Offset != raft.SnapshotChunkSize || !dropped.CompareAndSwap(false, true) {
+			return false, nil, nil
+		}
+		resp, err := c.nodes[lagging].HandleInstallSnapshotChunk(context.Background(), req)
+		if err != nil {
+			return true, nil, err
+		}
+		if want := int64(req.Offset) + int64(len(req.Data)); resp.NextOffset != want {
+			return true, nil, fmt.Errorf("follower NextOffset = %d, want %d", resp.NextOffset, want)
+		}
+		return true, nil, errors.New("snapshot network: response lost")
+	})
+	c.net.heal(lagging)
+
+	eventually(t, c.timeout, "follower restores the snapshot after a lost chunk response", func() bool {
+		return c.sms[lagging].appliedIndex() >= snap.Index
+	})
+	if got, ok := c.sms[lagging].get("resume-lost"); !ok || !bytes.Equal(got, payload) {
+		t.Fatalf("follower restored value = %d bytes, ok=%v; want %d bytes", len(got), ok, len(payload))
+	}
+	stored, err := c.stores[lagging].LoadSnapshot()
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	if stored.Index != snap.Index || !bytes.Equal(stored.Data, snap.Data) {
+		t.Fatalf("stored snapshot = {%d, %d bytes}, want {%d, %d bytes}",
+			stored.Index, len(stored.Data), snap.Index, len(snap.Data))
+	}
+
+	reqs := tr.chunkRequests(lagging)
+	wantRetries := 2 // the dropped chunk and its idempotent retry
+	requireSucceededChunks(t, reqs, snap.Data, raft.SnapshotChunkSize, wantRetries)
+	if got := tr.legacyCalls(lagging); got != 0 {
+		t.Fatalf("leader fell back to the legacy install %d times", got)
+	}
+	assertNoSnapshotRecvTemps(t, c.dirs[lagging])
+}
+
+func TestInstallSnapshotChunkResumesFromRejectionOffset(t *testing.T) {
+	payload := bytes.Repeat([]byte("z"), 2*raft.SnapshotChunkSize+(300<<10))
+	c, lagging, snap, tr := chunkInstallSetup(t, "resume-reject", payload)
+
+	// The follower accepts the second chunk but reports it as rejected
+	// together with the offset it has accepted. The sender must seek there and
+	// keep going; re-sending bytes before NextOffset would make the first
+	// chunk appear twice.
+	var rejected atomic.Bool
+	tr.setFault(func(peer string, req *raft.InstallSnapshotChunkRequest) (bool, *raft.InstallSnapshotChunkResponse, error) {
+		if peer != lagging || req.Done || req.Offset != raft.SnapshotChunkSize || !rejected.CompareAndSwap(false, true) {
+			return false, nil, nil
+		}
+		resp, err := c.nodes[lagging].HandleInstallSnapshotChunk(context.Background(), req)
+		if err != nil {
+			return true, nil, err
+		}
+		return true, &raft.InstallSnapshotChunkResponse{
+			Term:       req.Term,
+			Success:    false,
+			Error:      "snapshot network: response lost",
+			NextOffset: resp.NextOffset,
+		}, nil
+	})
+	c.net.heal(lagging)
+
+	eventually(t, c.timeout, "follower restores the snapshot from a rejected-chunk offset", func() bool {
+		return c.sms[lagging].appliedIndex() >= snap.Index
+	})
+	reqs := tr.chunkRequests(lagging)
+	// The rejected chunk is not sent again: only the remaining chunk is.
+	requireSucceededChunks(t, reqs, snap.Data, raft.SnapshotChunkSize, 1)
+	assertNoSnapshotRecvTemps(t, c.dirs[lagging])
+}
+
+func TestInstallSnapshotChunkResumesAcrossAttempts(t *testing.T) {
+	payload := bytes.Repeat([]byte("w"), raft.SnapshotChunkSize+(300<<10))
+	c, lagging, snap, tr := chunkInstallSetup(t, "resume-rounds", payload)
+
+	// The last data chunk is dropped until the leader exhausts its retry
+	// budget for one replicate round. The next round must resume from the
+	// offset the follower already confirmed instead of restarting at zero.
+	lastOffset := uint64(0)
+	for off := uint64(0); off < uint64(len(snap.Data)); {
+		lastOffset = off
+		n := uint64(raft.SnapshotChunkSize)
+		if rem := uint64(len(snap.Data)) - off; rem < n {
+			n = rem
+		}
+		off += n
+	}
+	var down atomic.Bool
+	down.Store(true)
+	var failed atomic.Int32
+	tr.setFault(func(peer string, req *raft.InstallSnapshotChunkRequest) (bool, *raft.InstallSnapshotChunkResponse, error) {
+		if peer != lagging || req.Done || req.Offset != lastOffset || !down.Load() {
+			return false, nil, nil
+		}
+		failed.Add(1)
+		return true, nil, errors.New("snapshot network: link down")
+	})
+	c.net.heal(lagging)
+
+	eventually(t, c.timeout, "leader exhausts the retry budget for the last chunk", func() bool {
+		if failed.Load() >= 5 {
+			down.Store(false)
+			return true
+		}
+		return false
+	})
+	eventually(t, c.timeout, "follower restores the snapshot after a later retry round", func() bool {
+		return c.sms[lagging].appliedIndex() >= snap.Index
+	})
+
+	reqs := tr.chunkRequests(lagging)
+	// One success on the last chunk plus every dropped attempt.
+	requireSucceededChunks(t, reqs, snap.Data, lastOffset, int(failed.Load())+1)
+	if got := tr.legacyCalls(lagging); got != 0 {
+		t.Fatalf("leader fell back to the legacy install %d times", got)
+	}
+	assertNoSnapshotRecvTemps(t, c.dirs[lagging])
 }

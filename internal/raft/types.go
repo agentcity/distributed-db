@@ -269,8 +269,8 @@ type InstallSnapshotChunkRequest struct {
 // follower's current term, Success reports whether the chunk was accepted,
 // LastIndex is set when the final chunk completed the install and Error
 // describes a rejected chunk. NextOffset is the number of payload bytes
-// accepted so far, i.e. the offset the receiver expects next; it is reported
-// for snapshot resume but does not change the current send path.
+// accepted so far, i.e. the offset the receiver expects next; the leader uses
+// it to resume a chunked upload after a lost response or a transient failure.
 type InstallSnapshotChunkResponse struct {
 	Term       uint64
 	Success    bool
