@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"distributed-db/internal/grpctls"
 	"distributed-db/internal/metrics"
 	"distributed-db/internal/pgwire"
 	"distributed-db/internal/sqlengine"
@@ -28,8 +29,10 @@ func main() {
 	metricsAddr := flag.String("metrics-addr", "", "optional HTTP listen address for /metrics, /debug/slo, and /healthz (empty disables)")
 	metaAddr := flag.String("meta", "127.0.0.1:9090", "meta/TSO gRPC address")
 	nodes := flag.String("nodes", "", "comma-separated KV node gRPC addresses")
-	tlsCert := flag.String("tls-cert", "", "PEM TLS server certificate file (requires -tls-key)")
-	tlsKey := flag.String("tls-key", "", "PEM TLS server private key file (requires -tls-cert)")
+	tlsCert := flag.String("tls-cert", "", "PEM TLS certificate (PostgreSQL listener server cert; also used as the cluster client cert when -tls-ca/-tls-server-name enables cluster TLS; requires -tls-key)")
+	tlsKey := flag.String("tls-key", "", "PEM TLS private key (requires -tls-cert)")
+	tlsCA := flag.String("tls-ca", "", "PEM CA bundle used to verify the meta/KV servers; setting it (or -tls-server-name) enables cluster TLS")
+	tlsServerName := flag.String("tls-server-name", "", "expected server name for meta/KV certificate verification; setting it enables cluster TLS")
 	authUser := flag.String("auth-user", "", "require password authentication for this user (requires TLS)")
 	authPassword := flag.String("auth-password", "", "password for -auth-user (requires TLS; visible in the process list)")
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
@@ -44,7 +47,15 @@ func main() {
 		os.Exit(2)
 	}
 	log := newLogger(*logLevel)
-	client, err := v2client.New(*metaAddr, splitList(*nodes))
+	// Cluster TLS is opt-in through -tls-ca or -tls-server-name so that an
+	// existing deployment which only enables TLS on the PostgreSQL listener
+	// keeps dialing a plaintext cluster. Once enabled, the same certificate as
+	// the PostgreSQL listener is presented for mTLS when it is configured.
+	clientTLS, err := clusterTLSOptions(*tlsCA, *tlsServerName, *tlsCert, *tlsKey)
+	if err != nil {
+		fatal(err)
+	}
+	client, err := v2client.NewWithTLS(*metaAddr, splitList(*nodes), clientTLS)
 	if err != nil {
 		fatal(err)
 	}
@@ -94,6 +105,7 @@ func main() {
 		"meta", *metaAddr,
 		"nodes", *nodes,
 		"tls", cfg.TLSEnabled(),
+		"cluster_tls", clientTLS != nil,
 		"auth", cfg.AuthEnabled())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -125,6 +137,18 @@ func pgwireConfig(tlsCert, tlsKey, authUser, authPassword string) (pgwire.Config
 		return pgwire.Config{}, err
 	}
 	return cfg, nil
+}
+
+// clusterTLSOptions builds the optional TLS options used to dial the meta and
+// KV services. Cluster TLS is enabled only when a CA bundle or a server name is
+// configured; the PostgreSQL listener's certificate/key flags alone do not turn
+// it on, which keeps existing listener-only TLS deployments working against a
+// plaintext cluster. An incomplete certificate/key pair is an error.
+func clusterTLSOptions(caFile, serverName, certFile, keyFile string) (*grpctls.ClientOptions, error) {
+	if caFile == "" && serverName == "" {
+		return nil, nil
+	}
+	return grpctls.NewClientOptions(caFile, certFile, keyFile, serverName)
 }
 
 func splitList(s string) []string {

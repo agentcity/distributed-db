@@ -8,9 +8,6 @@ import (
 
 	"distributed-db/internal/meta"
 	pbv2 "distributed-db/internal/pb/v2"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -205,7 +202,7 @@ func (s *Server) RemoveReplica(ctx context.Context, rangeID uint64, target strin
 // addReplicaOnTarget asks the target node to create/restart the range group as
 // a learner.
 func (s *Server) addReplicaOnTarget(ctx context.Context, r meta.Range, target string) (*pbv2.AddReplicaResponse, error) {
-	resp, err := callAddReplica(ctx, target, &pbv2.AddReplicaRequest{
+	resp, err := s.callAddReplica(ctx, target, &pbv2.AddReplicaRequest{
 		RangeId: r.ID,
 		Target:  target,
 		Peers:   append([]string(nil), r.Replicas...),
@@ -232,7 +229,7 @@ func (s *Server) addLearnerOnLeader(ctx context.Context, r meta.Range, target st
 		if err != nil {
 			lastErr = fmt.Errorf("find leader: %w", err)
 		} else {
-			resp, callErr := callAddLearner(ctx, leader, r.ID, target, r.Version)
+			resp, callErr := s.callAddLearner(ctx, leader, r.ID, target, r.Version)
 			if callErr != nil {
 				lastErr = fmt.Errorf("%s: %w", leader, callErr)
 			} else if resp.GetSuccess() {
@@ -261,7 +258,7 @@ func (s *Server) promoteOnLeader(ctx context.Context, r meta.Range, target strin
 		if err != nil {
 			lastErr = fmt.Errorf("find leader: %w", err)
 		} else {
-			resp, callErr := callPromoteReplica(ctx, leader, r.ID, target, r.Version)
+			resp, callErr := s.callPromoteReplica(ctx, leader, r.ID, target, r.Version)
 			if callErr != nil {
 				lastErr = fmt.Errorf("%s: %w", leader, callErr)
 			} else if resp.GetSuccess() {
@@ -287,13 +284,13 @@ func (s *Server) waitLearnerCaughtUp(ctx context.Context, leader, target string,
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	leaderStatus, err := callRangeStatus(ctx, leader, rangeID)
+	leaderStatus, err := s.callRangeStatus(ctx, leader, rangeID)
 	if err != nil {
 		return fmt.Errorf("leader status: %w", err)
 	}
 	want := leaderStatus.GetCommitIndex()
 	for {
-		targetStatus, err := callRangeStatus(ctx, target, rangeID)
+		targetStatus, err := s.callRangeStatus(ctx, target, rangeID)
 		if err == nil && targetStatus.GetLastApplied() >= want {
 			return nil
 		}
@@ -325,7 +322,7 @@ func (s *Server) removeVoterWithTransfer(ctx context.Context, r meta.Range, targ
 				lastErr = fmt.Errorf("leadership still on %s", target)
 			}
 		} else {
-			resp, callErr := callRemoveVoter(ctx, leader, r.ID, target, r.Version)
+			resp, callErr := s.callRemoveVoter(ctx, leader, r.ID, target, r.Version)
 			if callErr != nil {
 				lastErr = fmt.Errorf("%s: %w", leader, callErr)
 			} else if resp.GetSuccess() {
@@ -382,7 +379,7 @@ func (s *Server) transferAwayFrom(ctx context.Context, r meta.Range, leader stri
 // logged, not returned: after RemoveVoter the target no longer contributes to
 // quorum, and a restarted stale group is rejected as a non-voter candidate.
 func (s *Server) stopReplicaOnTarget(ctx context.Context, target string, rangeID uint64) {
-	resp, err := callRemoveReplica(ctx, target, rangeID, target)
+	resp, err := s.callRemoveReplica(ctx, target, rangeID, target)
 	if err != nil {
 		if s.log != nil {
 			s.log.Warn("stop removed replica failed", "range", rangeID, "target", target, "error", err)
@@ -400,7 +397,7 @@ func (s *Server) stopReplicaOnTarget(ctx context.Context, target string, rangeID
 // replica set; a failure leaves the meta map unchanged and the orchestration
 // can be retried.
 func (s *Server) propagateRangeEpoch(ctx context.Context, replicas []string, rangeID, epoch uint64) error {
-	errs := callReplicas(ctx, replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
+	errs := s.callReplicas(ctx, replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
 		resp, err := client.UpdateRangeEpoch(ctx, &pbv2.UpdateRangeEpochRequest{
 			RangeId: rangeID, Epoch: epoch,
 		})
@@ -415,8 +412,8 @@ func (s *Server) propagateRangeEpoch(ctx context.Context, replicas []string, ran
 	return replicaFailures("update range epoch", replicas, errs)
 }
 
-func callAddReplica(ctx context.Context, addr string, req *pbv2.AddReplicaRequest) (*pbv2.AddReplicaResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callAddReplica(ctx context.Context, addr string, req *pbv2.AddReplicaRequest) (*pbv2.AddReplicaResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -426,8 +423,8 @@ func callAddReplica(ctx context.Context, addr string, req *pbv2.AddReplicaReques
 	return pbv2.NewKVServiceClient(cc).AddReplica(callCtx, req)
 }
 
-func callRemoveReplica(ctx context.Context, addr string, rangeID uint64, target string) (*pbv2.RemoveReplicaResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callRemoveReplica(ctx context.Context, addr string, rangeID uint64, target string) (*pbv2.RemoveReplicaResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -439,8 +436,8 @@ func callRemoveReplica(ctx context.Context, addr string, rangeID uint64, target 
 	})
 }
 
-func callAddLearner(ctx context.Context, addr string, rangeID uint64, target string, epoch uint64) (*pbv2.MembershipResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callAddLearner(ctx context.Context, addr string, rangeID uint64, target string, epoch uint64) (*pbv2.MembershipResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -452,8 +449,8 @@ func callAddLearner(ctx context.Context, addr string, rangeID uint64, target str
 	})
 }
 
-func callPromoteReplica(ctx context.Context, addr string, rangeID uint64, target string, epoch uint64) (*pbv2.MembershipResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callPromoteReplica(ctx context.Context, addr string, rangeID uint64, target string, epoch uint64) (*pbv2.MembershipResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -465,8 +462,8 @@ func callPromoteReplica(ctx context.Context, addr string, rangeID uint64, target
 	})
 }
 
-func callRemoveVoter(ctx context.Context, addr string, rangeID uint64, target string, epoch uint64) (*pbv2.MembershipResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callRemoveVoter(ctx context.Context, addr string, rangeID uint64, target string, epoch uint64) (*pbv2.MembershipResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}

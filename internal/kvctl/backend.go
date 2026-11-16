@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"distributed-db/internal/backup"
+	"distributed-db/internal/grpctls"
 	"distributed-db/internal/v2client"
 )
 
@@ -16,10 +17,25 @@ func openV2Backend(_ context.Context, cfg Config) (Backend, error) {
 		c   *v2client.Client
 		err error
 	)
+	var tls *grpctls.ClientOptions
+	if cfg.TLSCA != "" || cfg.TLSCert != "" || cfg.TLSKey != "" || cfg.TLSServerName != "" {
+		tls, err = grpctls.NewClientOptions(cfg.TLSCA, cfg.TLSCert, cfg.TLSKey, cfg.TLSServerName)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(cfg.Nodes) == 0 {
-		c, err = v2client.NewMetaOnly(cfg.Meta)
+		if tls != nil {
+			c, err = v2client.NewMetaOnlyWithTLS(cfg.Meta, tls)
+		} else {
+			c, err = v2client.NewMetaOnly(cfg.Meta)
+		}
 	} else {
-		c, err = v2client.New(cfg.Meta, cfg.Nodes)
+		if tls != nil {
+			c, err = v2client.NewWithTLS(cfg.Meta, cfg.Nodes, tls)
+		} else {
+			c, err = v2client.New(cfg.Meta, cfg.Nodes)
+		}
 	}
 	if err != nil {
 		return nil, err

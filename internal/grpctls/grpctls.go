@@ -18,19 +18,20 @@
 //
 // # Integration points
 //
-// KV, Raft, and meta servers pass ServerCredentials to grpc.NewServer:
+// A process that both serves gRPC and dials its peers (kvserver, metaserver)
+// embeds Options in its configuration and builds both credential sets at once:
 //
-//	creds, err := grpctls.ServerCredentials(grpctls.ServerOptions{
-//		CertFile:     cfg.TLSCertFile,
-//		KeyFile:      cfg.TLSKeyFile,
-//		ClientCAFile: cfg.TLSClientCAFile, // non-empty enables mTLS
-//	})
+//	serverCreds, peerCreds, err := cfg.TLS.Credentials()
 //	if err != nil {
 //		return nil, err
 //	}
-//	srv := grpc.NewServer(grpc.Creds(creds))
+//	if serverCreds != nil {
+//		srv := grpc.NewServer(grpc.Creds(serverCreds))
+//	}
+//	// Peer dials use peerCreds, which is nil only when TLS is disabled.
 //
-// v2client and meta peers pass ClientCredentials to grpc.NewClient:
+// A client that only dials (v2client and the SQL front ends) uses
+// ClientOptions directly:
 //
 //	creds, err := grpctls.ClientCredentials(grpctls.ClientOptions{
 //		CAFile:     cfg.TLSCAFile,
@@ -50,6 +51,7 @@ package grpctls
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 
@@ -116,6 +118,102 @@ type ClientOptions struct {
 	InsecureSkipVerify bool
 	// MinVersion is the minimum accepted TLS version. Zero means TLS 1.3.
 	MinVersion uint16
+}
+
+// Options is the reusable TLS/mTLS configuration of a process that both serves
+// gRPC and dials peer gRPC services (a KV node, a meta node, or a combined
+// process).
+//
+// Server configures the inbound listener: CertFile/KeyFile enable TLS and
+// Server.ClientCAFile enables mTLS. Client configures outbound connections:
+// Client.CAFile and Client.ServerName select the trust root and expected
+// server name. When Client.CertFile is empty, outbound connections present the
+// node's own server certificate, which is what a homogeneous cluster needs for
+// mTLS between its members.
+//
+// The zero value means plaintext. A partially configured value (for example a
+// certificate without a key, or client-only options without a server
+// certificate) is an error: callers must not silently fall back to plaintext.
+type Options struct {
+	Server ServerOptions
+	Client ClientOptions
+}
+
+// Enabled reports whether TLS is configured for the inbound listener. It is
+// false for the zero value and for a misconfigured half-configuration.
+func (o Options) Enabled() bool {
+	return o.Server.CertFile != "" || o.Server.KeyFile != ""
+}
+
+// Validate checks that the configuration is either completely empty
+// (plaintext) or a complete TLS/mTLS configuration. It does not touch the
+// filesystem; Credentials does that.
+func (o Options) Validate() error {
+	if (o.Server.CertFile == "") != (o.Server.KeyFile == "") {
+		return errors.New("grpctls: TLS requires both CertFile and KeyFile")
+	}
+	if (o.Client.CertFile == "") != (o.Client.KeyFile == "") {
+		return errors.New("grpctls: TLS client certificate requires both Client.CertFile and Client.KeyFile")
+	}
+	if !o.Enabled() {
+		if o.Client != (ClientOptions{}) || o.Server.ClientCAFile != "" || o.Server.MinVersion != 0 || o.Server.ServerName != "" {
+			return errors.New("grpctls: client TLS options require server CertFile and KeyFile (plaintext nodes cannot verify or present certificates)")
+		}
+		return nil
+	}
+	return nil
+}
+
+// ClientOptions returns the client options used for peer dials, defaulting the
+// client identity to the node's own certificate when no distinct client
+// certificate is configured.
+func (o Options) ClientOptions() ClientOptions {
+	client := o.Client
+	if client.CertFile == "" {
+		client.CertFile = o.Server.CertFile
+		client.KeyFile = o.Server.KeyFile
+	}
+	return client
+}
+
+// Credentials validates the options and builds the server and client gRPC
+// transport credentials. Both results are nil when TLS is disabled, which is
+// the only case in which callers may use credentials/insecure.
+func (o Options) Credentials() (server, client credentials.TransportCredentials, err error) {
+	if err := o.Validate(); err != nil {
+		return nil, nil, err
+	}
+	if !o.Enabled() {
+		return nil, nil, nil
+	}
+	server, err = ServerCredentials(o.Server)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err = ClientCredentials(o.ClientOptions())
+	if err != nil {
+		return nil, nil, err
+	}
+	return server, client, nil
+}
+
+// NewClientOptions builds optional client TLS options from file paths for a
+// client that only dials (SQL front ends, the CLI). It returns nil, meaning
+// plaintext, when every field is empty. A certificate without its key is
+// rejected; the files themselves are read later by ClientCredentials.
+func NewClientOptions(caFile, certFile, keyFile, serverName string) (*ClientOptions, error) {
+	if caFile == "" && certFile == "" && keyFile == "" && serverName == "" {
+		return nil, nil
+	}
+	if (certFile == "") != (keyFile == "") {
+		return nil, errors.New("grpctls: client TLS requires both CertFile and KeyFile")
+	}
+	return &ClientOptions{
+		CAFile:     caFile,
+		CertFile:   certFile,
+		KeyFile:    keyFile,
+		ServerName: serverName,
+	}, nil
 }
 
 // ServerConfig builds a server tls.Config from opts.

@@ -93,6 +93,13 @@ type Config struct {
 	Format  string // table, json, raw
 	Hex     bool   // keys/values on input/output are hexadecimal
 	Quiet   bool
+
+	// TLS enables TLS/mTLS for meta and KV gRPC connections. An empty
+	// TLSCA/cert/key/server-name leaves the connection plaintext (dev).
+	TLSCA         string
+	TLSCert       string
+	TLSKey        string
+	TLSServerName string
 }
 
 // Runner executes one kvctl invocation. Open creates a backend; tests replace
@@ -137,6 +144,10 @@ Global flags:
   -format table|json|raw    output format (default table)
   -hex                      treat keys/values as hex on input and output
   -quiet                    suppress success messages
+  -tls-ca FILE              PEM CA bundle for meta/KV server verification
+  -tls-cert FILE            PEM client certificate for mTLS
+  -tls-key FILE             PEM client private key (with -tls-cert)
+  -tls-server-name NAME     expected server name for certificate verification
 
   ranges, status, split and merge only need -meta. get, put, delete, scan,
   txn, shell, ping and backup also require -nodes. Backup defaults to a 10m
@@ -187,6 +198,10 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 	format := fs.String("format", envOr("KVCTL_FORMAT", "table"), "table, json or raw")
 	hexMode := fs.Bool("hex", false, "hex keys/values")
 	quiet := fs.Bool("quiet", false, "suppress success messages")
+	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for meta/KV servers")
+	tlsCert := fs.String("tls-cert", "", "PEM client cert for mTLS")
+	tlsKey := fs.String("tls-key", "", "PEM client key for mTLS")
+	tlsServerName := fs.String("tls-server-name", "", "expected server name")
 	fs.Usage = func() { fmt.Fprint(r.errOut(), usageText) }
 
 	if err := fs.Parse(args); err != nil {
@@ -217,12 +232,16 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		return 0
 	}
 	cfg := Config{
-		Meta:    *meta,
-		Nodes:   splitList(*nodes),
-		Timeout: *timeout,
-		Format:  strings.ToLower(*format),
-		Hex:     *hexMode,
-		Quiet:   *quiet,
+		Meta:          *meta,
+		Nodes:         splitList(*nodes),
+		Timeout:       *timeout,
+		Format:        strings.ToLower(*format),
+		Hex:           *hexMode,
+		Quiet:         *quiet,
+		TLSCA:         *tlsCA,
+		TLSCert:       *tlsCert,
+		TLSKey:        *tlsKey,
+		TLSServerName: *tlsServerName,
 	}
 	if cfg.Timeout <= 0 {
 		fmt.Fprintln(r.errOut(), "kvctl: -timeout must be > 0")

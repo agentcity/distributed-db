@@ -18,9 +18,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
+	"distributed-db/internal/grpctls"
 	pbv2 "distributed-db/internal/pb/v2"
 )
 
@@ -212,9 +214,13 @@ type Client struct {
 	closed  bool
 
 	addrs []string
+	// transportCreds is the credentials used for KV node connections. It is
+	// nil only for a Client built directly by tests, which keeps the plaintext
+	// default; New/NewWithOptions/NewWithTLS always set it.
+	transportCreds credentials.TransportCredentials
 	// dialOpts are applied to KV node connections. They are useful for
-	// custom timeouts, TLS and test interceptors; meta connections are
-	// intentionally unaffected.
+	// custom timeouts, test interceptors and advanced transport settings;
+	// transport security itself is set by Options.TLS or NewWithTLS.
 	dialOpts []grpc.DialOption
 
 	// Meta service connection pool and leader discovery. Connections are
@@ -251,16 +257,37 @@ type leaderEntry struct {
 	until time.Time
 }
 
-// New connects to the meta service and one or more KV nodes. It does not dial
-// KV nodes until the first operation.
+// Options configures a Client.
+//
+// TLS, when non-nil, secures every connection the client opens: the initial
+// meta connection, every meta failover dial and every KV node dial. A nil TLS
+// keeps the historical plaintext transport, which is a development default
+// and not suitable for production.
+//
+// When TLS is set there is no plaintext fallback: an invalid CA, certificate
+// or key makes the constructor fail, and an unverifiable server makes the RPC
+// fail.
+type Options struct {
+	// TLS enables TLS (and mTLS when a client certificate is set) for both
+	// meta and KV dials.
+	TLS *grpctls.ClientOptions
+	// DialOptions are extra gRPC options applied to KV node connections in
+	// addition to the transport credentials. They are useful for keepalive
+	// settings and test interceptors.
+	DialOptions []grpc.DialOption
+}
+
+// New connects to the meta service and one or more KV nodes over plaintext. It
+// does not dial KV nodes until the first operation. Use NewWithTLS or
+// NewWithOptions for a TLS cluster.
 func New(metaAddr string, addrs []string) (*Client, error) {
 	return NewWithDialOptions(metaAddr, addrs)
 }
 
 // NewWithDialOptions is New with additional gRPC dial options applied to KV
-// node connections. Meta connections use the default options. It is primarily
-// useful for custom transport security, keepalive settings and test
-// interceptors.
+// node connections. Meta connections use the default options. It is retained
+// for compatibility; new code that needs transport security should use
+// NewWithOptions/NewWithTLS so that meta connections are covered too.
 func NewWithDialOptions(metaAddr string, addrs []string, opts ...grpc.DialOption) (*Client, error) {
 	if metaAddr == "" {
 		return nil, errors.New("v2client: meta address is required")
@@ -268,35 +295,78 @@ func NewWithDialOptions(metaAddr string, addrs []string, opts ...grpc.DialOption
 	if len(addrs) == 0 {
 		return nil, errors.New("v2client: at least one node address is required")
 	}
-	return newClient(metaAddr, addrs, opts...)
+	return newClient(metaAddr, addrs, nil, opts...)
 }
 
-// NewMetaOnly connects only to the meta service. It is intended for
-// administrative operations that read or change the range map (listing,
+// NewWithOptions is New with explicit transport options. When opts.TLS is set,
+// both meta and KV connections use it.
+func NewWithOptions(metaAddr string, addrs []string, opts Options) (*Client, error) {
+	if metaAddr == "" {
+		return nil, errors.New("v2client: meta address is required")
+	}
+	if len(addrs) == 0 {
+		return nil, errors.New("v2client: at least one node address is required")
+	}
+	return newClient(metaAddr, addrs, opts.TLS, opts.DialOptions...)
+}
+
+// NewWithTLS is New with TLS/mTLS enabled for both meta and KV connections.
+// The TLS options are validated before any connection is created; an error is
+// returned instead of falling back to plaintext.
+func NewWithTLS(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions) (*Client, error) {
+	if metaAddr == "" {
+		return nil, errors.New("v2client: meta address is required")
+	}
+	if len(addrs) == 0 {
+		return nil, errors.New("v2client: at least one node address is required")
+	}
+	return newClient(metaAddr, addrs, clientTLS)
+}
+
+// NewMetaOnly connects only to the meta service over plaintext. It is intended
+// for administrative operations that read or change the range map (listing,
 // splitting and merging ranges, or asking for the meta leader) where no KV
 // node address is needed. Data operations are intended for a client created
 // with New.
 func NewMetaOnly(metaAddr string) (*Client, error) {
-	return newClient(metaAddr, nil)
+	return newClient(metaAddr, nil, nil)
 }
 
-func newClient(metaAddr string, addrs []string, opts ...grpc.DialOption) (*Client, error) {
+// NewMetaOnlyWithTLS is NewMetaOnly with TLS/mTLS for the meta connection.
+func NewMetaOnlyWithTLS(metaAddr string, clientTLS *grpctls.ClientOptions) (*Client, error) {
+	return newClient(metaAddr, nil, clientTLS)
+}
+
+// newClient builds a Client. clientTLS nil means plaintext; a non-nil value is
+// validated and used for every meta and KV dial.
+func newClient(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions, opts ...grpc.DialOption) (*Client, error) {
 	if metaAddr == "" {
 		return nil, errors.New("v2client: meta address is required")
 	}
-	metaOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	transportCreds := insecure.NewCredentials()
+	if clientTLS != nil {
+		creds, err := grpctls.ClientCredentials(*clientTLS)
+		if err != nil {
+			return nil, fmt.Errorf("v2client: TLS: %w", err)
+		}
+		transportCreds = creds
+	}
+	metaOpts := []grpc.DialOption{grpc.WithTransportCredentials(transportCreds)}
 	cc, err := grpc.NewClient(metaAddr, metaOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("v2client: dial meta: %w", err)
 	}
 	mc := pbv2.NewMetaServiceClient(cc)
 	return &Client{
-		meta:            mc,
-		metaAddr:        metaAddr,
-		metaSeeds:       []string{metaAddr},
-		metaPool:        map[string]*metaEntry{metaAddr: {cc: cc, mc: mc}},
-		metaDial:        dialMeta,
+		meta:      mc,
+		metaAddr:  metaAddr,
+		metaSeeds: []string{metaAddr},
+		metaPool:  map[string]*metaEntry{metaAddr: {cc: cc, mc: mc}},
+		metaDial: func(addr string) (*grpc.ClientConn, metaAPI, error) {
+			return dialMeta(addr, metaOpts...)
+		},
 		addrs:           append([]string(nil), addrs...),
+		transportCreds:  transportCreds,
 		dialOpts:        append([]grpc.DialOption(nil), opts...),
 		clients:         make(map[string]pbv2.KVServiceClient),
 		conns:           make(map[string]*grpc.ClientConn),
@@ -359,8 +429,14 @@ func (c *Client) node(addr string) (pbv2.KVServiceClient, error) {
 	if cl, ok := c.clients[addr]; ok {
 		return cl, nil
 	}
+	creds := c.transportCreds
+	if creds == nil {
+		// Only a Client assembled directly by tests has nil credentials; the
+		// public constructors always set the configured transport security.
+		creds = insecure.NewCredentials()
+	}
 	opts := make([]grpc.DialOption, 0, len(c.dialOpts)+1)
-	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts = append(opts, grpc.WithTransportCredentials(creds))
 	opts = append(opts, c.dialOpts...)
 	cc, err := grpc.NewClient(addr, opts...)
 	if err != nil {

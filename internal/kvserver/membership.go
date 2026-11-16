@@ -68,7 +68,7 @@ func (s *Server) addRangeGroup(rc RangeConfig) (*rangeGroup, error) {
 		return nil, errors.New("kvserver: range ID must be non-zero")
 	}
 
-	g, err := newRangeGroup(s.cfg, s.engine, normalized)
+	g, err := newRangeGroup(s.cfg, s.engine, normalized, s.peerCreds)
 	if err != nil {
 		return nil, err
 	}

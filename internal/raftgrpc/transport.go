@@ -6,24 +6,50 @@ import (
 	"fmt"
 	"sync"
 
+	"distributed-db/internal/grpctls"
 	pbv2 "distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Transport dials peers lazily and implements raft.Transport and
 // raft.SnapshotTransport.
+//
+// A Transport built with New keeps the plaintext behavior used by standalone
+// meta servers and development clusters. A Transport built with NewWithTLS
+// uses the supplied client credentials for every peer dial; there is no
+// plaintext fallback once TLS is configured.
 type Transport struct {
+	// creds is nil for plaintext transports and non-nil for TLS transports.
+	creds credentials.TransportCredentials
+
 	mu      sync.Mutex
 	clients map[string]pbv2.RaftServiceClient
 	conns   map[string]*grpc.ClientConn
 }
 
-// New returns an empty transport.
+// New returns an empty plaintext transport.
 func New() *Transport {
+	return newTransport(nil)
+}
+
+// NewWithTLS returns an empty transport that dials every peer with TLS (and
+// mTLS when clientTLS carries a certificate). It validates the options and
+// returns an error instead of silently falling back to plaintext.
+func NewWithTLS(clientTLS grpctls.ClientOptions) (*Transport, error) {
+	creds, err := grpctls.ClientCredentials(clientTLS)
+	if err != nil {
+		return nil, fmt.Errorf("raftgrpc: client TLS: %w", err)
+	}
+	return newTransport(creds), nil
+}
+
+func newTransport(creds credentials.TransportCredentials) *Transport {
 	return &Transport{
+		creds:   creds,
 		clients: make(map[string]pbv2.RaftServiceClient),
 		conns:   make(map[string]*grpc.ClientConn),
 	}
@@ -35,7 +61,13 @@ func (t *Transport) client(peer string) (pbv2.RaftServiceClient, error) {
 	if c, ok := t.clients[peer]; ok {
 		return c, nil
 	}
-	cc, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds := t.creds
+	if creds == nil {
+		// Plaintext is the explicit development default; a TLS transport
+		// always carries non-nil creds.
+		creds = insecure.NewCredentials()
+	}
+	cc, err := grpc.NewClient(peer, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, fmt.Errorf("raftgrpc: dial %s: %w", peer, err)
 	}

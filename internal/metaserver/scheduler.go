@@ -12,9 +12,6 @@ import (
 
 	"distributed-db/internal/meta"
 	pbv2 "distributed-db/internal/pb/v2"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // schedulerRPCTimeout bounds every per-replica KVService administration call.
@@ -106,7 +103,7 @@ func (s *Server) splitRangeLocked(ctx context.Context, req *pbv2.MetaSplitRangeR
 	// from the local AllocID counter (different meta replicas could disagree).
 	newID := maxID + 1
 
-	errs := callReplicasWithRetry(ctx, old.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
+	errs := s.callReplicasWithRetry(ctx, old.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
 		resp, err := client.SplitRange(ctx, &pbv2.SplitRangeRequest{
 			RangeId:    old.ID,
 			SplitKey:   splitKey,
@@ -220,7 +217,7 @@ func (s *Server) mergeRangesLocked(ctx context.Context, req *pbv2.MetaMergeRange
 		return mergeFailed("merge: range %d has no replicas", leftID), nil
 	}
 
-	errs := callReplicasWithRetry(ctx, left.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
+	errs := s.callReplicasWithRetry(ctx, left.Replicas, func(ctx context.Context, client pbv2.KVServiceClient) error {
 		resp, err := client.MergeRanges(ctx, &pbv2.MergeRangesRequest{
 			LeftRangeId:  left.ID,
 			RightRangeId: right.ID,
@@ -630,7 +627,7 @@ func (s *Server) queryRangeStats(ctx context.Context, r meta.Range) (*pbv2.Range
 	var lastErr error
 	for attempt := 0; attempt < schedulerAttempts; attempt++ {
 		for _, addr := range order {
-			resp, err := callRangeStats(ctx, addr, r)
+			resp, err := s.callRangeStats(ctx, addr, r)
 			if err != nil {
 				lastErr = err
 				continue
@@ -658,8 +655,8 @@ func (s *Server) queryRangeStats(ctx context.Context, r meta.Range) (*pbv2.Range
 }
 
 // callRangeStats performs one RangeStats RPC against one replica.
-func callRangeStats(ctx context.Context, addr string, r meta.Range) (*pbv2.RangeStatsResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callRangeStats(ctx context.Context, addr string, r meta.Range) (*pbv2.RangeStatsResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -775,10 +772,10 @@ func adjacent(left, right meta.Range) bool {
 
 // callReplicasWithRetry retries a partially failed fan-out. KV split and
 // merge are idempotent, so retrying the whole replica set is safe.
-func callReplicasWithRetry(ctx context.Context, replicas []string, call func(context.Context, pbv2.KVServiceClient) error) []error {
+func (s *Server) callReplicasWithRetry(ctx context.Context, replicas []string, call func(context.Context, pbv2.KVServiceClient) error) []error {
 	var errs []error
 	for attempt := 0; attempt < schedulerAttempts; attempt++ {
-		errs = callReplicas(ctx, replicas, call)
+		errs = s.callReplicas(ctx, replicas, call)
 		if allOK(errs) {
 			return errs
 		}
@@ -803,10 +800,10 @@ func allOK(errs []error) bool {
 }
 
 // callReplicas invokes call on every replica concurrently. Each replica gets
-// its own short-lived connection (insecure credentials, as the rest of the v2
-// data plane uses) and its own 10s timeout derived from ctx. It always waits
-// for all calls, and the returned slice is indexed like replicas.
-func callReplicas(ctx context.Context, replicas []string, call func(context.Context, pbv2.KVServiceClient) error) []error {
+// its own short-lived connection carrying the server's transport security and
+// its own bounded timeout derived from ctx. It always waits for all calls, and
+// the returned slice is indexed like replicas.
+func (s *Server) callReplicas(ctx context.Context, replicas []string, call func(context.Context, pbv2.KVServiceClient) error) []error {
 	errs := make([]error, len(replicas))
 	var wg sync.WaitGroup
 	wg.Add(len(replicas))
@@ -814,7 +811,7 @@ func callReplicas(ctx context.Context, replicas []string, call func(context.Cont
 		go func(i int) {
 			defer wg.Done()
 			addr := replicas[i]
-			cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			cc, err := s.dial(addr)
 			if err != nil {
 				errs[i] = fmt.Errorf("dial %s: %w", addr, err)
 				return

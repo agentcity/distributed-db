@@ -14,6 +14,8 @@ import (
 	"distributed-db/internal/mvcc"
 	"distributed-db/internal/raft"
 	"distributed-db/internal/storage"
+
+	"google.golang.org/grpc/credentials"
 )
 
 // rangeGroup is one independently replicated range hosted by a Server. All
@@ -65,7 +67,7 @@ func sharedEngineDir(dataDir string) string {
 // newRangeGroup builds a group over the shared engine and opens its Raft log.
 // The returned group is not running until start is called. The shared engine
 // is owned by the Server, so groups never close it.
-func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig) (*rangeGroup, error) {
+func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig, peerCreds credentials.TransportCredentials) (*rangeGroup, error) {
 	if shared == nil {
 		return nil, fmt.Errorf("kvserver: range %d: shared storage engine is nil", rc.ID)
 	}
@@ -83,7 +85,7 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig) (*rangeGro
 
 	store := mvcc.New(engine)
 	sm := &stateMachine{store: store, engine: engine}
-	tr := newPeerTransport(cfg.Logger, rc.ID, cfg.PeerAddrs)
+	tr := newPeerTransport(cfg.Logger, rc.ID, cfg.PeerAddrs, peerCreds)
 	node, err := raft.New(raft.Config{
 		ID:                 cfg.ID,
 		Peers:              append([]string(nil), rc.Peers...),

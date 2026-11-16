@@ -331,6 +331,31 @@ func TestEnvConfig(t *testing.T) {
 	}
 }
 
+func TestTLSConfigForwarded(t *testing.T) {
+	f := newFake()
+	f.data["k"] = []byte("v")
+	var got Config
+	r := &Runner{
+		In:  strings.NewReader(""),
+		Out: ioDiscard{},
+		Err: ioDiscard{},
+		Open: func(_ context.Context, cfg Config) (Backend, error) {
+			got = cfg
+			return f, nil
+		},
+	}
+	code := r.Run(context.Background(), []string{
+		"-nodes", "n1", "-tls-ca", "ca.pem", "-tls-cert", "c.pem",
+		"-tls-key", "k.pem", "-tls-server-name", "kv.test", "get", "k",
+	})
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	if got.TLSCA != "ca.pem" || got.TLSCert != "c.pem" || got.TLSKey != "k.pem" || got.TLSServerName != "kv.test" {
+		t.Fatalf("tls config = %#v", got)
+	}
+}
+
 func TestShell(t *testing.T) {
 	f := newFake()
 	code, out, _ := runCLI(t, f, "put a 1\nget a\nquit\n", "-nodes", "n1", "shell")

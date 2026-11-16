@@ -83,3 +83,44 @@ func TestPGWireConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestClusterTLSOptionsDisabledWithoutCAOrServerName(t *testing.T) {
+	// PostgreSQL listener TLS flags alone must not change cluster dialing:
+	// existing deployments may serve TLS to clients against a plaintext
+	// cluster.
+	opts, err := clusterTLSOptions("", "", "listener.pem", "listener.key")
+	if err != nil {
+		t.Fatalf("clusterTLSOptions: %v", err)
+	}
+	if opts != nil {
+		t.Fatalf("listener-only TLS enabled cluster TLS: %+v", opts)
+	}
+}
+
+func TestClusterTLSOptionsEnabledByCA(t *testing.T) {
+	opts, err := clusterTLSOptions("ca.pem", "", "listener.pem", "listener.key")
+	if err != nil {
+		t.Fatalf("clusterTLSOptions: %v", err)
+	}
+	if opts == nil || opts.CAFile != "ca.pem" || opts.CertFile != "listener.pem" ||
+		opts.KeyFile != "listener.key" {
+		t.Fatalf("clusterTLSOptions = %+v", opts)
+	}
+}
+
+func TestClusterTLSOptionsRejectsCertWithoutKey(t *testing.T) {
+	_, err := clusterTLSOptions("ca.pem", "", "listener.pem", "")
+	if err == nil || !strings.Contains(err.Error(), "both CertFile and KeyFile") {
+		t.Fatalf("error = %v, want a certificate/key pair error", err)
+	}
+}
+
+func TestClusterTLSOptionsServerNameOnly(t *testing.T) {
+	opts, err := clusterTLSOptions("", "meta.internal", "", "")
+	if err != nil {
+		t.Fatalf("clusterTLSOptions: %v", err)
+	}
+	if opts == nil || opts.ServerName != "meta.internal" {
+		t.Fatalf("server-name-only options = %+v", opts)
+	}
+}

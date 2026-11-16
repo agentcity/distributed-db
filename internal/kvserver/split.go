@@ -50,7 +50,7 @@ func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, 
 	newGroup, err := newRangeGroup(s.cfg, s.engine, RangeConfig{
 		ID: newID, Start: cloneBytes(splitKey), End: oldEnd,
 		Peers: cloneStrings(g.cfg.Peers), Epoch: g.cfg.Epoch + 1,
-	})
+	}, s.peerCreds)
 	if err != nil {
 		return nil, fmt.Errorf("kvserver: split range %d: create group: %w", rangeID, err)
 	}

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"distributed-db/internal/grpctls"
 	"distributed-db/internal/kvserver"
 	"distributed-db/internal/metaserver"
 )
@@ -35,9 +36,18 @@ func main() {
 		`state-machine durability for -mode=node: "sync" (fsync every batch; production default) `+
 			`or "fast" (skip state-machine fsyncs and rely on Raft log replay; `+
 			`NOT production-safe until crash tests pass)`)
+	tlsCert := flag.String("tls-cert", "", "PEM certificate for the gRPC listener; enables TLS (requires -tls-key)")
+	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert (requires -tls-cert)")
+	tlsClientCA := flag.String("tls-client-ca", "", "PEM CA bundle that signs client certificates; enables mTLS")
+	tlsCA := flag.String("tls-ca", "", "PEM CA bundle used to verify KV/meta peers (default: system roots)")
+	tlsServerName := flag.String("tls-server-name", "", "expected server name for peer certificate verification")
 	flag.Parse()
 
 	log := newLogger(*logLevel)
+	tlsCfg, err := tlsOptions(*tlsCert, *tlsKey, *tlsClientCA, *tlsCA, *tlsServerName)
+	if err != nil {
+		fatal(err)
+	}
 
 	switch *mode {
 	case "meta":
@@ -47,7 +57,7 @@ func main() {
 		}
 		metaCfg := metaserver.Config{
 			Addr: *addr, ID: metaIDVal, Peers: splitList(*metaPeers),
-			DataDir: *metaDataDir, Logger: log,
+			DataDir: *metaDataDir, Logger: log, TLS: tlsCfg,
 		}
 		if len(metaCfg.Peers) > 0 {
 			metaCfg.Replicated = true
@@ -61,7 +71,7 @@ func main() {
 		if err := srv.Start(ctx); err != nil {
 			fatal(err)
 		}
-		log.Info("kv2 meta started", "addr", srv.Addr())
+		log.Info("kv2 meta started", "addr", srv.Addr(), "tls", tlsCfg.Enabled(), "mtls", *tlsClientCA != "")
 		<-ctx.Done()
 		_ = srv.Stop()
 
@@ -80,6 +90,7 @@ func main() {
 			Peers:          splitList(*peers),
 			DurabilityMode: *durability,
 			Logger:         log,
+			TLS:            tlsCfg,
 		})
 		if err != nil {
 			fatal(err)
@@ -89,7 +100,8 @@ func main() {
 		if err := srv.Start(ctx); err != nil {
 			fatal(err)
 		}
-		log.Info("kv2 node started", "id", *id, "addr", srv.Addr())
+		log.Info("kv2 node started", "id", *id, "addr", srv.Addr(),
+			"tls", tlsCfg.Enabled(), "mtls", *tlsClientCA != "")
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -101,6 +113,28 @@ func main() {
 	default:
 		fatal(fmt.Errorf("unknown mode %q (want node or meta)", *mode))
 	}
+}
+
+// tlsOptions builds and validates the cluster TLS configuration from the
+// command-line flags. The zero value (no flags) keeps plaintext; a certificate
+// without its key, or client-only flags without a server certificate, is
+// rejected instead of silently disabling TLS.
+func tlsOptions(certFile, keyFile, clientCAFile, caFile, serverName string) (grpctls.Options, error) {
+	opts := grpctls.Options{
+		Server: grpctls.ServerOptions{
+			CertFile:     certFile,
+			KeyFile:      keyFile,
+			ClientCAFile: clientCAFile,
+		},
+		Client: grpctls.ClientOptions{
+			CAFile:     caFile,
+			ServerName: serverName,
+		},
+	}
+	if err := opts.Validate(); err != nil {
+		return grpctls.Options{}, err
+	}
+	return opts, nil
 }
 
 func splitList(s string) []string {

@@ -18,7 +18,10 @@ import (
 	"distributed-db/internal/raft"
 	"distributed-db/internal/storage"
 
+	"distributed-db/internal/grpctls"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // Durability modes accepted by Config.DurabilityMode. Values are matched
@@ -107,6 +110,24 @@ type Config struct {
 	// New code should prefer DurabilityMode; this field remains for existing
 	// callers.
 	SyncStateMachine bool
+
+	// TLS configures TLS/mTLS for the gRPC listener (KVService and
+	// RaftService) and for outbound Raft peer dials.
+	//
+	// The zero value keeps the historical plaintext transport. Setting
+	// TLS.Server.CertFile and TLS.Server.KeyFile enables TLS on the listener
+	// and makes every peer dial use TLS as well; there is no mixed mode and no
+	// plaintext fallback. TLS.Server.ClientCAFile enables mTLS and rejects
+	// clients without a certificate signed by that CA.
+	//
+	// Peer dials verify servers against TLS.Client.CAFile (or the system roots
+	// when empty) and present the node certificate unless a distinct
+	// TLS.Client.CertFile/KeyFile is configured. With mTLS enabled the node
+	// certificate must be valid for client authentication too (ServerAuth and
+	// ClientAuth extended key usages), or a distinct client certificate must be
+	// supplied. TLS.Client.ServerName is required when peers are addressed by
+	// IP address and the certificate has no IP SAN.
+	TLS grpctls.Options
 }
 
 // resolveSyncWrites maps DurabilityMode and the SyncStateMachine override to
@@ -153,6 +174,11 @@ type Server struct {
 	grpcSrv *grpc.Server
 	lis     net.Listener
 
+	// peerCreds is non-nil only when TLS is configured. It is handed to every
+	// range group's peer transport so Raft traffic uses the same credentials
+	// as the listener; a nil value means the node runs plaintext.
+	peerCreds credentials.TransportCredentials
+
 	// hostMu protects groups/groupIDs/defaultID/cfg.Ranges after Start.
 	hostMu sync.RWMutex
 
@@ -196,6 +222,14 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 100 * time.Millisecond
 	}
+	// Resolve TLS before touching the filesystem so a half-configured
+	// certificate/key pair fails fast. When TLS is configured there is no
+	// plaintext fallback: either both server and peer credentials are built
+	// or New returns an error.
+	serverCreds, peerCreds, err := cfg.TLS.Credentials()
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: TLS: %w", err)
+	}
 	if persisted, err := loadPersistedRanges(cfg.DataDir); err != nil {
 		return nil, err
 	} else if len(persisted) > 0 {
@@ -230,6 +264,7 @@ func New(cfg Config) (*Server, error) {
 		log:        cfg.Logger.With("node", cfg.ID),
 		engine:     shared,
 		syncWrites: syncWrites,
+		peerCreds:  peerCreds,
 		groups:     make(map[uint64]*rangeGroup, len(ranges)),
 		groupIDs:   make([]uint64, 0, len(ranges)),
 		defaultID:  0,
@@ -238,7 +273,7 @@ func New(cfg Config) (*Server, error) {
 		s.defaultID = ranges[0].ID
 	}
 	for _, rc := range ranges {
-		g, err := newRangeGroup(cfg, shared, rc)
+		g, err := newRangeGroup(cfg, shared, rc, peerCreds)
 		if err != nil {
 			var errs []error
 			for _, id := range s.groupIDs {
@@ -256,6 +291,9 @@ func New(cfg Config) (*Server, error) {
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(16 << 20),
 		grpc.MaxSendMsgSize(16 << 20),
+	}
+	if serverCreds != nil {
+		opts = append(opts, grpc.Creds(serverCreds))
 	}
 	if s.cfg.Metrics != nil {
 		opts = append(opts, grpc.ChainUnaryInterceptor(s.metricsInterceptor))
@@ -316,7 +354,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.resolveLocksLoop(resolverCtx)
 	s.log.Info("kvserver started",
 		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID,
-		"sync_writes", s.syncWrites)
+		"sync_writes", s.syncWrites, "tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "")
 	return nil
 }
 

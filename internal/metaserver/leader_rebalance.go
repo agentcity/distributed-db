@@ -10,9 +10,6 @@ import (
 
 	"distributed-db/internal/meta"
 	pbv2 "distributed-db/internal/pb/v2"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Leader rebalancing timeouts. Status probes are advisory and short; a
@@ -202,7 +199,7 @@ func (s *Server) queryRangeLeader(ctx context.Context, r meta.Range) (string, er
 	var hint string
 	var lastErr error
 	for _, addr := range order {
-		resp, err := callRangeStatus(ctx, addr, r.ID)
+		resp, err := s.callRangeStatus(ctx, addr, r.ID)
 		if err != nil {
 			lastErr = err
 			continue
@@ -224,8 +221,8 @@ func (s *Server) queryRangeLeader(ctx context.Context, r meta.Range) (string, er
 }
 
 // callRangeStatus performs one Status RPC against one replica.
-func callRangeStatus(ctx context.Context, addr string, rangeID uint64) (*pbv2.StatusResponse, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (s *Server) callRangeStatus(ctx context.Context, addr string, rangeID uint64) (*pbv2.StatusResponse, error) {
+	cc, err := s.dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -243,7 +240,7 @@ func callRangeStatus(ctx context.Context, addr string, rangeID uint64) (*pbv2.St
 // transferRangeLeader asks the current leader of r to hand leadership to
 // target. epoch is the range version; zero disables the KV-side epoch check.
 func (s *Server) transferRangeLeader(ctx context.Context, leader string, r meta.Range, target string) (*pbv2.TransferLeaderResponse, error) {
-	cc, err := grpc.NewClient(leader, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := s.dial(leader)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", leader, err)
 	}

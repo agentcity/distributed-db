@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	pbv2 "distributed-db/internal/pb/v2"
 )
@@ -43,8 +42,11 @@ type metaEntry struct {
 	mc metaAPI
 }
 
-func dialMeta(addr string) (*grpc.ClientConn, metaAPI, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+// dialMeta opens one meta connection with the given dial options. Callers that
+// need TLS pass the transport credentials built by the client constructor;
+// there is no plaintext fallback here.
+func dialMeta(addr string, opts ...grpc.DialOption) (*grpc.ClientConn, metaAPI, error) {
+	cc, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, nil, err
 	}

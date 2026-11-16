@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"distributed-db/internal/grpctls"
 	"distributed-db/internal/meta"
 	"distributed-db/internal/model"
 	pbv2 "distributed-db/internal/pb/v2"
@@ -25,6 +27,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
@@ -43,6 +46,20 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
+
+	// TLS configures TLS/mTLS for the meta gRPC listener and for every
+	// outbound dial the server makes: Raft peer transport, KV scheduler,
+	// membership, leader rebalance and snapshot RPCs.
+	//
+	// The zero value keeps the historical plaintext transport. Setting
+	// TLS.Server.CertFile and TLS.Server.KeyFile enables TLS on the listener
+	// and on all outbound dials; there is no plaintext fallback.
+	// TLS.Server.ClientCAFile enables mTLS, and TLS.Client.CAFile selects the
+	// trust root used to verify KV nodes and meta peers. Outbound dials present
+	// the meta node certificate unless TLS.Client.CertFile/KeyFile is set, so
+	// with mTLS on the KV side that certificate must also be valid for client
+	// authentication.
+	TLS grpctls.Options
 }
 
 // Server is a gRPC MetaService backed by meta.Cluster, optionally replicated.
@@ -56,6 +73,12 @@ type Server struct {
 	raft      *raft.Node
 	transport *raftgrpc.Transport
 	logStore  *raft.FileStore
+
+	// serverCreds and peerCreds are non-nil only when TLS is configured.
+	// serverCreds secures the listener; peerCreds is shared by every outbound
+	// dial so the server never mixes TLS and plaintext transports.
+	serverCreds credentials.TransportCredentials
+	peerCreds   credentials.TransportCredentials
 
 	mu      sync.Mutex
 	grpc    *grpc.Server
@@ -127,13 +150,25 @@ func New(cfg Config) (*Server, error) {
 			cfg.HeartbeatInterval = 30 * time.Millisecond
 		}
 	}
+	// Resolve TLS before any listener is bound so a half-configured
+	// certificate/key pair fails fast and never silently degrades to plaintext.
+	serverCreds, peerCreds, err := cfg.TLS.Credentials()
+	if err != nil {
+		return nil, fmt.Errorf("metaserver: TLS: %w", err)
+	}
 	cluster := meta.New()
 	if len(cfg.Ranges) > 0 {
 		if err := cluster.SetRanges(cfg.Ranges); err != nil {
 			return nil, err
 		}
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, cluster: cluster}, nil
+	return &Server{
+		cfg:         cfg,
+		log:         cfg.Logger,
+		cluster:     cluster,
+		serverCreds: serverCreds,
+		peerCreds:   peerCreds,
+	}, nil
 }
 
 // Start binds Addr, serves MetaService and starts the meta Raft group.
@@ -152,7 +187,11 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	s.lis = lis
-	s.grpc = grpc.NewServer()
+	var serverOpts []grpc.ServerOption
+	if s.serverCreds != nil {
+		serverOpts = append(serverOpts, grpc.Creds(s.serverCreds))
+	}
+	s.grpc = grpc.NewServer(serverOpts...)
 	pbv2.RegisterMetaServiceServer(s.grpc, s)
 	if s.cfg.Replicated {
 		pbv2.RegisterRaftServiceServer(s.grpc, &raftService{s: s})
@@ -173,7 +212,9 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	s.log.Info("meta server started", "addr", lis.Addr().String(), "replicated", s.cfg.Replicated)
+	s.log.Info("meta server started",
+		"addr", lis.Addr().String(), "replicated", s.cfg.Replicated,
+		"tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "")
 
 	go func() {
 		<-ctx.Done()
@@ -191,7 +232,15 @@ func (s *Server) startRaft(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	tr := raftgrpc.New()
+	var tr *raftgrpc.Transport
+	if s.cfg.TLS.Enabled() {
+		tr, err = raftgrpc.NewWithTLS(s.cfg.TLS.ClientOptions())
+		if err != nil {
+			return err
+		}
+	} else {
+		tr = raftgrpc.New()
+	}
 	sm := &stateMachine{cluster: s.cluster}
 	node, err := raft.New(raft.Config{
 		ID:                 s.cfg.ID,

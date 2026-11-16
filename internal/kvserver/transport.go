@@ -11,17 +11,20 @@ import (
 	"distributed-db/internal/raft"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// peerTransport implements raft.Transport over gRPC. M1 has no TLS/mTLS; that
-// is added together with the production transport in M3.
+// peerTransport implements raft.Transport over gRPC. When creds is non-nil it
+// is used for every peer dial; a nil creds means the node is running
+// plaintext, which is the development default. There is no per-peer fallback.
 //
 // One transport is created per range group. rangeID is attached to every Raft
 // RPC so the receiving RangeHost can dispatch it to the right group.
 type peerTransport struct {
 	log     *slog.Logger
 	rangeID uint64
+	creds   credentials.TransportCredentials
 
 	mu      sync.Mutex
 	clients map[string]pbv2.RaftServiceClient
@@ -30,13 +33,14 @@ type peerTransport struct {
 	closed  bool
 }
 
-func newPeerTransport(log *slog.Logger, rangeID uint64, peerAddrs map[string]string) *peerTransport {
+func newPeerTransport(log *slog.Logger, rangeID uint64, peerAddrs map[string]string, creds credentials.TransportCredentials) *peerTransport {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &peerTransport{
 		log:     log,
 		rangeID: rangeID,
+		creds:   creds,
 		clients: make(map[string]pbv2.RaftServiceClient),
 		conns:   make(map[string]*grpc.ClientConn),
 		addrs:   peerAddrs,
@@ -56,8 +60,14 @@ func (t *peerTransport) client(peer string) (pbv2.RaftServiceClient, error) {
 	if mapped := t.addrs[peer]; mapped != "" {
 		addr = mapped
 	}
+	creds := t.creds
+	if creds == nil {
+		// Plaintext is the explicit development default; TLS-configured nodes
+		// always carry non-nil creds.
+		creds = insecure.NewCredentials()
+	}
 	cc, err := grpc.NewClient(addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(16<<20),
 			grpc.MaxCallSendMsgSize(16<<20),
