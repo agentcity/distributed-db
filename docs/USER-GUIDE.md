@@ -479,6 +479,55 @@ kvctl> quit
 
 `get` отсутствующего ключа печатает `key ... not found` в stderr и возвращает 1.
 
+### 8.8 Админ-команды
+
+Эти команды работают **только с meta**, `-nodes` не нужен:
+
+```bash
+export KVCTL_META=127.0.0.1:9090
+
+# список range'ей
+./bin/kvctl ranges
+# ID  START  END  LEADER  REPLICAS  VERSION
+
+# JSON
+./bin/kvctl -format json ranges
+
+# состояние meta/range map
+./bin/kvctl status
+# META_LEADER ... TERM ... RANGES ... LEADER ...
+```
+
+`split` и `merge` меняют range map — это админские операции:
+
+```bash
+# разделить range 1 по ключу m
+./bin/kvctl split 1 m
+# new range id: 2
+
+# слить соседние range 1 и 2
+./bin/kvctl merge 1 2
+# OK
+```
+
+Сервер проверяет границы, соседство и реплики; ошибки выводятся как есть.
+Перед `split/merge` сделайте backup и не выполняйте их под активной записью
+без понимания последствий.
+
+Backup:
+
+```bash
+./bin/kvctl backup -out ./backup   -chunk-keys 1000 -chunk-bytes 1048576
+# backup complete: ./backup
+# snapshot_ts=... keys=... bytes=... ranges=...
+```
+
+`-out` должен не существовать; backup логический, без PITR. Для verify/restore
+используйте `cmd/kvbackup` (раздел 9).
+
+`ranges/status/split/merge` не требуют `-nodes`; `backup` требует, потому что
+читает данные.
+
 ## 8a. Сырой KV v2 из Go (advanced)
 
 Если нужен доступ из кода, используйте `internal/v2client`. Программа должна
