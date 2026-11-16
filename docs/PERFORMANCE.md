@@ -4,8 +4,10 @@
 - HEAD: `8c173bf`
 - Железо: Apple M1 Pro, macOS, loopback.
 - PostgreSQL: 13-alpine в Docker, один узел, `synchronous_commit=on`.
-- Наш кластер: 1 meta + 3 KV, loopback, `SyncWrites=false` (durability —
-  Raft-лог; см. `Config.SyncStateMachine`).
+- Наш кластер: 1 meta + 3 KV, loopback, **fast profile**
+  (`DurabilityMode=fast`, `SyncWrites=false`, durability — Raft-лог).
+  Production default — `sync` (`DurabilityMode=sync`), он медленнее; цифры
+  ниже не являются production-обещанием.
 
 ## Методика
 
@@ -104,7 +106,9 @@ commit. Сравнение честно только в классе «расп�
 - маленький набор ключей, без compaction на ТБ;
 - нет p99, только средние ns/op;
 - PostgreSQL запущен как один узел, без Patroni/Citus;
-- batch throughput — не latency одного клиента.
+- batch throughput — не latency одного клиента;
+- production default `sync` делает лишний fsync на state machine; fast —
+  opt-in и требует crash-тестов (они есть в `test/crash_consistency_test.go`).
 
 ## Вывод
 
