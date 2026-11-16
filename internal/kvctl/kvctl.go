@@ -430,8 +430,10 @@ func (r *Runner) runShell(ctx context.Context, b Backend, cfg Config) int {
 		cmdCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 		code := r.execute(cmdCtx, b, cfg, cmd, args)
 		cancel()
-		if code != 0 && code != 1 {
-			return code
+		// Interactive shell: a bad command must not close the session. The
+		// command already printed its error; keep the prompt alive.
+		if code != 0 {
+			continue
 		}
 	}
 	if err := sc.Err(); err != nil {
