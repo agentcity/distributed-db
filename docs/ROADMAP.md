@@ -207,3 +207,7 @@ range identity в Status, клиентский routing по range ID и e2e
 
 Осталось в M2/0007: split/merge с реальным переносом данных и Raft-групп,
 Multi-Raft host внутри одного процесса, переезд meta/TSO в Raft.
+
+В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
+по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
+Осталось: клиентские методы, фоновый GC locks, stress/Jepsen.

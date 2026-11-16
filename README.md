@@ -69,7 +69,9 @@ go test -race ./test -run TestV2SingleRangeCluster -v
 ```
 
 Есть 2 диапазона × 3 реплики: meta отдаёт `GetRange/ListRanges`, клиент
-маршрутизирует ключ по range ID и обновляет лидера при failover.
+маршрутизирует ключ по range ID и обновляет лидера при failover. Транзакции
+поддерживают `CheckTxnStatus/ResolveLock`, а `Get` сам разрешает
+committed/rolled-back/expired locks.
 
 Пока нет: Multi-Raft host внутри одного процесса, split/merge с переносом
 данных и SQL-слой. Snapshot catch-up, restart из snapshot и gRPC-бенчмарк
