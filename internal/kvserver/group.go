@@ -91,6 +91,8 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig) (*rangeGro
 		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
 		HeartbeatInterval:  cfg.HeartbeatInterval,
 		Logger:             cfg.Logger,
+		Learner:            rc.Learner,
+		ForceLearner:       rc.ForceLearner,
 	}, logStore, sm, tr)
 	if err != nil {
 		_ = logStore.Close()

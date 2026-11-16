@@ -21,6 +21,15 @@ type RangeConfig struct {
 	End   []byte   `json:"end,omitempty"`
 	Peers []string `json:"peers,omitempty"`
 	Epoch uint64   `json:"epoch,omitempty"`
+	// Learner starts this range's local Raft node as a non-voting member. It
+	// is used by AddReplica: the target group exists and catches up from the
+	// leader before the leader promotes it to a voter.
+	Learner bool `json:"learner,omitempty"`
+	// ForceLearner makes AddReplica overwrite a stale persisted Raft
+	// membership with the supplied voter set plus a local learner. It is not
+	// persisted in ranges.json; normal restarts rely on the Raft membership
+	// record instead.
+	ForceLearner bool `json:"-"`
 }
 
 var (
@@ -40,6 +49,9 @@ var (
 // empty and validates the configured ranges. The result is sorted by range
 // start so Groups and key routing are deterministic.
 func normalizeRanges(cfg Config) ([]RangeConfig, error) {
+	if cfg.NoRanges {
+		return nil, nil
+	}
 	if len(cfg.Ranges) == 0 {
 		id := cfg.RangeID
 		if id == 0 {
@@ -76,11 +88,13 @@ func normalizeRanges(cfg Config) ([]RangeConfig, error) {
 			epoch = 1
 		}
 		out = append(out, RangeConfig{
-			ID:    rc.ID,
-			Start: cloneBytes(rc.Start),
-			End:   cloneBytes(rc.End),
-			Peers: cloneStrings(rc.Peers),
-			Epoch: epoch,
+			ID:      rc.ID,
+			Start:   cloneBytes(rc.Start),
+			End:     cloneBytes(rc.End),
+			Peers:   cloneStrings(rc.Peers),
+			Epoch:        epoch,
+			Learner:      rc.Learner,
+			ForceLearner: rc.ForceLearner,
 		})
 	}
 
@@ -130,11 +144,13 @@ func (s *Server) Ranges() []RangeConfig {
 			epoch = 1
 		}
 		out = append(out, RangeConfig{
-			ID:    rc.ID,
-			Start: cloneBytes(rc.Start),
-			End:   cloneBytes(rc.End),
-			Peers: cloneStrings(rc.Peers),
-			Epoch: epoch,
+			ID:      rc.ID,
+			Start:   cloneBytes(rc.Start),
+			End:     cloneBytes(rc.End),
+			Peers:   cloneStrings(rc.Peers),
+			Epoch:        epoch,
+			Learner:      rc.Learner,
+			ForceLearner: rc.ForceLearner,
 		})
 	}
 	return out

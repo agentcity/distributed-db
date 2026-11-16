@@ -500,6 +500,12 @@ func TestSnapshotEmptyStateMachine(t *testing.T) {
 	}
 }
 
+// applyOnlySM implements only raft.StateMachine, so it has no snapshot
+// capability. It stands in for application state machines that never snapshot.
+type applyOnlySM struct{}
+
+func (*applyOnlySM) Apply(model.Entry) error { return nil }
+
 func TestSnapshotUnsupportedStateMachine(t *testing.T) {
 	dir := t.TempDir()
 	store, err := raft.NewFileStore(dir)
@@ -508,8 +514,7 @@ func TestSnapshotUnsupportedStateMachine(t *testing.T) {
 	}
 	defer store.Close()
 	net := newSnapshotNetwork()
-	// A plain testSM does not implement Snapshotter.
-	node, err := raft.New(snapshotTestConfig("n1", nil, dir, 40*time.Millisecond, 80*time.Millisecond, 10*time.Millisecond), store, newTestSM(), net.transport("n1"))
+	node, err := raft.New(snapshotTestConfig("n1", nil, dir, 40*time.Millisecond, 80*time.Millisecond, 10*time.Millisecond), store, &applyOnlySM{}, net.transport("n1"))
 	if err != nil {
 		t.Fatalf("raft.New: %v", err)
 	}

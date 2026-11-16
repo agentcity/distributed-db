@@ -19,19 +19,26 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KVService_Get_FullMethodName            = "/dbv2.KVService/Get"
-	KVService_Scan_FullMethodName           = "/dbv2.KVService/Scan"
-	KVService_Prewrite_FullMethodName       = "/dbv2.KVService/Prewrite"
-	KVService_Commit_FullMethodName         = "/dbv2.KVService/Commit"
-	KVService_CommitSingle_FullMethodName   = "/dbv2.KVService/CommitSingle"
-	KVService_Rollback_FullMethodName       = "/dbv2.KVService/Rollback"
-	KVService_CheckTxnStatus_FullMethodName = "/dbv2.KVService/CheckTxnStatus"
-	KVService_ResolveLock_FullMethodName    = "/dbv2.KVService/ResolveLock"
-	KVService_SplitRange_FullMethodName     = "/dbv2.KVService/SplitRange"
-	KVService_MergeRanges_FullMethodName    = "/dbv2.KVService/MergeRanges"
-	KVService_RangeStats_FullMethodName     = "/dbv2.KVService/RangeStats"
-	KVService_Status_FullMethodName         = "/dbv2.KVService/Status"
-	KVService_TransferLeader_FullMethodName = "/dbv2.KVService/TransferLeader"
+	KVService_Get_FullMethodName              = "/dbv2.KVService/Get"
+	KVService_Scan_FullMethodName             = "/dbv2.KVService/Scan"
+	KVService_Prewrite_FullMethodName         = "/dbv2.KVService/Prewrite"
+	KVService_Commit_FullMethodName           = "/dbv2.KVService/Commit"
+	KVService_CommitSingle_FullMethodName     = "/dbv2.KVService/CommitSingle"
+	KVService_Rollback_FullMethodName         = "/dbv2.KVService/Rollback"
+	KVService_CheckTxnStatus_FullMethodName   = "/dbv2.KVService/CheckTxnStatus"
+	KVService_ResolveLock_FullMethodName      = "/dbv2.KVService/ResolveLock"
+	KVService_SplitRange_FullMethodName       = "/dbv2.KVService/SplitRange"
+	KVService_MergeRanges_FullMethodName      = "/dbv2.KVService/MergeRanges"
+	KVService_RangeStats_FullMethodName       = "/dbv2.KVService/RangeStats"
+	KVService_Status_FullMethodName           = "/dbv2.KVService/Status"
+	KVService_TransferLeader_FullMethodName   = "/dbv2.KVService/TransferLeader"
+	KVService_AddReplica_FullMethodName       = "/dbv2.KVService/AddReplica"
+	KVService_AddLearner_FullMethodName       = "/dbv2.KVService/AddLearner"
+	KVService_PromoteReplica_FullMethodName   = "/dbv2.KVService/PromoteReplica"
+	KVService_RemoveVoter_FullMethodName      = "/dbv2.KVService/RemoveVoter"
+	KVService_RemoveReplica_FullMethodName    = "/dbv2.KVService/RemoveReplica"
+	KVService_Membership_FullMethodName       = "/dbv2.KVService/Membership"
+	KVService_UpdateRangeEpoch_FullMethodName = "/dbv2.KVService/UpdateRangeEpoch"
 )
 
 // KVServiceClient is the client API for KVService service.
@@ -55,6 +62,22 @@ type KVServiceClient interface {
 	// TransferLeader moves leadership of one range to target. The request is
 	// served by the current leader; epoch is optional (0 disables the check).
 	TransferLeader(ctx context.Context, in *TransferLeaderRequest, opts ...grpc.CallOption) (*TransferLeaderResponse, error)
+	// Replica-set membership. Changes are single-server (no joint consensus):
+	// AddReplica creates a non-voting Raft group on the target node, AddLearner
+	// registers that node as a learner on the range leader, PromoteReplica turns
+	// the caught-up learner into a voter and RemoveVoter removes a voter on the
+	// leader. RemoveReplica stops the group on the target after the leader has
+	// confirmed the removal. Epoch is optional; 0 disables the epoch check.
+	AddReplica(ctx context.Context, in *AddReplicaRequest, opts ...grpc.CallOption) (*AddReplicaResponse, error)
+	AddLearner(ctx context.Context, in *AddLearnerRequest, opts ...grpc.CallOption) (*MembershipResponse, error)
+	PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (*MembershipResponse, error)
+	RemoveVoter(ctx context.Context, in *RemoveVoterRequest, opts ...grpc.CallOption) (*MembershipResponse, error)
+	RemoveReplica(ctx context.Context, in *RemoveReplicaRequest, opts ...grpc.CallOption) (*RemoveReplicaResponse, error)
+	Membership(ctx context.Context, in *MembershipRequest, opts ...grpc.CallOption) (*MembershipResponse, error)
+	// UpdateRangeEpoch locally records the range version published by meta on
+	// one replica. The scheduler fans it out before publishing a new range map
+	// so every replica accepts requests carrying the new version.
+	UpdateRangeEpoch(ctx context.Context, in *UpdateRangeEpochRequest, opts ...grpc.CallOption) (*UpdateRangeEpochResponse, error)
 }
 
 type kVServiceClient struct {
@@ -195,6 +218,76 @@ func (c *kVServiceClient) TransferLeader(ctx context.Context, in *TransferLeader
 	return out, nil
 }
 
+func (c *kVServiceClient) AddReplica(ctx context.Context, in *AddReplicaRequest, opts ...grpc.CallOption) (*AddReplicaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AddReplicaResponse)
+	err := c.cc.Invoke(ctx, KVService_AddReplica_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) AddLearner(ctx context.Context, in *AddLearnerRequest, opts ...grpc.CallOption) (*MembershipResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembershipResponse)
+	err := c.cc.Invoke(ctx, KVService_AddLearner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (*MembershipResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembershipResponse)
+	err := c.cc.Invoke(ctx, KVService_PromoteReplica_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) RemoveVoter(ctx context.Context, in *RemoveVoterRequest, opts ...grpc.CallOption) (*MembershipResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembershipResponse)
+	err := c.cc.Invoke(ctx, KVService_RemoveVoter_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) RemoveReplica(ctx context.Context, in *RemoveReplicaRequest, opts ...grpc.CallOption) (*RemoveReplicaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveReplicaResponse)
+	err := c.cc.Invoke(ctx, KVService_RemoveReplica_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) Membership(ctx context.Context, in *MembershipRequest, opts ...grpc.CallOption) (*MembershipResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembershipResponse)
+	err := c.cc.Invoke(ctx, KVService_Membership_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) UpdateRangeEpoch(ctx context.Context, in *UpdateRangeEpochRequest, opts ...grpc.CallOption) (*UpdateRangeEpochResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateRangeEpochResponse)
+	err := c.cc.Invoke(ctx, KVService_UpdateRangeEpoch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVServiceServer is the server API for KVService service.
 // All implementations must embed UnimplementedKVServiceServer
 // for forward compatibility.
@@ -216,6 +309,22 @@ type KVServiceServer interface {
 	// TransferLeader moves leadership of one range to target. The request is
 	// served by the current leader; epoch is optional (0 disables the check).
 	TransferLeader(context.Context, *TransferLeaderRequest) (*TransferLeaderResponse, error)
+	// Replica-set membership. Changes are single-server (no joint consensus):
+	// AddReplica creates a non-voting Raft group on the target node, AddLearner
+	// registers that node as a learner on the range leader, PromoteReplica turns
+	// the caught-up learner into a voter and RemoveVoter removes a voter on the
+	// leader. RemoveReplica stops the group on the target after the leader has
+	// confirmed the removal. Epoch is optional; 0 disables the epoch check.
+	AddReplica(context.Context, *AddReplicaRequest) (*AddReplicaResponse, error)
+	AddLearner(context.Context, *AddLearnerRequest) (*MembershipResponse, error)
+	PromoteReplica(context.Context, *PromoteReplicaRequest) (*MembershipResponse, error)
+	RemoveVoter(context.Context, *RemoveVoterRequest) (*MembershipResponse, error)
+	RemoveReplica(context.Context, *RemoveReplicaRequest) (*RemoveReplicaResponse, error)
+	Membership(context.Context, *MembershipRequest) (*MembershipResponse, error)
+	// UpdateRangeEpoch locally records the range version published by meta on
+	// one replica. The scheduler fans it out before publishing a new range map
+	// so every replica accepts requests carrying the new version.
+	UpdateRangeEpoch(context.Context, *UpdateRangeEpochRequest) (*UpdateRangeEpochResponse, error)
 	mustEmbedUnimplementedKVServiceServer()
 }
 
@@ -264,6 +373,27 @@ func (UnimplementedKVServiceServer) Status(context.Context, *StatusRequest) (*St
 }
 func (UnimplementedKVServiceServer) TransferLeader(context.Context, *TransferLeaderRequest) (*TransferLeaderResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method TransferLeader not implemented")
+}
+func (UnimplementedKVServiceServer) AddReplica(context.Context, *AddReplicaRequest) (*AddReplicaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddReplica not implemented")
+}
+func (UnimplementedKVServiceServer) AddLearner(context.Context, *AddLearnerRequest) (*MembershipResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddLearner not implemented")
+}
+func (UnimplementedKVServiceServer) PromoteReplica(context.Context, *PromoteReplicaRequest) (*MembershipResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PromoteReplica not implemented")
+}
+func (UnimplementedKVServiceServer) RemoveVoter(context.Context, *RemoveVoterRequest) (*MembershipResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveVoter not implemented")
+}
+func (UnimplementedKVServiceServer) RemoveReplica(context.Context, *RemoveReplicaRequest) (*RemoveReplicaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveReplica not implemented")
+}
+func (UnimplementedKVServiceServer) Membership(context.Context, *MembershipRequest) (*MembershipResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Membership not implemented")
+}
+func (UnimplementedKVServiceServer) UpdateRangeEpoch(context.Context, *UpdateRangeEpochRequest) (*UpdateRangeEpochResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateRangeEpoch not implemented")
 }
 func (UnimplementedKVServiceServer) mustEmbedUnimplementedKVServiceServer() {}
 func (UnimplementedKVServiceServer) testEmbeddedByValue()                   {}
@@ -520,6 +650,132 @@ func _KVService_TransferLeader_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_AddReplica_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddReplicaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).AddReplica(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_AddReplica_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).AddReplica(ctx, req.(*AddReplicaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_AddLearner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddLearnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).AddLearner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_AddLearner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).AddLearner(ctx, req.(*AddLearnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_PromoteReplica_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PromoteReplicaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).PromoteReplica(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_PromoteReplica_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).PromoteReplica(ctx, req.(*PromoteReplicaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_RemoveVoter_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveVoterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).RemoveVoter(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_RemoveVoter_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).RemoveVoter(ctx, req.(*RemoveVoterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_RemoveReplica_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveReplicaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).RemoveReplica(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_RemoveReplica_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).RemoveReplica(ctx, req.(*RemoveReplicaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_Membership_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MembershipRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).Membership(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_Membership_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).Membership(ctx, req.(*MembershipRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_UpdateRangeEpoch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateRangeEpochRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).UpdateRangeEpoch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_UpdateRangeEpoch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).UpdateRangeEpoch(ctx, req.(*UpdateRangeEpochRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KVService_ServiceDesc is the grpc.ServiceDesc for KVService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -578,6 +834,34 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TransferLeader",
 			Handler:    _KVService_TransferLeader_Handler,
+		},
+		{
+			MethodName: "AddReplica",
+			Handler:    _KVService_AddReplica_Handler,
+		},
+		{
+			MethodName: "AddLearner",
+			Handler:    _KVService_AddLearner_Handler,
+		},
+		{
+			MethodName: "PromoteReplica",
+			Handler:    _KVService_PromoteReplica_Handler,
+		},
+		{
+			MethodName: "RemoveVoter",
+			Handler:    _KVService_RemoveVoter_Handler,
+		},
+		{
+			MethodName: "RemoveReplica",
+			Handler:    _KVService_RemoveReplica_Handler,
+		},
+		{
+			MethodName: "Membership",
+			Handler:    _KVService_Membership_Handler,
+		},
+		{
+			MethodName: "UpdateRangeEpoch",
+			Handler:    _KVService_UpdateRangeEpoch_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

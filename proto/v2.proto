@@ -21,6 +21,23 @@ service KVService {
   // TransferLeader moves leadership of one range to target. The request is
   // served by the current leader; epoch is optional (0 disables the check).
   rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
+
+  // Replica-set membership. Changes are single-server (no joint consensus):
+  // AddReplica creates a non-voting Raft group on the target node, AddLearner
+  // registers that node as a learner on the range leader, PromoteReplica turns
+  // the caught-up learner into a voter and RemoveVoter removes a voter on the
+  // leader. RemoveReplica stops the group on the target after the leader has
+  // confirmed the removal. Epoch is optional; 0 disables the epoch check.
+  rpc AddReplica(AddReplicaRequest) returns (AddReplicaResponse);
+  rpc AddLearner(AddLearnerRequest) returns (MembershipResponse);
+  rpc PromoteReplica(PromoteReplicaRequest) returns (MembershipResponse);
+  rpc RemoveVoter(RemoveVoterRequest) returns (MembershipResponse);
+  rpc RemoveReplica(RemoveReplicaRequest) returns (RemoveReplicaResponse);
+  rpc Membership(MembershipRequest) returns (MembershipResponse);
+  // UpdateRangeEpoch locally records the range version published by meta on
+  // one replica. The scheduler fans it out before publishing a new range map
+  // so every replica accepts requests carrying the new version.
+  rpc UpdateRangeEpoch(UpdateRangeEpochRequest) returns (UpdateRangeEpochResponse);
 }
 
 // RaftService is the Raft peer transport.
@@ -217,6 +234,12 @@ message StatusResponse {
   bytes range_start = 8;
   bytes range_end = 9;
   uint64 epoch = 10;
+  // Raft membership of this range. voters includes the local node when it is
+  // a voter; learners are non-voting. learner reports whether the local node
+  // is currently a learner.
+  repeated string voters = 11;
+  repeated string learners = 12;
+  bool learner = 13;
 }
 
 // TransferLeaderRequest asks the serving leader of range_id to hand
@@ -234,6 +257,79 @@ message TransferLeaderResponse {
   string leader = 2;
   string error = 3;
 }
+
+// AddReplicaRequest is served by the target node. It creates (or restarts) a
+// Raft group for range_id with the supplied bounds and the current voter set,
+// as a non-voting learner. Existing data and an existing Raft log are reused;
+// catch-up comes from the leader. peers holds the range's current voters and
+// may include target, which is filtered out.
+message AddReplicaRequest {
+  uint64 range_id = 1;
+  string target = 2;
+  repeated string peers = 3;
+  uint64 epoch = 4;
+  bytes start = 5;
+  bytes end = 6;
+}
+message AddReplicaResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+// AddLearnerRequest is served by the range leader.
+message AddLearnerRequest {
+  uint64 range_id = 1;
+  string target = 2;
+  uint64 epoch = 3;
+}
+// PromoteReplicaRequest is served by the range leader.
+message PromoteReplicaRequest {
+  uint64 range_id = 1;
+  string target = 2;
+  uint64 epoch = 3;
+}
+// RemoveVoterRequest is served by the range leader.
+message RemoveVoterRequest {
+  uint64 range_id = 1;
+  string target = 2;
+  uint64 epoch = 3;
+}
+// RemoveReplicaRequest is served by the target node and stops its local group.
+message RemoveReplicaRequest {
+  uint64 range_id = 1;
+  string target = 2;
+}
+message RemoveReplicaResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+}
+
+// UpdateRangeEpochRequest sets one replica's cached range version. It never
+// changes Raft membership and is idempotent: a version not newer than the
+// cached one is accepted without change.
+message UpdateRangeEpochRequest {
+  uint64 range_id = 1;
+  uint64 epoch = 2;
+}
+message UpdateRangeEpochResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+  uint64 epoch = 4;
+}
+
+// MembershipRequest returns the Raft membership of one hosted range.
+message MembershipRequest { uint64 range_id = 1; }
+message MembershipResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+  repeated string voters = 4;
+  repeated string learners = 5;
+}
+
 
 // TimeoutNowRequest is sent by a leader that is transferring leadership. term
 // is the leader's term; the follower accepts only when it matches its own.

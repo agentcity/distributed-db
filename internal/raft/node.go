@@ -64,11 +64,17 @@ type Node struct {
 	leaderID         string
 	electionDeadline time.Time
 	votes            map[string]bool
-	nextIndex        map[string]uint64
-	matchIndex       map[string]uint64
-	lastAck          map[string]time.Time
-	triggers         map[string]chan struct{}
-	pending          map[uint64]*proposal
+	// voters and learners are the mutable Raft membership. voters includes
+	// this node when it is a voter. cfg.Peers is only the bootstrap input.
+	voters   []string
+	learners map[string]bool
+	// configInFlight gates membership changes to one server at a time.
+	configInFlight bool
+	nextIndex      map[string]uint64
+	matchIndex     map[string]uint64
+	lastAck        map[string]time.Time
+	triggers       map[string]chan struct{}
+	pending        map[uint64]*proposal
 
 	// proposeQueue and proposeSignal implement group commit. Both are guarded
 	// by mu. Propose enqueues under mu (no I/O) and then waits without mu; the
@@ -97,6 +103,7 @@ type Node struct {
 
 	runCtx       context.Context
 	cancel       context.CancelFunc
+	leaderCtx    context.Context
 	leaderCancel context.CancelFunc
 
 	started bool
@@ -155,6 +162,23 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	voters, learners, err := initMembership(cfg, store)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ForceLearner {
+		// Re-adding a range to a node with an old data directory: overwrite
+		// the stale on-disk membership before the node can campaign.
+		if ms, ok := store.(MembershipStore); ok {
+			if err := ms.SaveMembership(voters, learners); err != nil {
+				return nil, fmt.Errorf("raft: persist forced learner membership: %w", err)
+			}
+		}
+	}
+	learnerSet := make(map[string]bool, len(learners))
+	for _, l := range learners {
+		learnerSet[l] = true
+	}
 	n := &Node{
 		cfg:                  cfg,
 		store:                store,
@@ -169,6 +193,8 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 		lastApplied:          snap.Index,
 		role:                 Follower,
 		votes:                make(map[string]bool),
+		voters:               voters,
+		learners:             learnerSet,
 		nextIndex:            make(map[string]uint64),
 		matchIndex:           make(map[string]uint64),
 		lastAck:              make(map[string]time.Time),
@@ -506,6 +532,9 @@ func (n *Node) Status() Status {
 		CommitIndex: n.commitIndex,
 		LastIndex:   n.lastIndexLocked(),
 		LastApplied: n.lastApplied,
+		Voters:      append([]string(nil), n.voters...),
+		Learners:    n.learnerListLocked(),
+		Learner:     n.isLearnerLocked(n.cfg.ID),
 	}
 }
 
@@ -1085,6 +1114,11 @@ func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	if n.stopped {
 		return nil, ErrStopped
 	}
+	// Adopt a higher term from any sender, as standard Raft requires, but only
+	// current voters may win a vote. Removed nodes and learners are rejected
+	// after the term update so an isolated stale replica cannot win an
+	// election; a group that keeps seeing higher terms still converges to the
+	// newest term.
 	if req.Term < n.term {
 		return &RequestVoteResponse{Term: n.term}, nil
 	}
@@ -1093,7 +1127,9 @@ func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 			return nil, err
 		}
 	}
-
+	if !n.isVoterLocked(req.CandidateID) || !n.selfIsVoterLocked() {
+		return &RequestVoteResponse{Term: n.term, VoteGranted: false}, nil
+	}
 	lastIndex := n.lastIndexLocked()
 	lastTerm := n.lastLogTermLocked()
 	upToDate := req.LastLogTerm > lastTerm ||
@@ -1470,6 +1506,14 @@ func (n *Node) beginElection() {
 		n.mu.Unlock()
 		return
 	}
+	if !n.selfIsVoterLocked() {
+		// A learner (or a node removed from the configuration) never
+		// campaigns. Keep the deadline moving so the election loop does not
+		// spin on an expired timer.
+		n.resetElectionDeadlineLocked()
+		n.mu.Unlock()
+		return
+	}
 	oldTerm, oldVotedFor := n.term, n.votedFor
 	newTerm := n.term + 1
 	if err := n.store.SaveMeta(newTerm, n.cfg.ID); err != nil {
@@ -1492,7 +1536,7 @@ func (n *Node) beginElection() {
 		LastLogIndex: n.lastIndexLocked(),
 		LastLogTerm:  n.lastLogTermLocked(),
 	}
-	peers := append([]string(nil), n.cfg.Peers...)
+	peers := n.votersExceptSelfLocked()
 	n.wg.Add(len(peers))
 	n.mu.Unlock()
 
@@ -1548,21 +1592,22 @@ func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
 	n.leaderID = n.cfg.ID
 	n.leaderNoopIndex = 0
+	n.configInFlight = false
 	voters := n.votes
 	n.votes = nil
 	n.cancelLeaderLocked()
 
 	leaderCtx, cancel := context.WithCancel(context.Background())
+	n.leaderCtx = leaderCtx
 	n.leaderCancel = cancel
 
 	now := time.Now()
-	n.nextIndex = make(map[string]uint64, len(n.cfg.Peers))
-	n.matchIndex = make(map[string]uint64, len(n.cfg.Peers))
-	n.lastAck = make(map[string]time.Time, len(n.cfg.Peers))
-	n.triggers = make(map[string]chan struct{}, len(n.cfg.Peers))
-	for _, p := range n.cfg.Peers {
-		n.nextIndex[p] = n.lastIndexLocked() + 1
-		n.matchIndex[p] = 0
+	targets := n.replicationTargetsLocked()
+	n.nextIndex = make(map[string]uint64, len(targets))
+	n.matchIndex = make(map[string]uint64, len(targets))
+	n.lastAck = make(map[string]time.Time, len(targets))
+	n.triggers = make(map[string]chan struct{}, len(targets))
+	for _, p := range targets {
 		// Only the peers that actually granted their vote are known to have
 		// been reachable during the election. The election quorum provides a
 		// short lease for ReadBarrier; other peers must heartbeat first.
@@ -1589,15 +1634,9 @@ func (n *Node) becomeLeaderLocked() {
 	n.entries = append(n.entries, noop)
 	n.leaderNoopIndex = noop.Index
 
-	for _, peer := range n.cfg.Peers {
-		trigger := make(chan struct{}, 1)
-		n.triggers[peer] = trigger
-		n.wg.Add(1)
-		go func(peer string, trigger <-chan struct{}, term uint64) {
-			defer n.wg.Done()
-			n.replicateLoop(leaderCtx, peer, trigger, term)
-		}(peer, trigger, n.term)
-	}
+	// syncReplicatorsLocked starts one loop per voter and learner, including
+	// learners that were added before this node became leader.
+	n.syncReplicatorsLocked()
 
 	n.logger.Info("raft: became leader", "id", n.cfg.ID, "term", n.term, "last_index", n.lastIndexLocked())
 	n.maybeCommitLocked()
@@ -1616,12 +1655,12 @@ func (n *Node) replicateLoop(ctx context.Context, peer string, trigger <-chan st
 		case <-ticker.C:
 		case <-trigger:
 		}
-		if !n.isLeaderFor(term) {
+		if !n.isLeaderFor(term) || !n.replicationTarget(peer) {
 			return
 		}
 		for {
 			retry := n.sendAppendEntries(ctx, peer, term)
-			if !retry || !n.isLeaderFor(term) {
+			if !retry || !n.isLeaderFor(term) || !n.replicationTarget(peer) {
 				break
 			}
 		}
@@ -1676,7 +1715,7 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role != Leader || n.term != term {
+	if n.stopped || n.role != Leader || n.term != term || (!n.isVoterLocked(peer) && !n.isLearnerLocked(peer)) {
 		return false
 	}
 	if resp.Term > n.term {
@@ -1871,7 +1910,15 @@ func (n *Node) applyLoop() {
 		entry := cloneEntry(n.entries[index-n.snapshot.Index-1])
 		n.mu.Unlock()
 
-		err := n.sm.Apply(entry)
+		var err error
+		if isConfigCommand(entry.Type) {
+			// Membership is Raft state, not application state: apply it here
+			// so voters/learners update deterministically on every node and
+			// never reach the user state machine.
+			err = n.applyConfigEntry(entry)
+		} else {
+			err = n.sm.Apply(entry)
+		}
 
 		n.mu.Lock()
 		n.lastApplied = index
@@ -1892,7 +1939,10 @@ func (n *Node) applyLoop() {
 // ---------------------------------------------------------------------------
 
 func (n *Node) majority() int {
-	return (len(n.cfg.Peers)+1)/2 + 1
+	if len(n.voters) == 0 {
+		return 1
+	}
+	return len(n.voters)/2 + 1
 }
 
 func (n *Node) lastIndexLocked() uint64 {
@@ -1954,6 +2004,7 @@ func (n *Node) cancelLeaderLocked() {
 	if n.leaderCancel != nil {
 		n.leaderCancel()
 		n.leaderCancel = nil
+		n.leaderCtx = nil
 	}
 }
 
@@ -1968,6 +2019,7 @@ func (n *Node) stepDownWithErrorLocked(leaderID string, pendingErr error) {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.votes = nil
+	n.configInFlight = false
 	// Pending proposals can no longer be completed on this node. Failing them
 	// here prevents a caller using a background context from hanging forever.
 	n.failPendingLocked(pendingErr)
@@ -1990,6 +2042,7 @@ func (n *Node) adoptTermLocked(term uint64, leaderID string) error {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.votes = nil
+	n.configInFlight = false
 	n.failPendingLocked(ErrNotLeader)
 	n.failQueuedLocked(ErrNotLeader)
 	n.resetElectionDeadlineLocked()
@@ -2043,8 +2096,14 @@ func (n *Node) completeLocked(p *proposal, err error) {
 }
 
 func (n *Node) hasQuorumLocked(now time.Time) bool {
-	count := 1 // self
-	for _, peer := range n.cfg.Peers {
+	count := 0
+	if n.selfIsVoterLocked() {
+		count = 1
+	}
+	for _, peer := range n.voters {
+		if peer == n.cfg.ID {
+			continue
+		}
 		if ts, ok := n.lastAck[peer]; ok && now.Sub(ts) <= n.cfg.ElectionTimeoutMin {
 			count++
 		}
@@ -2066,8 +2125,14 @@ func (n *Node) maybeCommitLocked() {
 		if !ok || term != n.term {
 			continue
 		}
-		count := 1 // self
-		for _, peer := range n.cfg.Peers {
+		count := 0
+		if n.selfIsVoterLocked() {
+			count = 1
+		}
+		for _, peer := range n.voters {
+			if peer == n.cfg.ID {
+				continue
+			}
 			if n.matchIndex[peer] >= index {
 				count++
 			}

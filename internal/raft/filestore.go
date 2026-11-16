@@ -39,11 +39,15 @@ const (
 )
 
 type walRecord struct {
-	Type      string        `json:"type"` // "meta", "append", "truncate", "truncate_prefix"
+	Type      string        `json:"type"` // "meta", "append", "truncate", "truncate_prefix", "membership"
 	Term      uint64        `json:"term,omitempty"`
 	VotedFor  string        `json:"voted_for,omitempty"`
 	Entries   []model.Entry `json:"entries,omitempty"`
 	FromIndex uint64        `json:"from_index,omitempty"`
+	// Membership records. Voters includes the local node; Learners are
+	// non-voting members. They are written by SaveMembership.
+	Voters   []string `json:"voters,omitempty"`
+	Learners []string `json:"learners,omitempty"`
 }
 
 // snapshotMeta is the durable description of the current snapshot. The data
@@ -72,6 +76,10 @@ type FileStore struct {
 	term     uint64
 	votedFor string
 	entries  []model.Entry
+	// voters and learners are the last persisted Raft membership. A nil
+	// voters slice means no membership record has ever been written.
+	voters   []string
+	learners []string
 	// prefix is the highest index removed by TruncatePrefix. Entries are
 	// contiguous from prefix+1 (or empty).
 	prefix   uint64
@@ -85,6 +93,7 @@ var errStoreClosed = errors.New("raft: log store closed")
 var (
 	_ BatchAppender       = (*FileStore)(nil)
 	_ SnapshotStreamStore = (*FileStore)(nil)
+	_ MembershipStore     = (*FileStore)(nil)
 )
 
 // NewFileStore opens (creating if needed) the WAL in dir and replays it. A
@@ -227,6 +236,14 @@ func (s *FileStore) applyRecord(rec walRecord) error {
 			s.prefix = rec.FromIndex
 			s.dropThroughLocked(rec.FromIndex)
 		}
+	case "membership":
+		// A legacy WAL has no membership record and keeps working: the node
+		// then initializes from its static configuration.
+		if len(rec.Voters) == 0 {
+			return errors.New("raft: WAL membership record has no voters")
+		}
+		s.voters = append([]string(nil), rec.Voters...)
+		s.learners = append([]string(nil), rec.Learners...)
 	default:
 		return fmt.Errorf("raft: unknown WAL record type %q", rec.Type)
 	}
@@ -297,6 +314,44 @@ func (s *FileStore) SaveMeta(term uint64, votedFor string) error {
 	s.term = term
 	s.votedFor = votedFor
 	return nil
+}
+
+// SaveMembership durably records the current voter and learner sets. Voters
+// must be non-empty and include the local node; callers validate that before
+// calling. The record is independent of the log, so membership survives a
+// restart even after the config entries that produced it were compacted.
+func (s *FileStore) SaveMembership(voters, learners []string) error {
+	if len(voters) == 0 {
+		return errors.New("raft: membership must have at least one voter")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errStoreClosed
+	}
+	v := append([]string(nil), voters...)
+	l := append([]string(nil), learners...)
+	if err := s.writeRecord(walRecord{Type: "membership", Voters: v, Learners: l}); err != nil {
+		return err
+	}
+	s.voters = v
+	s.learners = l
+	return nil
+}
+
+// LoadMembership returns the persisted voter and learner sets. A store that
+// has never saved membership (including a WAL written by an older version)
+// returns nil, nil, nil.
+func (s *FileStore) LoadMembership() ([]string, []string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, errStoreClosed
+	}
+	if len(s.voters) == 0 {
+		return nil, nil, nil
+	}
+	return append([]string(nil), s.voters...), append([]string(nil), s.learners...), nil
 }
 
 // Append durably appends contiguous entries. It is atomic with respect to the

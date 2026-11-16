@@ -580,6 +580,11 @@ func (n *Node) finishSnapshotInstall(peer string, term, snapIndex, lastIndex uin
 	if n.stopped || n.role != Leader || n.term != term {
 		return false
 	}
+	if !n.isVoterLocked(peer) && !n.isLearnerLocked(peer) {
+		// The member was removed while the snapshot was in flight; do not
+		// resurrect bookkeeping for it.
+		return false
+	}
 	if lastIndex > n.matchIndex[peer] {
 		n.matchIndex[peer] = lastIndex
 	}

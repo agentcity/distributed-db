@@ -165,7 +165,7 @@ func (k *kvService) Get(ctx context.Context, req *pbv2.GetRequest) (*pbv2.GetRes
 	if err != nil {
 		return &pbv2.GetResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.GetResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	leader := g.node.Leader()
@@ -206,7 +206,7 @@ func (k *kvService) Scan(ctx context.Context, req *pbv2.ScanRequest) (*pbv2.Scan
 	if err != nil {
 		return &pbv2.ScanResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.ScanResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if !g.containsRange(req.GetStart(), req.GetEnd()) {
@@ -250,7 +250,7 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 	if err != nil {
 		return &pbv2.PrewriteResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if g.isFrozen() {
@@ -291,7 +291,7 @@ func (k *kvService) CommitSingle(ctx context.Context, req *pbv2.CommitSingleRequ
 	if err != nil {
 		return &pbv2.CommitSingleResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if g.isFrozen() {
@@ -315,7 +315,7 @@ func (k *kvService) Commit(ctx context.Context, req *pbv2.CommitRequest) (*pbv2.
 	if err != nil {
 		return &pbv2.CommitResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if g.isFrozen() {
@@ -340,7 +340,7 @@ func (k *kvService) Rollback(ctx context.Context, req *pbv2.RollbackRequest) (*p
 	if err != nil {
 		return &pbv2.RollbackResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if g.isFrozen() {
@@ -364,7 +364,7 @@ func (k *kvService) CheckTxnStatus(ctx context.Context, req *pbv2.CheckTxnStatus
 	if err != nil {
 		return &pbv2.CheckTxnStatusResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.CheckTxnStatusResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	leader := g.node.Leader()
@@ -394,7 +394,7 @@ func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockReques
 	if err != nil {
 		return &pbv2.ResolveLockResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if g.isFrozen() {
@@ -449,8 +449,8 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 	if req.GetNewRangeId() == 0 || len(req.GetSplitKey()) == 0 {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: "bad split request"}, nil
 	}
-	if req.GetEpoch() != 0 && req.GetEpoch() != g.cfg.Epoch {
-		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(ErrStaleEpoch)}, nil
+	if err := k.s.acceptEpoch(g, req.GetEpoch()); err != nil {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
 	}
 	if _, ok := k.s.groups[req.GetNewRangeId()]; ok {
 		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
@@ -516,8 +516,8 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	if left == right {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "same range"}, nil
 	}
-	if req.GetEpoch() != 0 && req.GetEpoch() != left.cfg.Epoch {
-		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(ErrStaleEpoch)}, nil
+	if err := k.s.acceptEpoch(left, req.GetEpoch()); err != nil {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 	}
 	payload, err := json.Marshal(struct {
 		Left  uint64 `json:"left"`
@@ -579,6 +579,7 @@ func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.St
 		return nil, err
 	}
 	st := g.node.Status()
+	start, end, epoch := k.s.rangeView(g)
 	return &pbv2.StatusResponse{
 		Id:          st.ID,
 		Role:        string(st.Role),
@@ -587,9 +588,12 @@ func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.St
 		CommitIndex: st.CommitIndex,
 		LastApplied: st.LastApplied,
 		RangeId:     g.cfg.ID,
-		RangeStart:  cloneBytes(g.cfg.Start),
-		RangeEnd:    cloneBytes(g.cfg.End),
-		Epoch:       g.cfg.Epoch,
+		RangeStart:  start,
+		RangeEnd:    end,
+		Epoch:       epoch,
+		Voters:      st.Voters,
+		Learners:    st.Learners,
+		Learner:     st.Learner,
 	}, nil
 }
 
@@ -603,11 +607,11 @@ func (k *kvService) TransferLeader(ctx context.Context, req *pbv2.TransferLeader
 	if err != nil {
 		return &pbv2.TransferLeaderResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	if err := checkEpoch(ctx, g); err != nil {
+	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	if req.GetEpoch() != 0 && req.GetEpoch() != g.cfg.Epoch {
-		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: opError(ErrStaleEpoch)}, nil
+	if err := k.s.acceptEpoch(g, req.GetEpoch()); err != nil {
+		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	if req.GetTarget() == "" {
 		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: "empty transfer target"}, nil
@@ -858,14 +862,19 @@ func proposeWhileLeader(ctx context.Context, g *rangeGroup, entry model.Entry) e
 	}
 }
 
-func checkEpoch(ctx context.Context, g *rangeGroup) error {
-	return checkEpochHeader(ctx, g.cfg.Epoch)
+// checkEpoch validates the optional x-range-epoch request header against the
+// group's epoch. A higher epoch is adopted: the replicated meta range map is
+// the authority for version bumps (membership changes, split and merge), while
+// an individual KV group may not have seen the new version yet. A lower epoch
+// is a stale client and is rejected.
+func (s *Server) checkEpoch(ctx context.Context, g *rangeGroup) error {
+	return s.checkEpochHeader(ctx, g)
 }
 
-// checkEpochHeader validates the optional x-range-epoch metadata against the
-// supplied range epoch. Callers that already snapshotted the epoch use this
-// form so the check does not read a concurrently-mutated group descriptor.
-func checkEpochHeader(ctx context.Context, current uint64) error {
+// checkEpochHeader is checkEpoch for callers that already hold a group
+// reference. It parses the optional x-range-epoch metadata and delegates the
+// comparison to acceptEpoch.
+func (s *Server) checkEpochHeader(ctx context.Context, g *rangeGroup) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil
@@ -878,8 +887,22 @@ func checkEpochHeader(ctx context.Context, current uint64) error {
 	if err != nil {
 		return fmt.Errorf("%w: bad header", ErrStaleEpoch)
 	}
-	if epoch != 0 && epoch != current {
-		return fmt.Errorf("%w: have %d, request %d", ErrStaleEpoch, current, epoch)
+	return s.acceptEpoch(g, epoch)
+}
+
+// acceptEpoch compares an optional epoch with the group's current epoch. The
+// meta range map is the single source of truth for range versions: the
+// scheduler propagates a new version to every replica (see UpdateRangeEpoch)
+// before it publishes the new map, so any mismatch here is a stale request.
+// Epoch 0 disables the check.
+func (s *Server) acceptEpoch(g *rangeGroup, epoch uint64) error {
+	if epoch == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if epoch != g.cfg.Epoch {
+		return fmt.Errorf("%w: have %d, request %d", ErrStaleEpoch, g.cfg.Epoch, epoch)
 	}
 	return nil
 }

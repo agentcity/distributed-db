@@ -3,6 +3,14 @@
 // The package depends only on the standard library and internal/model. The
 // durable log, the state machine and the peer-to-peer transport are injected
 // through interfaces so that the core stays testable and transport agnostic.
+//
+// Membership uses the single-server change algorithm and deliberately omits
+// joint consensus: AddLearner, PromoteLearner and RemoveVoter each append one
+// config entry, only one change may be in flight, and the old and new voter
+// majorities therefore always overlap. Learners replicate but never vote or
+// count towards a quorum. Voter/learner sets are persisted through the optional
+// MembershipStore capability (FileStore implements it) and are also rebuilt
+// deterministically by replaying config entries.
 package raft
 
 import (
@@ -37,6 +45,19 @@ type Config struct {
 	HeartbeatInterval  time.Duration // e.g. 100ms
 	Logger             *slog.Logger
 
+	// Learner starts the node as a non-voting member: Peers are the current
+	// voters and the local ID is a learner until a PromoteLearner config entry
+	// is applied. It is used when a KV server creates a new range replica
+	// before the leader has registered it as a learner. A learner never
+	// campaigns and never grants votes.
+	Learner bool
+	// ForceLearner replaces any persisted membership with "Peers are voters
+	// and the local node is a learner", and persists that immediately. It is
+	// used by AddReplica when a group is restarted from an old data directory:
+	// the stale on-disk voter state must not let the node campaign before the
+	// leader has re-added it. Normal restarts must not set it.
+	ForceLearner bool
+
 	// ProposeBatchWindow is how long the leader waits for more concurrent
 	// proposals before committing a batch to the LogStore. It bounds the
 	// added latency of a lone proposal. Zero or negative selects the default
@@ -56,6 +77,9 @@ type Status struct {
 	CommitIndex uint64
 	LastIndex   uint64
 	LastApplied uint64
+	Voters      []string
+	Learners    []string
+	Learner     bool // the local node is currently a learner
 }
 
 // RequestVoteRequest is sent by a candidate to its peers.
@@ -122,7 +146,11 @@ type TimeoutNowTransport interface {
 	TimeoutNow(ctx context.Context, peer string, req *TimeoutNowRequest) (*TimeoutNowResponse, error)
 }
 
-// StateMachine consumes committed log entries in index order.
+// StateMachine consumes committed log entries in index order. Raft membership
+// commands (config_add_learner, config_promote_learner, config_remove_voter)
+// are consumed by Raft itself and are not delivered to the state machine, so
+// the indices it sees may have gaps; "in index order" means increasing, not
+// necessarily contiguous.
 type StateMachine interface {
 	Apply(entry model.Entry) error
 }
@@ -304,6 +332,20 @@ type LogStore interface {
 	Truncate(fromIndex uint64) error
 }
 
+// MembershipStore is the optional LogStore capability used to persist the Raft
+// voter/learner set. It is separate from the log: a config entry is replayed
+// after a restart only when it is still in the log (it may have been compacted
+// into a snapshot), so the current membership must be durable on its own.
+//
+// LoadMembership returns the last saved membership. A store that has never
+// saved one returns nil, nil (a nil voter slice means "not persisted", not an
+// empty configuration). Voters include the local node. Implementations must
+// keep old files loadable: a missing or legacy state simply yields nil, nil.
+type MembershipStore interface {
+	SaveMembership(voters, learners []string) error
+	LoadMembership() (voters, learners []string, err error)
+}
+
 // BatchAppender is the optional LogStore capability used for group commit. A
 // store that implements it can persist a contiguous batch of entries with one
 // durable write (one fsync for FileStore) instead of one append per proposal.
@@ -343,6 +385,24 @@ var (
 	// ErrStaleTimeoutNow is returned when a TimeoutNow request carries a term
 	// or leader that no longer matches this follower's state.
 	ErrStaleTimeoutNow = errors.New("raft: stale TimeoutNow request")
+
+	// ErrAlreadyVoter is returned when AddLearner names a current voter.
+	ErrAlreadyVoter = errors.New("raft: peer is already a voter")
+	// ErrAlreadyLearner is returned when AddLearner names a current learner.
+	ErrAlreadyLearner = errors.New("raft: peer is already a learner")
+	// ErrNotLearner is returned when PromoteLearner names a peer that is not a
+	// learner.
+	ErrNotLearner = errors.New("raft: peer is not a learner")
+	// ErrNotVoter is returned when RemoveVoter names a peer that is not a
+	// voter.
+	ErrNotVoter = errors.New("raft: peer is not a voter")
+	// ErrUnsafeConfigChange is returned when a membership change would remove
+	// the leader or the last voter, or would otherwise be unsafe without joint
+	// consensus.
+	ErrUnsafeConfigChange = errors.New("raft: unsafe membership change")
+	// ErrConfigChangeInProgress is returned when a membership change is
+	// already being applied. Changes are strictly one server at a time.
+	ErrConfigChangeInProgress = errors.New("raft: membership change already in progress")
 )
 
 // errLostQuorum classifies a proposal that was accepted while this node was
@@ -350,6 +410,17 @@ var (
 // lease. It matches both ErrNotLeader (the node stepped down) and ErrTimeout
 // (the entry will not commit), so callers using errors.Is either way work.
 var errLostQuorum = errors.Join(ErrNotLeader, ErrTimeout)
+
+// isConfigCommand reports whether the entry is a Raft membership change that
+// the node applies itself instead of forwarding to the state machine.
+func isConfigCommand(t model.CommandType) bool {
+	switch t {
+	case model.CommandAddLearner, model.CommandPromoteLearner, model.CommandRemoveVoter:
+		return true
+	default:
+		return false
+	}
+}
 
 // cloneEntry returns a deep copy so callers cannot mutate the log or the state
 // machine through shared Value slices.

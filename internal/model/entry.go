@@ -31,6 +31,18 @@ const (
 	CommandSplitPrepare CommandType = "split_prepare"
 	// CommandMergePrepare freezes two adjacent ranges before data movement.
 	CommandMergePrepare CommandType = "merge_prepare"
+
+	// Raft membership changes. These entries are consumed by the Raft node
+	// itself, not by the application state machine. Entry.Key carries the
+	// peer id; Entry.Value is empty.
+	//
+	// Membership is changed one server at a time: AddLearner adds a
+	// non-voting replica, PromoteLearner turns that learner into a voter and
+	// RemoveVoter removes a voter (or learner). There is deliberately no joint
+	// consensus, so two changes must never overlap.
+	CommandAddLearner     CommandType = "config_add_learner"
+	CommandPromoteLearner CommandType = "config_promote_learner"
+	CommandRemoveVoter    CommandType = "config_remove_voter"
 )
 
 // Entry is a single replicated log entry. Index is 1-based. Value is nil for

@@ -163,6 +163,8 @@ func (s *Server) rebuildRangeOrder() {
 	s.groupIDs = ids
 	if len(ids) > 0 {
 		s.defaultID = ids[0]
+	} else {
+		s.defaultID = 0
 	}
 	s.cfg.Ranges = s.cfg.Ranges[:0]
 	for _, id := range ids {

@@ -47,6 +47,12 @@ type Config struct {
 	RangeEnd   []byte
 	RangeEpoch uint64
 
+	// NoRanges starts the process without hosting any range. Ranges can then
+	// be added through KVService.AddReplica (or a persisted range map can be
+	// loaded). It exists for membership orchestration and tests; a normal data
+	// node configures Ranges or the legacy fields above.
+	NoRanges bool
+
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
@@ -146,7 +152,10 @@ func New(cfg Config) (*Server, error) {
 		engine:    shared,
 		groups:    make(map[uint64]*rangeGroup, len(ranges)),
 		groupIDs:  make([]uint64, 0, len(ranges)),
-		defaultID: ranges[0].ID,
+		defaultID: 0,
+	}
+	if len(ranges) > 0 {
+		s.defaultID = ranges[0].ID
 	}
 	for _, rc := range ranges {
 		g, err := newRangeGroup(cfg, shared, rc)

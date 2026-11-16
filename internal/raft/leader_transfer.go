@@ -55,13 +55,7 @@ func (n *Node) TransferLeadership(ctx context.Context, target string) error {
 		n.mu.Unlock()
 		return fmt.Errorf("%w: %s is the current leader", ErrUnknownTarget, target)
 	}
-	known := false
-	for _, peer := range n.cfg.Peers {
-		if peer == target {
-			known = true
-			break
-		}
-	}
+	known := n.isVoterLocked(target)
 	if !known {
 		n.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrUnknownTarget, target)
@@ -204,6 +198,12 @@ func (n *Node) HandleTimeoutNow(ctx context.Context, req *TimeoutNowRequest) (*T
 		return &TimeoutNowResponse{Term: term, Success: false}, nil
 	}
 	if n.role != Follower {
+		term := n.term
+		n.mu.Unlock()
+		return &TimeoutNowResponse{Term: term, Success: false}, nil
+	}
+	if !n.selfIsVoterLocked() {
+		// Learners and removed nodes must not campaign.
 		term := n.term
 		n.mu.Unlock()
 		return &TimeoutNowResponse{Term: term, Success: false}, nil

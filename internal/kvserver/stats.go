@@ -66,12 +66,12 @@ func (k *kvService) RangeStats(ctx context.Context, req *pbv2.RangeStatsRequest)
 
 	// Snapshot the descriptor under s.mu: split/merge mutates g.cfg while
 	// holding it. The scan itself runs outside the lock.
-	start, end, epoch := k.s.rangeView(g)
+	start, end, _ := k.s.rangeView(g)
 	leader := g.node.Leader()
-	if req.GetEpoch() != 0 && req.GetEpoch() != epoch {
-		return &pbv2.RangeStatsResponse{Leader: leader, Error: opError(ErrStaleEpoch)}, nil
+	if err := k.s.acceptEpoch(g, req.GetEpoch()); err != nil {
+		return &pbv2.RangeStatsResponse{Leader: leader, Error: opError(err)}, nil
 	}
-	if err := checkEpochHeader(ctx, epoch); err != nil {
+	if err := k.s.checkEpochHeader(ctx, g); err != nil {
 		return &pbv2.RangeStatsResponse{Leader: leader, Error: opError(err)}, nil
 	}
 	if !g.node.IsLeader() {

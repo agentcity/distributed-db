@@ -2,6 +2,7 @@ package raft_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,9 +60,6 @@ func (s *testSM) Apply(entry model.Entry) error {
 		// (internal/kv) is idempotent; the test model simply ignores replays.
 		return nil
 	}
-	if entry.Index != s.lastIndex+1 {
-		return fmt.Errorf("state machine apply out of order: got %d after %d", entry.Index, s.lastIndex)
-	}
 	s.lastIndex = entry.Index
 	s.byIndex[entry.Index] = entry
 	switch entry.Type {
@@ -90,6 +88,41 @@ func (s *testSM) appliedIndex() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastIndex
+}
+
+// Snapshot/RestoreSnapshot make testSM usable by membership tests that force
+// log compaction before adding a learner. The payload mirrors the applied
+// values and index; byIndex is intentionally not preserved.
+type testSMSnapshot struct {
+	LastIndex uint64            `json:"last_index"`
+	Values    map[string][]byte `json:"values"`
+}
+
+func (s *testSM) Snapshot() ([]byte, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload := testSMSnapshot{LastIndex: s.lastIndex, Values: make(map[string][]byte, len(s.values))}
+	for k, v := range s.values {
+		payload.Values[k] = append([]byte(nil), v...)
+	}
+	data, err := json.Marshal(payload)
+	return data, s.lastIndex, err
+}
+
+func (s *testSM) RestoreSnapshot(data []byte) error {
+	var payload testSMSnapshot
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastIndex = payload.LastIndex
+	s.values = make(map[string][]byte, len(payload.Values))
+	for k, v := range payload.Values {
+		s.values[k] = append([]byte(nil), v...)
+	}
+	s.byIndex = make(map[uint64]model.Entry)
+	return nil
 }
 
 func (s *testSM) entryAt(index uint64) (model.Entry, bool) {

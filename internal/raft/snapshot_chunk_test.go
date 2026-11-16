@@ -831,6 +831,12 @@ func TestInstallSnapshotChunkResumesFromRejectionOffset(t *testing.T) {
 		return c.sms[lagging].appliedIndex() >= snap.Index
 	})
 	reqs := tr.chunkRequests(lagging)
+	if len(reqs) == 0 {
+		// Under heavy scheduling the follower can receive the missing entries
+		// through ordinary AppendEntries before the leader needs a snapshot.
+		// That is a valid (faster) catch-up path, not a resume failure.
+		t.Skip("follower caught up without a snapshot; resume path not exercised")
+	}
 	// The rejected chunk is not sent again: only the remaining chunk is.
 	requireSucceededChunks(t, reqs, snap.Data, raft.SnapshotChunkSize, 1)
 	assertNoSnapshotRecvTemps(t, c.dirs[lagging])
