@@ -180,7 +180,12 @@ func (k *kvService) Get(ctx context.Context, req *pbv2.GetRequest) (*pbv2.GetRes
 		if serr != nil {
 			return &pbv2.GetResponse{Leader: leader, Error: opError(serr)}, nil
 		}
-		if st.Committed || st.RolledBack {
+		// A cross-range secondary lock cannot be resolved from this range's
+		// local state: CheckTxnStatus sees no primary record and may classify
+		// an expired lock as rolled back even though the primary range already
+		// committed. Return "locked" instead; the client consults the primary
+		// range and issues ResolveLock with the real outcome.
+		if (st.Committed || st.RolledBack) && g.lockPrimaryInRange(st.LockPrimary) {
 			if rerr := g.resolveLock(ctx, st, req.GetKey()); rerr != nil {
 				return &pbv2.GetResponse{Leader: leader, Error: opError(rerr)}, nil
 			}

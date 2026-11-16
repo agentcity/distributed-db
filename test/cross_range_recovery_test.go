@@ -480,6 +480,109 @@ func TestV2CrossRange2PCConcurrentConflict(t *testing.T) {
 	}
 }
 
+// TestV2CrossRange2PCResolverLeavesForeignSecondaryLock puts both ranges on one
+// node. A secondary key's lock has a primary in the other range; its TTL is
+// expired and the primary range has committed. The background resolver must not
+// locally roll the secondary lock back (which would make the transaction
+// partially visible). A client read must instead resolve it through the primary
+// range and see both values.
+func TestV2CrossRange2PCResolverLeavesForeignSecondaryLock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr, addr := v2FreeAddr(t), v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{
+		Addr: metaAddr,
+		Ranges: []meta.Range{
+			{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{addr}, Leader: addr, Version: 1},
+			{ID: 2, Start: []byte("m"), End: nil, Replicas: []string{addr}, Leader: addr, Version: 1},
+		},
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("meta server: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("start meta: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+
+	srv, err := kvserver.New(kvserver.Config{
+		ID: addr, RaftAddr: addr, DataDir: t.TempDir(),
+		Ranges: []kvserver.RangeConfig{
+			{ID: 1, End: []byte("m")},
+			{ID: 2, Start: []byte("m")},
+		},
+		ElectionTimeoutMin: 80 * time.Millisecond,
+		ElectionTimeoutMax: 160 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		CacheSize:          8 << 20,
+		MemTableSize:       4 << 20,
+		Logger:             v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("kvserver: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start kvserver: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Stop(sctx)
+	})
+	if !waitGroupLeader(t, srv, 1) || !waitGroupLeader(t, srv, 2) {
+		t.Fatal("ranges did not elect leaders")
+	}
+	raw := v2Dial(t, addr)
+
+	// The lock is already past its 3s TTL: startTS physical time is 10s ago.
+	oldTS := uint64(time.Now().Add(-10*time.Second).UnixMilli()) << 18
+	pr, err := raw.Prewrite(ctx, &pbv2.PrewriteRequest{
+		StartTs: oldTS, Primary: []byte("a"),
+		Mutations: []*pbv2.Mutation{{Key: []byte("z"), Value: []byte("right")}},
+	})
+	if err != nil || !pr.GetSuccess() {
+		t.Fatalf("prewrite secondary: %v %+v", err, pr)
+	}
+	// Commit the primary range in one Raft entry; its key is in range 1 while
+	// the secondary lock is in range 2.
+	cr, err := raw.CommitSingle(ctx, &pbv2.CommitSingleRequest{
+		StartTs: oldTS, CommitTs: oldTS + 1, Primary: []byte("a"),
+		Mutations: []*pbv2.Mutation{{Key: []byte("a"), Value: []byte("left")}},
+	})
+	if err != nil || !cr.GetSuccess() {
+		t.Fatalf("commit primary: %v %+v", err, cr)
+	}
+
+	// Give the background resolver at least one tick. It must skip the foreign
+	// secondary lock instead of TTL-rolling it back.
+	time.Sleep(1500 * time.Millisecond)
+	if got := srv.ResolvedLocks(); got != 0 {
+		t.Fatalf("background resolver resolved %d locks, want 0 (foreign secondary lock must be skipped)", got)
+	}
+
+	// A raw read must report the still-present lock, not a locally resolved
+	// absence. The high-level client below is what resolves it through the
+	// primary range.
+	nowTS := uint64(time.Now().UnixMilli()) << 18
+	gr, err := raw.Get(ctx, &pbv2.GetRequest{Key: []byte("z"), Ts: nowTS})
+	if err != nil {
+		t.Fatalf("raw get secondary: %v", err)
+	}
+	if gr.GetError() != "locked" {
+		t.Fatalf("raw get secondary = %+v, want still locked (resolver must not roll it back locally)", gr)
+	}
+
+	client, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("v2 client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	assertCR2PCValues(t, client, ctx, "left", "right", 5*time.Second)
+}
+
 // TestV2CrossRange2PCCommitResponseLoss applies the commit on a range and then
 // drops the response. The client retries the same commitTS; the server's
 // idempotent replay must make the transaction succeed exactly once.

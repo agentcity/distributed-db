@@ -295,6 +295,20 @@ func (s *Server) stop(ctx context.Context) error {
 // rolled back. It is useful for tests and metrics.
 func (s *Server) ResolvedLocks() uint64 { return s.locksResolved.Load() }
 
+// lockPrimaryInRange reports whether a lock's primary key belongs to this
+// group's range (or the lock carries no primary pointer).
+//
+// A false result identifies a cross-range secondary lock. Its commit or
+// rollback depends on the primary range, which this group cannot decide from
+// local state: the local MVCC store has no record for the primary key, and
+// treating the lock's TTL as a rollback would make a committed cross-range
+// transaction partially visible. Such locks are left for an explicit
+// ResolveLock or for the client, which checks the primary range before
+// resolving.
+func (g *rangeGroup) lockPrimaryInRange(primary []byte) bool {
+	return len(primary) == 0 || g.containsKey(primary)
+}
+
 func (s *Server) resolveLocksLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -323,6 +337,14 @@ func (s *Server) resolveExpiredLocks(now time.Time) {
 		for _, key := range keys {
 			st, err := g.store.CheckTxnStatus(key, 0, now)
 			if err != nil || (!st.Committed && !st.RolledBack) {
+				continue
+			}
+			if !g.lockPrimaryInRange(st.LockPrimary) {
+				// The local range cannot decide this lock's fate; the primary
+				// range may have committed the transaction. Leave it for the
+				// client/ResolveLock instead of exposing a partial commit.
+				s.log.Debug("skip cross-range secondary lock",
+					"range", id, "key", key, "primary", st.LockPrimary, "lock_ts", st.LockTS)
 				continue
 			}
 			if err := g.resolveLock(context.Background(), st, key); err != nil {
