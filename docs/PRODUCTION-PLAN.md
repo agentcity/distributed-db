@@ -1,7 +1,6 @@
 # Production plan: что реализовать и в каком порядке
 
-- Дата: 2026-11-16
-- HEAD: `13c03c2`
+- Дата: 2026-11-17
 - Связанные документы: [ASSESSMENT.md](ASSESSMENT.md),
   [PRODUCT-READINESS.md](PRODUCT-READINESS.md), [PERFORMANCE.md](PERFORMANCE.md).
 

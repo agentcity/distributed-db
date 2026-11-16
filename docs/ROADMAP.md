@@ -186,60 +186,35 @@ SQL не начинается, пока KV не даёт стабильные т
 - Correctness: linearizability checker, snapshot isolation tests, Jepsen.
 - Recovery: snapshot + replay, RTO, целостность после сбоя.
 
-## Статус на 2026-11-16
+## Текущее состояние
 
-Сделано (M0–M2, часть M3/M5):
+KV:
 
-- storage на Pebble, MVCC/2PC, Raft snapshots/InstallSnapshot, Multi-Raft host,
+- Pebble, MVCC/2PC, Raft snapshots/InstallSnapshot, Multi-Raft host,
   meta/range/TSO, smart client, benchmark harness;
-- single-range v2: gRPC KVService/RaftService, `kv2 node|meta`, клиентский
-  транзакционный SDK;
-- e2e 3 узла: prewrite/commit/get/scan, kill лидера, новая транзакция и
-  клиентский commit после failover;
-- InstallSnapshot по gRPC, state-machine snapshot MVCC и restart из snapshot;
-- e2e catch-up отставшей реплики через InstallSnapshot;
-- adapter `multiraft` → `raft.Node`;
-- benchmark v2 на реальном gRPC; Stage 1: group commit, TSO batch,
-  range cache, 1PC; 3 узла ~40 мс/транзакция sequential, ~350 tx/s parallel,
-  Get ~0.15–1 мс.
+- 3-node v2: prewrite/commit/get/scan, failover, snapshot catch-up;
+- range split/merge, auto-split/merge, leader transfer/rebalance;
+- learner→voter membership, chunked snapshots, logical backup/restore;
+- fast/sync профили; sync по умолчанию;
+- batch/pipeline: fast ~7k tx/s амортизированно, sync pipeline 256 ~8.6k tx/s
+  на loopback; один in-flight остаётся latency-bound;
+- Jepsen partitions/clock skew, crash SIGKILL harness, nightly chaos CI.
 
-M1/0006 закрыт. В M2 сделано: `meta.SetRanges`, `GetRange/ListRanges`,
-range identity в Status, клиентский routing по range ID и e2e
-2 диапазона × 3 реплики с failover. M2.1/0011: meta Raft 3 узла,
-replicated TSO, `Leader`, клиентский redirect и failover.
+SQL:
 
-В M2.2/0012 сделан RangeHost (N Raft-групп в процессе, range_id RPC) и
-host-local split/merge с переносом MVCC-записей. В M2.4/0013 — распределённый
-split: prepare через Raft, freeze всех реплик, новая группа на каждой,
-meta SetRanges после успеха. Распределённый merge тоже сделан. Epoch/fencing,
-meta scheduler Split/Merge, retry fan-out и partial-merge idempotency готовы;
-range map persist. Остались durable scheduler queue/leader lease.
-Stage 1 speed закрыт: group commit, TSO batch, range cache, 1PC.
-Stage 2.1: потоковый `StreamRange`/split/merge и `AutoSplit` по размеру.
-Stage 2.2a: shared Pebble на узел. Stage 2.2b: потоковый state-machine
-snapshot и chunked InstallSnapshot. Stage 3.1: cross-range 2PC primary-first. Stage 3.2: SQL после split,
-planner/plan cache, extended pgwire, recovery, Jepsen partitions.
-Stage 2.3: auto-merge, backup/restore, gzip snapshot. Leader transfer/rebalance, snapshot resume и SQL/pgwire-метрики сделаны.
-Add/Remove replica (learner→voter) сделан; остались joint consensus/decommission,
-per-chunk CRC, SLO p99, TLS/auth.
-Stage 3.3: batch-entry (256 × 500 µs) + `CommitBatch` (256 in-flight) —
-batch throughput ~5–7k tx/s на уровне PostgreSQL 13 на loopback, но batch
-latency 36–51 мс; interactive/parallel fast всё ещё ~8–11×, production sync
-~33–37× медленнее. `SyncWrites=false` для state machine: durability
-опирается на replay Raft-лога, нужен crash-soak.
+- parser, каталог, row encoding, indexes, CBO/plan cache;
+- CREATE/DROP TABLE/INDEX, INSERT/SELECT/UPDATE/DELETE;
+- WHERE, GROUP BY, INNER JOIN, ORDER BY/LIMIT;
+- pgwire simple+extended, HTTP `POST /v1/sql`;
+- SQL после split и на 3 узлах с failover.
 
-В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
-по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
-Клиентские методы, resolver, GC safe point и opt-in Jepsen kill/restart
-добавлены. Осталось: network partitions, clock skew, longer soak.
+Не закрыто:
 
-В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV,
-HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
-колонке), multi-row UPDATE/DELETE по индексу, агрегаты COUNT/SUM/AVG/
-MIN/MAX; e2e CREATE/INSERT/SELECT/UPDATE/DELETE прошёл.
-GROUP BY, INNER JOIN и pgwire simple+extended сделаны. Осталось: planner
-(JOIN order/cost), AND/OR, >2 JOIN, LEFT/RIGHT JOIN, NULL/DECIMAL/JSON/FK,
-online DDL, pg_catalog/JDBC/TLS. SQL на 3 узлах с kill лидера проверен.
+- joint consensus/decommission, membership в snapshot;
+- PITR/continuous backup, restore drills;
+- TLS по умолчанию, RBAC/audit/encryption at rest;
+- rolling upgrade/operator, SLO p99 и 1 ТБ soak;
+- AND/OR, >2 JOIN, NULL/DECIMAL/JSON/FK, online DDL, pg_catalog/JDBC.
 
 ## Отдельный трек: edge hash cache
 

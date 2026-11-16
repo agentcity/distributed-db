@@ -1,6 +1,6 @@
 # Честная оценка проекта
 
-- Дата: 2026-11-16
+- Дата: 2026-11-17
 - Состояние: 2026-11-17
 - Область: v1 (`cmd/db`), v2 KV/SQL (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`),
   edge hash cache (`cmd/edgehash`, `internal/edgeset`, `edgehttp`, `edgecache`),

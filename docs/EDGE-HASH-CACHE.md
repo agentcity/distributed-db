@@ -1,6 +1,6 @@
 # Edge hash cache: Bloom + Merkle + manifest
 
-- Дата: 2026-11-16
+- Дата: 2026-11-17
 - Задачи: 0034, 0035
 - Код: `internal/edgeset`, `internal/edgehttp`, `internal/edgecache`, `cmd/edgehash`, `mobile/`
 
