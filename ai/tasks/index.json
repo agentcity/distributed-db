@@ -70,5 +70,11 @@
     "title": "M2.2/M2.3 — RangeHost и split/merge",
     "status": "done",
     "file": "0012-m2-rangehost-split.md"
+  },
+  {
+    "id": "0013",
+    "title": "M2.4 — распределённый split на всех репликах",
+    "status": "done",
+    "file": "0013-distributed-split.md"
   }
 ]
