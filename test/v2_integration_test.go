@@ -661,3 +661,105 @@ func TestV2TwoRangesRouting(t *testing.T) {
 	// Range 1 needs two replicas; the failed node is gone, so the transaction
 	// above proves the client refreshed its leader cache and routing.
 }
+
+func TestV2LockResolution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr := v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{Addr: metaAddr, Logger: v2Logger()})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+	metaCC, err := grpc.NewClient(metaAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("meta dial: %v", err)
+	}
+	t.Cleanup(func() { _ = metaCC.Close() })
+	metaClient := pbv2.NewMetaServiceClient(metaCC)
+
+	addr := v2FreeAddr(t)
+	srv, err := kvserver.New(kvserver.Config{
+		ID: addr, RaftAddr: addr, DataDir: t.TempDir(),
+		ElectionTimeoutMin: 80 * time.Millisecond,
+		ElectionTimeoutMax: 160 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		CacheSize:          8 << 20, MemTableSize: 4 << 20,
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Stop(sctx)
+	})
+	client := v2Dial(t, addr)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && srv.Raft().Status().Role != "leader" {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if srv.Raft().Status().Role != "leader" {
+		t.Fatal("no leader")
+	}
+
+	ts := func() (uint64, uint64) {
+		r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
+		if err != nil {
+			t.Fatalf("ts: %v", err)
+		}
+		return r.Start, r.Start + 1
+	}
+
+	start, commit := ts()
+	pr, err := client.Prewrite(ctx, &pbv2.PrewriteRequest{
+		StartTs: start, Primary: []byte("lk"),
+		Mutations: []*pbv2.Mutation{{Key: []byte("lk"), Value: []byte("v")}},
+	})
+	if err != nil || !pr.GetSuccess() {
+		t.Fatalf("prewrite: %v %+v", err, pr)
+	}
+	st, err := client.CheckTxnStatus(ctx, &pbv2.CheckTxnStatusRequest{Key: []byte("lk"), StartTs: start})
+	if err != nil || st.GetCommitted() || st.GetRolledBack() {
+		t.Fatalf("status after prewrite: %v %+v", err, st)
+	}
+	if _, err := client.ResolveLock(ctx, &pbv2.ResolveLockRequest{
+		Keys: [][]byte{[]byte("lk")}, StartTs: start, CommitTs: commit,
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	gr, err := client.Get(ctx, &pbv2.GetRequest{Key: []byte("lk"), Ts: commit})
+	if err != nil || !gr.GetFound() || string(gr.GetValue()) != "v" {
+		t.Fatalf("get after resolve: %v %+v", err, gr)
+	}
+	st, err = client.CheckTxnStatus(ctx, &pbv2.CheckTxnStatusRequest{Key: []byte("lk"), StartTs: start})
+	if err != nil || !st.GetCommitted() || st.GetCommitTs() != commit {
+		t.Fatalf("committed status: %v %+v", err, st)
+	}
+
+	// Rollback path.
+	start2, _ := ts()
+	if _, err := client.Prewrite(ctx, &pbv2.PrewriteRequest{
+		StartTs: start2, Primary: []byte("rb"),
+		Mutations: []*pbv2.Mutation{{Key: []byte("rb"), Value: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("prewrite2: %v", err)
+	}
+	if _, err := client.ResolveLock(ctx, &pbv2.ResolveLockRequest{
+		Keys: [][]byte{[]byte("rb")}, StartTs: start2, CommitTs: 0,
+	}); err != nil {
+		t.Fatalf("rollback resolve: %v", err)
+	}
+	if st, err := client.CheckTxnStatus(ctx, &pbv2.CheckTxnStatusRequest{Key: []byte("rb"), StartTs: start2}); err != nil || !st.GetRolledBack() {
+		t.Fatalf("rolled back status: %v %+v", err, st)
+	}
+}

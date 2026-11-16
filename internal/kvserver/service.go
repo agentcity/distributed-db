@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"distributed-db/internal/model"
 	"distributed-db/internal/mvcc"
@@ -163,6 +164,20 @@ func (k *kvService) Get(ctx context.Context, req *pbv2.GetRequest) (*pbv2.GetRes
 		return &pbv2.GetResponse{Leader: leader, Error: opError(err)}, nil
 	}
 	value, err := k.s.store.Get(req.GetKey(), req.GetTs())
+	if errors.Is(err, mvcc.ErrLocked) {
+		// Resolve a lock left by a committed/rolled-back/expired transaction,
+		// then retry the read. A live lock is reported to the caller.
+		st, serr := k.s.store.CheckTxnStatus(req.GetKey(), 0, time.Now())
+		if serr != nil {
+			return &pbv2.GetResponse{Leader: leader, Error: opError(serr)}, nil
+		}
+		if st.Committed || st.RolledBack {
+			if rerr := k.s.resolveLock(ctx, st, req.GetKey()); rerr != nil {
+				return &pbv2.GetResponse{Leader: leader, Error: opError(rerr)}, nil
+			}
+			value, err = k.s.store.Get(req.GetKey(), req.GetTs())
+		}
+	}
 	if errors.Is(err, mvcc.ErrKeyNotFound) {
 		return &pbv2.GetResponse{Found: false, Leader: leader}, nil
 	}
@@ -244,6 +259,63 @@ func (k *kvService) Rollback(ctx context.Context, req *pbv2.RollbackRequest) (*p
 		return &pbv2.RollbackResponse{Leader: k.s.raft.Leader(), Error: opError(err)}, nil
 	}
 	return &pbv2.RollbackResponse{Success: true, Leader: k.s.raft.Leader()}, nil
+}
+
+func (k *kvService) CheckTxnStatus(ctx context.Context, req *pbv2.CheckTxnStatusRequest) (*pbv2.CheckTxnStatusResponse, error) {
+	leader := k.s.raft.Leader()
+	if err := k.s.raft.ReadBarrier(ctx); err != nil {
+		return &pbv2.CheckTxnStatusResponse{Leader: leader, Error: opError(err)}, nil
+	}
+	st, err := k.s.store.CheckTxnStatus(req.GetKey(), req.GetStartTs(), time.Now())
+	if err != nil {
+		return &pbv2.CheckTxnStatusResponse{Leader: leader, Error: opError(err)}, nil
+	}
+	resp := &pbv2.CheckTxnStatusResponse{
+		Committed: st.Committed, CommitTs: st.CommitTS, RolledBack: st.RolledBack,
+		LockPrimary: st.LockPrimary, LockTs: st.LockTS, TtlMs: st.TTLMillis,
+		Expired: st.Expired, Leader: leader,
+	}
+	for _, key := range st.Keys {
+		resp.Keys = append(resp.Keys, key)
+	}
+	return resp, nil
+}
+
+func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockRequest) (*pbv2.ResolveLockResponse, error) {
+	if len(req.GetKeys()) == 0 {
+		return &pbv2.ResolveLockResponse{Leader: k.s.raft.Leader(), Error: "empty keys"}, nil
+	}
+	payload, err := encodeCommand(applyCommand{
+		StartTS: req.GetStartTs(), CommitTS: req.GetCommitTs(), Keys: req.GetKeys(),
+	})
+	if err != nil {
+		return &pbv2.ResolveLockResponse{Leader: k.s.raft.Leader(), Error: "encode"}, nil
+	}
+	typ := model.CommandRollback
+	if req.GetCommitTs() > 0 {
+		typ = model.CommandCommit
+	}
+	if _, err := k.s.raft.Propose(ctx, model.Entry{Type: typ, Value: payload}); err != nil {
+		return &pbv2.ResolveLockResponse{Leader: k.s.raft.Leader(), Error: opError(err)}, nil
+	}
+	return &pbv2.ResolveLockResponse{Success: true, Leader: k.s.raft.Leader()}, nil
+}
+
+func (s *Server) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbackKey []byte) error {
+	keys := st.Keys
+	if len(keys) == 0 {
+		keys = [][]byte{fallbackKey}
+	}
+	payload, err := encodeCommand(applyCommand{StartTS: st.LockTS, CommitTS: st.CommitTS, Keys: keys})
+	if err != nil {
+		return err
+	}
+	typ := model.CommandRollback
+	if st.Committed {
+		typ = model.CommandCommit
+	}
+	_, err = s.raft.Propose(ctx, model.Entry{Type: typ, Value: payload})
+	return err
 }
 
 func (k *kvService) Status(_ context.Context, _ *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {

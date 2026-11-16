@@ -19,12 +19,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KVService_Get_FullMethodName      = "/dbv2.KVService/Get"
-	KVService_Scan_FullMethodName     = "/dbv2.KVService/Scan"
-	KVService_Prewrite_FullMethodName = "/dbv2.KVService/Prewrite"
-	KVService_Commit_FullMethodName   = "/dbv2.KVService/Commit"
-	KVService_Rollback_FullMethodName = "/dbv2.KVService/Rollback"
-	KVService_Status_FullMethodName   = "/dbv2.KVService/Status"
+	KVService_Get_FullMethodName            = "/dbv2.KVService/Get"
+	KVService_Scan_FullMethodName           = "/dbv2.KVService/Scan"
+	KVService_Prewrite_FullMethodName       = "/dbv2.KVService/Prewrite"
+	KVService_Commit_FullMethodName         = "/dbv2.KVService/Commit"
+	KVService_Rollback_FullMethodName       = "/dbv2.KVService/Rollback"
+	KVService_CheckTxnStatus_FullMethodName = "/dbv2.KVService/CheckTxnStatus"
+	KVService_ResolveLock_FullMethodName    = "/dbv2.KVService/ResolveLock"
+	KVService_Status_FullMethodName         = "/dbv2.KVService/Status"
 )
 
 // KVServiceClient is the client API for KVService service.
@@ -38,6 +40,8 @@ type KVServiceClient interface {
 	Prewrite(ctx context.Context, in *PrewriteRequest, opts ...grpc.CallOption) (*PrewriteResponse, error)
 	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
 	Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error)
+	CheckTxnStatus(ctx context.Context, in *CheckTxnStatusRequest, opts ...grpc.CallOption) (*CheckTxnStatusResponse, error)
+	ResolveLock(ctx context.Context, in *ResolveLockRequest, opts ...grpc.CallOption) (*ResolveLockResponse, error)
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
@@ -99,6 +103,26 @@ func (c *kVServiceClient) Rollback(ctx context.Context, in *RollbackRequest, opt
 	return out, nil
 }
 
+func (c *kVServiceClient) CheckTxnStatus(ctx context.Context, in *CheckTxnStatusRequest, opts ...grpc.CallOption) (*CheckTxnStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckTxnStatusResponse)
+	err := c.cc.Invoke(ctx, KVService_CheckTxnStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) ResolveLock(ctx context.Context, in *ResolveLockRequest, opts ...grpc.CallOption) (*ResolveLockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveLockResponse)
+	err := c.cc.Invoke(ctx, KVService_ResolveLock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *kVServiceClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StatusResponse)
@@ -120,6 +144,8 @@ type KVServiceServer interface {
 	Prewrite(context.Context, *PrewriteRequest) (*PrewriteResponse, error)
 	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
 	Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error)
+	CheckTxnStatus(context.Context, *CheckTxnStatusRequest) (*CheckTxnStatusResponse, error)
+	ResolveLock(context.Context, *ResolveLockRequest) (*ResolveLockResponse, error)
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedKVServiceServer()
 }
@@ -145,6 +171,12 @@ func (UnimplementedKVServiceServer) Commit(context.Context, *CommitRequest) (*Co
 }
 func (UnimplementedKVServiceServer) Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Rollback not implemented")
+}
+func (UnimplementedKVServiceServer) CheckTxnStatus(context.Context, *CheckTxnStatusRequest) (*CheckTxnStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CheckTxnStatus not implemented")
+}
+func (UnimplementedKVServiceServer) ResolveLock(context.Context, *ResolveLockRequest) (*ResolveLockResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResolveLock not implemented")
 }
 func (UnimplementedKVServiceServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Status not implemented")
@@ -260,6 +292,42 @@ func _KVService_Rollback_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_CheckTxnStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckTxnStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).CheckTxnStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_CheckTxnStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).CheckTxnStatus(ctx, req.(*CheckTxnStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_ResolveLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).ResolveLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_ResolveLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).ResolveLock(ctx, req.(*ResolveLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _KVService_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StatusRequest)
 	if err := dec(in); err != nil {
@@ -304,6 +372,14 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Rollback",
 			Handler:    _KVService_Rollback_Handler,
+		},
+		{
+			MethodName: "CheckTxnStatus",
+			Handler:    _KVService_CheckTxnStatus_Handler,
+		},
+		{
+			MethodName: "ResolveLock",
+			Handler:    _KVService_ResolveLock_Handler,
 		},
 		{
 			MethodName: "Status",
