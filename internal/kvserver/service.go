@@ -132,89 +132,25 @@ func (m *stateMachine) clearMerge() {
 	m.splitMu.Unlock()
 }
 
-// snapshotPayload is the durable state-machine snapshot. It contains every
-// key/value in the MVCC keyspace plus the applied Raft index.
-type snapshotPayload struct {
-	Index   uint64 `json:"index"`
-	Entries []struct {
-		Key   []byte `json:"k"`
-		Value []byte `json:"v"`
-	} `json:"entries"`
-}
-
-// Snapshot implements raft.Snapshotter.
+// Snapshot implements raft.Snapshotter. The Raft interface requires the whole
+// snapshot as a []byte, so this compatibility method buffers the stream in
+// memory; StreamSnapshot is the bounded-memory entry point for callers that
+// can consume an io.Writer.
 func (m *stateMachine) Snapshot() ([]byte, uint64, error) {
-	snap, err := m.engine.Snapshot()
+	var buf bytes.Buffer
+	index, err := m.StreamSnapshot(&buf)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer snap.Close()
-	it, err := snap.NewIter(nil, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer it.Close()
-
-	payload := snapshotPayload{Index: m.lastApplied.Load()}
-	for it.Valid() {
-		key := append([]byte(nil), it.Key()...)
-		value := append([]byte(nil), it.Value()...)
-		payload.Entries = append(payload.Entries, struct {
-			Key   []byte `json:"k"`
-			Value []byte `json:"v"`
-		}{Key: key, Value: value})
-		it.Next()
-	}
-	if err := it.Error(); err != nil {
-		return nil, 0, err
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, 0, err
-	}
-	return data, payload.Index, nil
+	return buf.Bytes(), index, nil
 }
 
-// RestoreSnapshot implements raft.SnapshotRestorer. It replaces the whole
-// MVCC keyspace; this is acceptable for M1 (small snapshots) and will be
-// replaced by a Pebble snapshot/ingest path later.
+// RestoreSnapshot implements raft.SnapshotRestorer. It accepts the current
+// streaming format produced by Snapshot/StreamSnapshot and, for snapshots
+// persisted by earlier releases, the legacy single-JSON-object payload; the
+// legacy path is handled by RestoreSnapshotStream.
 func (m *stateMachine) RestoreSnapshot(data []byte) error {
-	var payload snapshotPayload
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return fmt.Errorf("kvserver: decode snapshot: %w", err)
-	}
-	batch := m.engine.NewBatch()
-	defer batch.Close()
-
-	it, err := m.engine.NewIter(nil, nil)
-	if err != nil {
-		return err
-	}
-	var oldKeys [][]byte
-	for it.Valid() {
-		oldKeys = append(oldKeys, append([]byte(nil), it.Key()...))
-		it.Next()
-	}
-	if err := it.Error(); err != nil {
-		it.Close()
-		return err
-	}
-	_ = it.Close()
-	for _, key := range oldKeys {
-		if err := batch.Delete(key); err != nil {
-			return err
-		}
-	}
-	for _, e := range payload.Entries {
-		if err := batch.Set(e.Key, e.Value); err != nil {
-			return err
-		}
-	}
-	if err := batch.Commit(); err != nil {
-		return err
-	}
-	m.lastApplied.Store(payload.Index)
-	return nil
+	return m.RestoreSnapshotStream(bytes.NewReader(data))
 }
 
 func encodeCommand(cmd applyCommand) ([]byte, error) { return json.Marshal(cmd) }
@@ -315,10 +251,8 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 	if g.isFrozen() {
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
-	if len(req.GetPrimary()) > 0 && !g.containsKey(req.GetPrimary()) {
-		err := fmt.Errorf("%w: primary %q is outside range %d", ErrRangeMismatch, req.GetPrimary(), g.cfg.ID)
-		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
-	}
+	// The primary may live in another range for a cross-range transaction;
+	// each participant only needs the primary pointer, not the primary key.
 	payload, err := encodeCommand(applyCommand{
 		StartTS:   req.GetStartTs(),
 		Primary:   req.GetPrimary(),
@@ -743,6 +677,41 @@ func (r *raftService) InstallSnapshot(ctx context.Context, req *pbv2.InstallSnap
 		Term:      resp.Term,
 		Success:   resp.Success,
 		LastIndex: resp.LastIndex,
+	}, nil
+}
+
+// InstallSnapshotChunk dispatches one chunk of a streamed snapshot to the Raft
+// node hosting range_id. Protocol rejections (bad offset, checksum, restore
+// failure) are returned in the response's error field with success=false;
+// transport-level failures such as an unknown range or a stopped node are
+// returned as gRPC errors.
+func (r *raftService) InstallSnapshotChunk(ctx context.Context, req *pbv2.InstallSnapshotChunkRequest) (*pbv2.InstallSnapshotChunkResponse, error) {
+	if req == nil {
+		return nil, errors.New("kvserver: nil InstallSnapshotChunk")
+	}
+	g, err := r.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.node.HandleInstallSnapshotChunk(ctx, &raft.InstallSnapshotChunkRequest{
+		Term:         req.GetTerm(),
+		LeaderID:     req.GetLeaderId(),
+		Index:        req.GetIndex(),
+		SnapshotTerm: req.GetSnapshotTerm(),
+		Offset:       req.GetOffset(),
+		Data:         req.GetData(),
+		Done:         req.GetDone(),
+		Size:         req.GetSize(),
+		CRC32:        req.GetCrc32(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pbv2.InstallSnapshotChunkResponse{
+		Term:      resp.Term,
+		Success:   resp.Success,
+		LastIndex: resp.LastIndex,
+		Error:     resp.Error,
 	}, nil
 }
 

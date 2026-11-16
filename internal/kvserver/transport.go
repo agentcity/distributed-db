@@ -144,6 +144,34 @@ func (t *peerTransport) InstallSnapshot(ctx context.Context, peer string, req *r
 	}, nil
 }
 
+func (t *peerTransport) InstallSnapshotChunk(ctx context.Context, peer string, req *raft.InstallSnapshotChunkRequest) (*raft.InstallSnapshotChunkResponse, error) {
+	c, err := t.client(peer)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.InstallSnapshotChunk(ctx, &pbv2.InstallSnapshotChunkRequest{
+		RangeId:      t.rangeID,
+		Term:         req.Term,
+		LeaderId:     req.LeaderID,
+		Index:        req.Index,
+		SnapshotTerm: req.SnapshotTerm,
+		Offset:       req.Offset,
+		Data:         req.Data,
+		Done:         req.Done,
+		Size:         req.Size,
+		Crc32:        req.CRC32,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raft.InstallSnapshotChunkResponse{
+		Term:      resp.GetTerm(),
+		Success:   resp.GetSuccess(),
+		LastIndex: resp.GetLastIndex(),
+		Error:     resp.GetError(),
+	}, nil
+}
+
 func (t *peerTransport) Close() {
 	t.mu.Lock()
 	if t.closed {
@@ -164,3 +192,4 @@ func (t *peerTransport) Close() {
 
 var _ raft.Transport = (*peerTransport)(nil)
 var _ raft.SnapshotTransport = (*peerTransport)(nil)
+var _ raft.SnapshotChunkTransport = (*peerTransport)(nil)

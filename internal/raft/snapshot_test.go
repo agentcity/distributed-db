@@ -189,20 +189,43 @@ func (t *snapshotTransport) InstallSnapshot(ctx context.Context, peer string, re
 // Cluster helpers
 // ---------------------------------------------------------------------------
 
-type snapshotCluster struct {
-	t       *testing.T
-	net     *snapshotNetwork
-	ids     []string
-	ctx     context.Context
-	cancel  context.CancelFunc
-	nodes   map[string]*raft.Node
-	sms     map[string]*snapshotSM
-	stores  map[string]*raft.FileStore
-	dirs    map[string]string
-	timeout time.Duration
+// snapshotSMView is the state-machine surface the snapshot cluster helpers
+// inspect; both the legacy and streaming test state machines implement it.
+type snapshotSMView interface {
+	get(key string) ([]byte, bool)
+	appliedIndex() uint64
 }
 
+type snapshotCluster struct {
+	t        *testing.T
+	net      *snapshotNetwork
+	ids      []string
+	ctx      context.Context
+	cancel   context.CancelFunc
+	nodes    map[string]*raft.Node
+	sms      map[string]snapshotSMView
+	stores   map[string]*raft.FileStore
+	dirs     map[string]string
+	chunkTrs map[string]*chunkSnapshotTransport
+	timeout  time.Duration
+}
+
+// newSnapshotCluster builds a cluster whose transports implement only the
+// legacy unary SnapshotTransport capability.
 func newSnapshotCluster(t *testing.T, size int) *snapshotCluster {
+	t.Helper()
+	return newSnapshotClusterMode(t, size, false)
+}
+
+// newSnapshotChunkCluster builds a cluster whose transports implement both the
+// legacy and the chunked snapshot capabilities, so a leader with a streaming
+// store prefers InstallSnapshotChunk.
+func newSnapshotChunkCluster(t *testing.T, size int) *snapshotCluster {
+	t.Helper()
+	return newSnapshotClusterMode(t, size, true)
+}
+
+func newSnapshotClusterMode(t *testing.T, size int, chunks bool) *snapshotCluster {
 	t.Helper()
 	// Realistic timers: fsync plus -race can deschedule a follower long enough
 	// for a 40ms lease to expire.
@@ -217,16 +240,17 @@ func newSnapshotCluster(t *testing.T, size int) *snapshotCluster {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &snapshotCluster{
-		t:       t,
-		net:     newSnapshotNetwork(),
-		ids:     ids,
-		ctx:     ctx,
-		cancel:  cancel,
-		nodes:   make(map[string]*raft.Node),
-		sms:     make(map[string]*snapshotSM),
-		stores:  make(map[string]*raft.FileStore),
-		dirs:    make(map[string]string),
-		timeout: 15 * time.Second,
+		t:        t,
+		net:      newSnapshotNetwork(),
+		ids:      ids,
+		ctx:      ctx,
+		cancel:   cancel,
+		nodes:    make(map[string]*raft.Node),
+		sms:      make(map[string]snapshotSMView),
+		stores:   make(map[string]*raft.FileStore),
+		dirs:     make(map[string]string),
+		chunkTrs: make(map[string]*chunkSnapshotTransport),
+		timeout:  15 * time.Second,
 	}
 	t.Cleanup(func() {
 		c.cancel()
@@ -244,15 +268,26 @@ func newSnapshotCluster(t *testing.T, size int) *snapshotCluster {
 		if err != nil {
 			t.Fatalf("NewFileStore(%s): %v", id, err)
 		}
-		sm := newSnapshotSM()
+		var sm raft.StateMachine = newSnapshotSM()
+		if chunks {
+			// The chunked receiver restores through the streaming state-machine
+			// capability, so chunked clusters need a streaming SM.
+			sm = newStreamSnapshotSM()
+		}
 		cfg := snapshotTestConfig(id, peersExcept(ids, id), dir, electionMin, electionMax, heartbeat)
-		node, err := raft.New(cfg, store, sm, c.net.transport(id))
+		var tr raft.Transport = c.net.transport(id)
+		if chunks {
+			ct := newChunkSnapshotTransport(c.net, id)
+			c.chunkTrs[id] = ct
+			tr = ct
+		}
+		node, err := raft.New(cfg, store, sm, tr)
 		if err != nil {
 			t.Fatalf("raft.New(%s): %v", id, err)
 		}
 		c.dirs[id] = dir
 		c.stores[id] = store
-		c.sms[id] = sm
+		c.sms[id] = sm.(snapshotSMView)
 		c.nodes[id] = node
 		c.net.register(id, node)
 		if err := node.Start(ctx); err != nil {

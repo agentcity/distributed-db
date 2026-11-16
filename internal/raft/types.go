@@ -8,6 +8,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"time"
 
@@ -111,11 +112,41 @@ type Snapshot struct {
 	Data  []byte
 }
 
+// SnapshotMeta describes snapshot data stored by a SnapshotStreamStore. It is
+// the metadata a transport needs to ship a snapshot in chunks: the log
+// position it covers and enough information to verify the received bytes.
+//
+// Size is the payload length in bytes and CRC32 is the IEEE CRC-32 (the same
+// polynomial as crc32.ChecksumIEEE) of the payload. File is an
+// implementation-defined locator for diagnostics; callers must use
+// OpenSnapshot rather than opening it directly. For FileStore it is the data
+// path relative to the store directory (for example
+// "snapshot/data-42.bin").
+type SnapshotMeta struct {
+	Index uint64
+	Term  uint64
+	Size  int64
+	CRC32 uint32
+	File  string
+}
+
 // Snapshotter is the optional StateMachine capability used by Node.Snapshot.
 // index is the last log index reflected in data. A state machine that does not
 // implement Snapshotter makes Node.Snapshot return ErrSnapshotUnsupported.
 type Snapshotter interface {
 	Snapshot() (data []byte, index uint64, err error)
+}
+
+// SnapshotStreamer is the optional StateMachine capability used by
+// Node.SnapshotToStore. StreamSnapshot writes the snapshot image to w without
+// materialising it in memory and returns the last log index the image covers.
+//
+// The node calls StreamSnapshot while holding its apply mutex, so no Apply can
+// run concurrently and the returned index is normally the node's last applied
+// index. A state machine that only implements Snapshotter keeps using
+// Node.Snapshot.
+type SnapshotStreamer interface {
+	StreamSnapshot(io.Writer) (uint64, error)
 }
 
 // SnapshotRestorer is the optional StateMachine capability used when a node
@@ -127,6 +158,14 @@ type SnapshotRestorer interface {
 	RestoreSnapshot(data []byte) error
 }
 
+// SnapshotStreamRestorer is the optional StateMachine capability used by
+// Node.RestoreSnapshotStream. RestoreSnapshotStream consumes a snapshot image
+// from r without requiring the whole payload in memory. The caller owns r and
+// closes it after RestoreSnapshotStream returns.
+type SnapshotStreamRestorer interface {
+	RestoreSnapshotStream(io.Reader) error
+}
+
 // SnapshotStore is the optional LogStore capability used for local log
 // compaction. Stores that do not implement it keep working: Node.Snapshot then
 // compacts only the in-memory log and does not persist a snapshot. TruncatePrefix
@@ -136,6 +175,29 @@ type SnapshotStore interface {
 	SaveSnapshot(snapshot Snapshot) error
 	LoadSnapshot() (Snapshot, error)
 	TruncatePrefix(index uint64) error
+}
+
+// SnapshotStreamStore is the optional LogStore capability used to persist and
+// reopen snapshot data without materialising it in memory. It is deliberately
+// transport agnostic: a leader can OpenSnapshot and read it in arbitrary-sized
+// chunks, while a follower can feed SaveSnapshotFromReader from any stream.
+//
+// SaveSnapshotFromReader durably stores the bytes read from r as the snapshot
+// for index/term. It must be atomic with respect to the previously stored
+// snapshot: if reading or writing fails, or a newer snapshot is already
+// present, the previous snapshot must remain intact and loadable. A store may
+// ignore a snapshot that is not newer than the current one; in that case it
+// need not consume r.
+//
+// OpenSnapshot returns the metadata of the current snapshot and a reader over
+// its data. The caller owns the reader and must close it. When no snapshot has
+// been saved it returns the zero SnapshotMeta, a nil reader and a nil error.
+// OpenSnapshot does not checksum the payload; callers that need integrity
+// checks compare the bytes they read with Size and CRC32 (FileStore checks the
+// file length when opening but not its CRC).
+type SnapshotStreamStore interface {
+	SaveSnapshotFromReader(index, term uint64, r io.Reader) error
+	OpenSnapshot() (SnapshotMeta, io.ReadCloser, error)
 }
 
 // InstallSnapshotRequest is sent by a leader whose follower is missing a
@@ -160,6 +222,43 @@ type InstallSnapshotResponse struct {
 // AppendEntries instead.
 type SnapshotTransport interface {
 	InstallSnapshot(ctx context.Context, peer string, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+}
+
+// InstallSnapshotChunkRequest is one chunk of a chunked snapshot install. The
+// leader reads the snapshot from a SnapshotStreamStore in SnapshotChunkSize
+// pieces and sends sequential offsets; the final request has Done set and an
+// empty Data at offset == total payload size. Size and CRC32 describe the whole
+// payload and are repeated on every chunk (zero means not supplied).
+type InstallSnapshotChunkRequest struct {
+	Term         uint64
+	LeaderID     string
+	Index        uint64
+	SnapshotTerm uint64
+	Offset       uint64
+	Data         []byte
+	Done         bool
+	Size         int64
+	CRC32        uint32
+}
+
+// InstallSnapshotChunkResponse is the reply to one chunk. Term is the
+// follower's current term, Success reports whether the chunk was accepted,
+// LastIndex is set when the final chunk completed the install and Error
+// describes a rejected chunk.
+type InstallSnapshotChunkResponse struct {
+	Term      uint64
+	Success   bool
+	LastIndex uint64
+	Error     string
+}
+
+// SnapshotChunkTransport is the optional Transport capability used to stream
+// snapshots in bounded chunks. When both the transport and the node's log
+// store support streaming, Node sends snapshots through it instead of
+// materialising the payload for SnapshotTransport. A transport that only
+// implements SnapshotTransport keeps the legacy unary path.
+type SnapshotChunkTransport interface {
+	InstallSnapshotChunk(ctx context.Context, peer string, req *InstallSnapshotChunkRequest) (*InstallSnapshotChunkResponse, error)
 }
 
 // PersistentState is everything Raft must recover after a restart.
@@ -201,6 +300,10 @@ var (
 	// ErrSnapshotUnsupported is returned when the configured StateMachine
 	// cannot produce snapshots.
 	ErrSnapshotUnsupported = errors.New("raft: snapshots unsupported by state machine")
+	// ErrSnapshotStreamUnsupported is returned when the streaming snapshot API
+	// is used with a StateMachine or LogStore that lacks the corresponding
+	// optional capability.
+	ErrSnapshotStreamUnsupported = errors.New("raft: snapshot streaming unsupported")
 )
 
 // errLostQuorum classifies a proposal that was accepted while this node was

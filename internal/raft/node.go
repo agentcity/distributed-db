@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 
@@ -80,6 +82,14 @@ type Node struct {
 	// entry application. It is acquired before mu.
 	applyMu sync.Mutex
 
+	// snapshotRecvMu serialises the chunked snapshot receiver. snapshotRecv
+	// holds the partial uploads keyed by leader id; it is bounded, a per-upload
+	// timer removes idle uploads, and every chunk also sweeps stale entries.
+	// Both are guarded by snapshotRecvMu.
+	snapshotRecvMu       sync.Mutex
+	snapshotRecv         map[string]*snapshotChunkRecv
+	snapshotChunkTimeout time.Duration
+
 	applyCond *sync.Cond
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -128,12 +138,9 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 	if err != nil {
 		return nil, fmt.Errorf("raft: load persistent state: %w", err)
 	}
-	var snap Snapshot
-	if ss, ok := store.(SnapshotStore); ok {
-		snap, err = ss.LoadSnapshot()
-		if err != nil {
-			return nil, fmt.Errorf("raft: load snapshot: %w", err)
-		}
+	snap, err := loadAndRestoreSnapshot(store, sm)
+	if err != nil {
+		return nil, err
 	}
 	// Entries are contiguous after the snapshot (or from index 1 without one);
 	// a compacted store loads only the suffix it still holds.
@@ -143,42 +150,108 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 			return nil, fmt.Errorf("raft: non-contiguous log: entry %d has index %d, want %d", i+1, e.Index, firstIndex+uint64(i))
 		}
 	}
-	if snap.Index > 0 {
-		if r, ok := sm.(SnapshotRestorer); ok {
-			if err := r.RestoreSnapshot(append([]byte(nil), snap.Data...)); err != nil {
-				return nil, fmt.Errorf("raft: restore state machine from snapshot: %w", err)
-			}
-		}
-	}
 
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	n := &Node{
-		cfg:           cfg,
-		store:         store,
-		sm:            sm,
-		tr:            tr,
-		logger:        logger,
-		term:          state.Term,
-		votedFor:      state.VotedFor,
-		entries:       cloneEntries(state.Entries),
-		snapshot:      cloneSnapshot(snap),
-		commitIndex:   snap.Index,
-		lastApplied:   snap.Index,
-		role:          Follower,
-		votes:         make(map[string]bool),
-		nextIndex:     make(map[string]uint64),
-		matchIndex:    make(map[string]uint64),
-		lastAck:       make(map[string]time.Time),
-		triggers:      make(map[string]chan struct{}),
-		pending:       make(map[uint64]*proposal),
-		stopCh:        make(chan struct{}),
-		proposeSignal: make(chan struct{}, 1),
+		cfg:                  cfg,
+		store:                store,
+		sm:                   sm,
+		tr:                   tr,
+		logger:               logger,
+		term:                 state.Term,
+		votedFor:             state.VotedFor,
+		entries:              cloneEntries(state.Entries),
+		snapshot:             cloneSnapshot(snap),
+		commitIndex:          snap.Index,
+		lastApplied:          snap.Index,
+		role:                 Follower,
+		votes:                make(map[string]bool),
+		nextIndex:            make(map[string]uint64),
+		matchIndex:           make(map[string]uint64),
+		lastAck:              make(map[string]time.Time),
+		triggers:             make(map[string]chan struct{}),
+		pending:              make(map[uint64]*proposal),
+		snapshotRecv:         make(map[string]*snapshotChunkRecv),
+		snapshotChunkTimeout: snapshotChunkIdleTimeout,
+		stopCh:               make(chan struct{}),
+		proposeSignal:        make(chan struct{}, 1),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	return n, nil
+}
+
+// loadAndRestoreSnapshot recovers the durable snapshot and restores the state
+// machine. When both the store and the state machine support streaming, the
+// payload is restored from the data file without loading it into memory.
+// Otherwise it falls back to the []byte SnapshotStore/SnapshotRestorer path.
+func loadAndRestoreSnapshot(store LogStore, sm StateMachine) (Snapshot, error) {
+	streamStore, hasStream := store.(SnapshotStreamStore)
+	if hasStream {
+		if restorer, ok := sm.(SnapshotStreamRestorer); ok {
+			meta, rc, err := streamStore.OpenSnapshot()
+			if err != nil {
+				return Snapshot{}, fmt.Errorf("raft: load snapshot: %w", err)
+			}
+			if rc == nil || meta.Index == 0 {
+				if rc != nil {
+					_ = rc.Close()
+				}
+				return Snapshot{}, nil
+			}
+			if err := restorer.RestoreSnapshotStream(rc); err != nil {
+				_ = rc.Close()
+				return Snapshot{}, fmt.Errorf("raft: restore state machine from snapshot: %w", err)
+			}
+			if err := rc.Close(); err != nil {
+				return Snapshot{}, fmt.Errorf("raft: close snapshot stream: %w", err)
+			}
+			return Snapshot{Index: meta.Index, Term: meta.Term}, nil
+		}
+	}
+
+	if snapshotStore, ok := store.(SnapshotStore); ok {
+		snap, err := snapshotStore.LoadSnapshot()
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("raft: load snapshot: %w", err)
+		}
+		if err := restoreSnapshotData(sm, snap); err != nil {
+			return Snapshot{}, err
+		}
+		return snap, nil
+	}
+
+	if hasStream {
+		// No []byte loader and no streaming restorer: recover the snapshot
+		// position so the log suffix stays contiguous across a restart, even
+		// though this state machine cannot rebuild its data from it.
+		meta, rc, err := streamStore.OpenSnapshot()
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("raft: load snapshot: %w", err)
+		}
+		if rc != nil {
+			_ = rc.Close()
+		}
+		return Snapshot{Index: meta.Index, Term: meta.Term}, nil
+	}
+	return Snapshot{}, nil
+}
+
+// restoreSnapshotData restores a []byte snapshot into a state machine that
+// implements SnapshotRestorer. A state machine without that capability keeps
+// its current state, matching Node.RestoreSnapshot.
+func restoreSnapshotData(sm StateMachine, snap Snapshot) error {
+	if snap.Index == 0 {
+		return nil
+	}
+	if r, ok := sm.(SnapshotRestorer); ok {
+		if err := r.RestoreSnapshot(append([]byte(nil), snap.Data...)); err != nil {
+			return fmt.Errorf("raft: restore state machine from snapshot: %w", err)
+		}
+	}
+	return nil
 }
 
 // Start launches the background loops and returns immediately. Cancelling ctx
@@ -233,6 +306,7 @@ func (n *Node) Start(ctx context.Context) error {
 func (n *Node) Stop() {
 	n.stopOnce.Do(n.stop)
 	n.wg.Wait()
+	n.discardAllSnapshotChunks()
 }
 
 func (n *Node) stop() {
@@ -485,7 +559,15 @@ func (n *Node) Snapshot() (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("raft: snapshot index %d outside log [%d,%d]", index, n.snapshot.Index, n.lastIndexLocked())
 	}
 	if index <= n.snapshot.Index {
-		// Nothing new has been applied since the last snapshot.
+		// Nothing new has been applied since the last snapshot. A snapshot
+		// created by SnapshotToStore keeps only metadata in memory, so when the
+		// state machine still reports the same index, return the fresh data
+		// rather than a metadata-only copy.
+		if index == n.snapshot.Index && n.snapshot.Data == nil {
+			snap := Snapshot{Index: index, Term: n.snapshot.Term, Data: append([]byte(nil), data...)}
+			n.mu.Unlock()
+			return snap, nil
+		}
 		snap := cloneSnapshot(n.snapshot)
 		n.mu.Unlock()
 		return snap, nil
@@ -514,6 +596,199 @@ func (n *Node) Snapshot() (Snapshot, error) {
 	n.snapshot = snap
 	n.mu.Unlock()
 	return cloneSnapshot(snap), nil
+}
+
+// SnapshotToStore asks a streaming state machine for a snapshot and persists
+// it through a SnapshotStreamStore without materialising the payload in
+// memory. It then truncates the local log prefix and records the new snapshot
+// metadata in the node, exactly as Snapshot does.
+//
+// The state machine must implement SnapshotStreamer and the store must
+// implement SnapshotStreamStore; otherwise SnapshotToStore returns
+// ErrSnapshotStreamUnsupported (Snapshot remains the fallback for
+// []byte-producing state machines). The streamed image is staged in a
+// temporary file (under DataDir when it is writable, otherwise in the system
+// temporary directory) and then copied through the store, so the snapshot is
+// written twice but never held in memory. The scratch file is removed on
+// return; a crash may leave a raft-snapshot-*.tmp file in DataDir.
+//
+// The returned metadata can be used by a transport to stream the snapshot in
+// chunks through store.OpenSnapshot. The node keeps only Index and Term in
+// memory, so legacy SnapshotTransport installs materialise the payload on
+// demand.
+func (n *Node) SnapshotToStore() (SnapshotMeta, error) {
+	streamer, ok := n.sm.(SnapshotStreamer)
+	if !ok {
+		return SnapshotMeta{}, ErrSnapshotStreamUnsupported
+	}
+	store, ok := n.store.(SnapshotStreamStore)
+	if !ok {
+		return SnapshotMeta{}, ErrSnapshotStreamUnsupported
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return SnapshotMeta{}, ErrStopped
+	}
+	if n.lastApplied == 0 {
+		// Nothing has been applied yet, so there is no state to persist.
+		n.mu.Unlock()
+		return SnapshotMeta{}, nil
+	}
+	if n.lastApplied <= n.snapshot.Index {
+		// No new applied state since the last snapshot.
+		n.mu.Unlock()
+		return currentSnapshotMeta(store)
+	}
+	n.mu.Unlock()
+
+	scratch, err := n.createSnapshotScratch()
+	if err != nil {
+		return SnapshotMeta{}, err
+	}
+	scratchName := scratch.Name()
+	defer func() {
+		_ = scratch.Close()
+		_ = os.Remove(scratchName)
+	}()
+
+	index, err := streamer.StreamSnapshot(scratch)
+	if err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: state machine snapshot stream: %w", err)
+	}
+	if index == 0 {
+		return SnapshotMeta{}, errors.New("raft: state machine streamed an empty snapshot")
+	}
+	if err := scratch.Sync(); err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: sync snapshot scratch file: %w", err)
+	}
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: rewind snapshot scratch file: %w", err)
+	}
+
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return SnapshotMeta{}, ErrStopped
+	}
+	if index > n.lastIndexLocked() {
+		n.mu.Unlock()
+		return SnapshotMeta{}, fmt.Errorf("raft: snapshot index %d outside log [%d,%d]", index, n.snapshot.Index, n.lastIndexLocked())
+	}
+	if index <= n.snapshot.Index {
+		// The state machine produced a snapshot no newer than the current one;
+		// discard the staged copy and report the existing one.
+		n.mu.Unlock()
+		return currentSnapshotMeta(store)
+	}
+	term, ok := n.termAtLocked(index)
+	n.mu.Unlock()
+	if !ok {
+		return SnapshotMeta{}, fmt.Errorf("raft: no log entry at snapshot index %d", index)
+	}
+
+	// Persist before the local log loses its prefix: a crash in between must
+	// leave a loadable state, never a truncated log without a snapshot.
+	if err := store.SaveSnapshotFromReader(index, term, scratch); err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: persist streamed snapshot: %w", err)
+	}
+	meta, rc, err := store.OpenSnapshot()
+	if err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: open persisted snapshot: %w", err)
+	}
+	if rc != nil {
+		_ = rc.Close()
+	}
+	if meta.Index != index {
+		return SnapshotMeta{}, fmt.Errorf("raft: persisted snapshot index %d, want %d", meta.Index, index)
+	}
+	if err := truncatePrefixForSnapshot(n.store, index); err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: truncate log prefix: %w", err)
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped {
+		return SnapshotMeta{}, ErrStopped
+	}
+	if index <= n.snapshot.Index {
+		// A concurrent install superseded the snapshot while it was copied.
+		return meta, nil
+	}
+	if t, ok := n.termAtLocked(index); ok && t != term {
+		return SnapshotMeta{}, fmt.Errorf("raft: log changed under streamed snapshot: term %d at index %d, want %d", t, index, term)
+	}
+	if index >= n.lastIndexLocked() {
+		n.entries = nil
+	} else {
+		n.entries = n.entries[index-n.snapshot.Index:]
+	}
+	n.snapshot = Snapshot{Index: index, Term: term}
+	return meta, nil
+}
+
+// currentSnapshotMeta returns the metadata of the store's current snapshot
+// without reading its payload.
+func currentSnapshotMeta(store SnapshotStreamStore) (SnapshotMeta, error) {
+	meta, rc, err := store.OpenSnapshot()
+	if err != nil {
+		return SnapshotMeta{}, fmt.Errorf("raft: open snapshot: %w", err)
+	}
+	if rc != nil {
+		_ = rc.Close()
+	}
+	return meta, nil
+}
+
+// prefixTruncator is the narrow log-compaction capability used by the
+// streaming snapshot paths. SnapshotStreamStore does not require it: a store
+// that can persist a snapshot but cannot compact its log still works, it just
+// keeps the covered prefix (and must keep Load consistent with the snapshot).
+type prefixTruncator interface {
+	TruncatePrefix(index uint64) error
+}
+
+func truncatePrefixForSnapshot(store LogStore, index uint64) error {
+	if pt, ok := store.(prefixTruncator); ok {
+		return pt.TruncatePrefix(index)
+	}
+	return nil
+}
+
+// createSnapshotScratch creates a temporary file for staging a snapshot
+// stream. It prefers the node's data directory so the file shares a
+// filesystem with the WAL, and falls back to the system temporary directory.
+func (n *Node) createSnapshotScratch() (*os.File, error) {
+	return n.createSnapshotTemp("raft-snapshot-*.tmp")
+}
+
+// createSnapshotTemp is createSnapshotScratch with a caller-selected pattern.
+// The chunked snapshot receiver uses a distinct prefix so partial uploads are
+// easy to spot and never confused with locally staged snapshots.
+func (n *Node) createSnapshotTemp(pattern string) (*os.File, error) {
+	dirs := make([]string, 0, 2)
+	if n.cfg.DataDir != "" {
+		dirs = append(dirs, n.cfg.DataDir)
+	}
+	if dir := os.TempDir(); dir != "" && dir != n.cfg.DataDir {
+		dirs = append(dirs, dir)
+	}
+	var lastErr error
+	for _, dir := range dirs {
+		f, err := os.CreateTemp(dir, pattern)
+		if err == nil {
+			return f, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no temporary directory")
+	}
+	return nil, fmt.Errorf("raft: create snapshot scratch file: %w", lastErr)
 }
 
 // RestoreSnapshot installs a snapshot received from a leader. The state
@@ -591,6 +866,149 @@ func (n *Node) RestoreSnapshot(s Snapshot) error {
 	}
 	if n.lastApplied < snap.Index {
 		n.lastApplied = snap.Index
+	}
+	n.applyCond.Broadcast()
+	return nil
+}
+
+// RestoreSnapshotStream installs a snapshot whose payload is read from r. It
+// is the streaming counterpart of RestoreSnapshot and keeps the same
+// idempotency, term and log-suffix rules:
+//
+//   - a snapshot at or below the current snapshot index is ignored and r is
+//     not read;
+//   - a matching term at meta.Index keeps the local log suffix; otherwise the
+//     divergent suffix is dropped;
+//   - the state machine is restored before the snapshot is persisted, and
+//     commit/applied advance to meta.Index.
+//
+// The state machine should implement SnapshotStreamRestorer; if it does not,
+// Raft logs a warning and still persists the snapshot and truncates the log.
+// The store must implement SnapshotStreamStore, otherwise
+// ErrSnapshotStreamUnsupported is returned before any data is consumed.
+//
+// The stream is staged in a temporary file while Size and CRC32 are checked
+// (a zero Size or CRC32 means "not supplied" and is not enforced), then
+// restored into the state machine and persisted through the store. The caller
+// owns r and closes it. A crash or error mid-restore can leave the state
+// machine partially updated; the previous durable snapshot is committed only
+// after the full payload has been received and verified.
+func (n *Node) RestoreSnapshotStream(meta SnapshotMeta, r io.Reader) error {
+	if meta.Index == 0 {
+		return errors.New("raft: snapshot index must be positive")
+	}
+	if meta.Size < 0 {
+		return fmt.Errorf("raft: invalid snapshot size %d", meta.Size)
+	}
+	if r == nil {
+		return errors.New("raft: nil snapshot stream")
+	}
+	store, ok := n.store.(SnapshotStreamStore)
+	if !ok {
+		return ErrSnapshotStreamUnsupported
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return ErrStopped
+	}
+	if meta.Index <= n.snapshot.Index {
+		// Already at least as up to date; snapshots are idempotent.
+		n.mu.Unlock()
+		return nil
+	}
+	n.mu.Unlock()
+
+	scratch, err := n.createSnapshotScratch()
+	if err != nil {
+		return err
+	}
+	scratchName := scratch.Name()
+	defer func() {
+		_ = scratch.Close()
+		_ = os.Remove(scratchName)
+	}()
+
+	hasher := crc32.NewIEEE()
+	var src io.Reader = r
+	if meta.Size > 0 {
+		// Read at most one byte past the declared size so an oversized stream
+		// is detected without copying it all.
+		src = io.LimitReader(r, meta.Size+1)
+	}
+	size, err := io.Copy(io.MultiWriter(scratch, hasher), src)
+	if err != nil {
+		return fmt.Errorf("raft: stream snapshot payload: %w", err)
+	}
+	if meta.Size > 0 && size != meta.Size {
+		return fmt.Errorf("raft: snapshot payload size %d, want %d", size, meta.Size)
+	}
+	if meta.CRC32 != 0 && hasher.Sum32() != meta.CRC32 {
+		return fmt.Errorf("raft: snapshot payload CRC32 %08x, want %08x", hasher.Sum32(), meta.CRC32)
+	}
+	if err := scratch.Sync(); err != nil {
+		return fmt.Errorf("raft: sync snapshot scratch file: %w", err)
+	}
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("raft: rewind snapshot scratch file: %w", err)
+	}
+
+	if restorer, ok := n.sm.(SnapshotStreamRestorer); ok {
+		if err := restorer.RestoreSnapshotStream(scratch); err != nil {
+			return fmt.Errorf("raft: restore state machine: %w", err)
+		}
+	} else {
+		n.logger.Warn("raft: state machine cannot restore snapshot streams", "id", n.cfg.ID, "index", meta.Index)
+	}
+
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("raft: rewind snapshot scratch file: %w", err)
+	}
+	if err := store.SaveSnapshotFromReader(meta.Index, meta.Term, scratch); err != nil {
+		return fmt.Errorf("raft: persist installed snapshot: %w", err)
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped {
+		return ErrStopped
+	}
+	if meta.Index <= n.snapshot.Index {
+		return nil
+	}
+	// Re-evaluate the suffix rule against the log as it is now: entries may
+	// have been appended or replaced while the payload was streaming.
+	keepSuffix := false
+	if term, ok := n.termAtLocked(meta.Index); ok && term == meta.Term {
+		keepSuffix = true
+	}
+	// Drop the divergent suffix first, then everything the snapshot covers,
+	// so a crash between the two steps still reloads safely.
+	if !keepSuffix {
+		if err := n.store.Truncate(meta.Index + 1); err != nil {
+			return fmt.Errorf("raft: truncate log after snapshot: %w", err)
+		}
+	}
+	if err := truncatePrefixForSnapshot(n.store, meta.Index); err != nil {
+		return fmt.Errorf("raft: truncate log prefix after snapshot: %w", err)
+	}
+	oldIndex := n.snapshot.Index
+	if keepSuffix {
+		n.entries = n.entries[meta.Index-oldIndex:]
+	} else {
+		n.entries = nil
+		n.failPendingFromLocked(meta.Index+1, ErrNotLeader)
+	}
+	n.snapshot = Snapshot{Index: meta.Index, Term: meta.Term}
+	if n.commitIndex < meta.Index {
+		n.commitIndex = meta.Index
+	}
+	if n.lastApplied < meta.Index {
+		n.lastApplied = meta.Index
 	}
 	n.applyCond.Broadcast()
 	return nil
@@ -1304,6 +1722,13 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 
 // sendInstallSnapshot ships the current snapshot to a follower whose nextIndex
 // falls inside the compacted prefix.
+//
+// When the transport supports chunked transfers and the log store exposes the
+// snapshot as a stream, the payload is read in SnapshotChunkSize pieces and
+// never materialised in memory. If either capability is missing, the legacy
+// unary InstallSnapshot path is used. A failure after the first chunk is not
+// retried through the legacy path: the next attempt starts a fresh chunked
+// upload instead of allocating the whole snapshot.
 func (n *Node) sendInstallSnapshot(leaderCtx context.Context, peer string, term uint64) bool {
 	n.mu.Lock()
 	if n.stopped || n.role != Leader || n.term != term {
@@ -1315,46 +1740,88 @@ func (n *Node) sendInstallSnapshot(leaderCtx context.Context, peer string, term 
 		n.mu.Unlock()
 		return false
 	}
-	tr, ok := n.tr.(SnapshotTransport)
-	if !ok {
-		n.mu.Unlock()
+	chunkTr, hasChunk := n.tr.(SnapshotChunkTransport)
+	legacyTr, hasLegacy := n.tr.(SnapshotTransport)
+	streamStore, hasStreamStore := n.store.(SnapshotStreamStore)
+	n.mu.Unlock()
+
+	if hasChunk && hasStreamStore {
+		if ok, attempted := n.sendInstallSnapshotChunks(leaderCtx, peer, term, snap, streamStore, chunkTr); attempted {
+			return ok
+		}
+	}
+	if !hasLegacy {
 		n.logger.Warn("raft: transport cannot install snapshots", "id", n.cfg.ID, "peer", peer)
 		return false
 	}
 	req := &InstallSnapshotRequest{Term: term, LeaderID: n.cfg.ID, Snapshot: snap}
-	n.mu.Unlock()
+
+	if snap.Data == nil {
+		// SnapshotToStore keeps only Index/Term in memory. The legacy
+		// InstallSnapshot RPC still carries the whole payload as []byte, so
+		// materialise it from the store on demand.
+		data, err := n.materializeSnapshot(snap)
+		if err != nil {
+			n.logger.Warn("raft: cannot materialise streamed snapshot for install", "id", n.cfg.ID, "peer", peer, "error", err)
+			return false
+		}
+		snap.Data = data
+		req = &InstallSnapshotRequest{Term: term, LeaderID: n.cfg.ID, Snapshot: snap}
+	}
 
 	rpcCtx, cancel := context.WithTimeout(leaderCtx, n.appendTimeout())
 	defer cancel()
-	resp, err := tr.InstallSnapshot(rpcCtx, peer, req)
+	resp, err := legacyTr.InstallSnapshot(rpcCtx, peer, req)
 	if err != nil || resp == nil {
 		return false
 	}
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.stopped || n.role != Leader || n.term != term {
+		n.mu.Unlock()
 		return false
 	}
 	if resp.Term > n.term {
 		if err := n.adoptTermLocked(resp.Term, ""); err != nil {
 			n.logger.Error("raft: adopt higher term failed", "id", n.cfg.ID, "error", err)
 		}
+		n.mu.Unlock()
 		return false
 	}
+	n.mu.Unlock()
 	if !resp.Success {
 		return false
 	}
-	if resp.LastIndex > n.matchIndex[peer] {
-		n.matchIndex[peer] = resp.LastIndex
+	return n.finishSnapshotInstall(peer, term, snap.Index, resp.LastIndex)
+}
+
+// materializeSnapshot reads a snapshot's payload from a streaming store so it
+// can be sent through the legacy []byte InstallSnapshot RPC. It verifies the
+// size and CRC before returning the bytes and does not mutate the node.
+func (n *Node) materializeSnapshot(snap Snapshot) ([]byte, error) {
+	store, ok := n.store.(SnapshotStreamStore)
+	if !ok {
+		return nil, errors.New("raft: snapshot data is not held in memory")
 	}
-	if snap.Index > n.matchIndex[peer] {
-		n.matchIndex[peer] = snap.Index
+	meta, rc, err := store.OpenSnapshot()
+	if err != nil {
+		return nil, err
 	}
-	n.nextIndex[peer] = n.matchIndex[peer] + 1
-	n.lastAck[peer] = time.Now()
-	n.maybeCommitLocked()
-	return n.nextIndex[peer] <= n.lastIndexLocked()
+	if rc == nil {
+		return nil, errors.New("raft: no stored snapshot")
+	}
+	defer rc.Close()
+	if meta.Index != snap.Index || meta.Term != snap.Term {
+		return nil, fmt.Errorf("raft: stored snapshot {%d,%d} does not match {%d,%d}", meta.Index, meta.Term, snap.Index, snap.Term)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != meta.Size || crc32.ChecksumIEEE(data) != meta.CRC32 {
+		return nil, fmt.Errorf("raft: snapshot data at index %d is corrupt", meta.Index)
+	}
+	return data, nil
 }
 
 func (n *Node) applyLoop() {

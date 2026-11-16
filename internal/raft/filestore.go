@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -80,8 +81,11 @@ type FileStore struct {
 var errStoreClosed = errors.New("raft: log store closed")
 
 // FileStore implements the base LogStore and the optional group-commit
-// BatchAppender capability.
-var _ BatchAppender = (*FileStore)(nil)
+// BatchAppender and streaming SnapshotStreamStore capabilities.
+var (
+	_ BatchAppender       = (*FileStore)(nil)
+	_ SnapshotStreamStore = (*FileStore)(nil)
+)
 
 // NewFileStore opens (creating if needed) the WAL in dir and replays it. A
 // partial or corrupt final record is discarded and the file is truncated back
@@ -385,66 +389,170 @@ func (s *FileStore) TruncatePrefix(index uint64) error {
 // renamed; the meta file is the commit point, and its data file name is
 // versioned by index so a crash cannot pair new data with old metadata.
 func (s *FileStore) SaveSnapshot(snapshot Snapshot) error {
-	if snapshot.Index == 0 {
+	return s.SaveSnapshotFromReader(snapshot.Index, snapshot.Term, bytes.NewReader(snapshot.Data))
+}
+
+// SaveSnapshotFromReader durably stores a snapshot whose payload is read from
+// r. The payload is streamed to a temporary file in snapshot/ while its size
+// and IEEE CRC-32 are computed, then fsynced and renamed into a data file
+// versioned by index. Only after that does the meta file get atomically
+// replaced, which is the commit point: a reader or write error, or a crash
+// before the meta rename, leaves the previous snapshot untouched.
+//
+// A snapshot that is not newer than the current one is ignored without
+// consuming r, mirroring SaveSnapshot. The data file and meta file are the
+// only persistent state; stale data and .tmp files are removed best-effort
+// after a successful commit. SaveSnapshotFromReader never holds the whole
+// payload in memory.
+func (s *FileStore) SaveSnapshotFromReader(index, term uint64, r io.Reader) error {
+	if index == 0 {
 		return errors.New("raft: snapshot index must be positive")
+	}
+	if r == nil {
+		return errors.New("raft: nil snapshot reader")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return errStoreClosed
 	}
-	if snapshot.Index <= s.snapMeta.Index {
+	if index <= s.snapMeta.Index {
 		return nil
 	}
 
-	dir := filepath.Join(s.dir, snapshotDirName)
-	created := false
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		created = true
+	dir, err := s.snapshotDirLocked()
+	if err != nil {
+		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("raft: create snapshot directory: %w", err)
+	tmp, err := os.CreateTemp(dir, fmt.Sprintf("data-%d-*.tmp", index))
+	if err != nil {
+		return fmt.Errorf("raft: create snapshot temp file: %w", err)
 	}
-	if created {
-		if err := syncDir(s.dir); err != nil {
-			return fmt.Errorf("raft: sync log directory: %w", err)
-		}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		// After a successful rename this is a no-op: the temporary name no
+		// longer exists.
+		_ = os.Remove(tmpName)
+	}()
+
+	hasher := crc32.NewIEEE()
+	size, err := io.Copy(io.MultiWriter(tmp, hasher), r)
+	if err != nil {
+		return fmt.Errorf("raft: stream snapshot data: %w", err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("raft: chmod snapshot data: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("raft: sync snapshot data: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("raft: close snapshot data: %w", err)
 	}
 
-	dataName := fmt.Sprintf("data-%d.bin", snapshot.Index)
+	dataName := fmt.Sprintf("data-%d.bin", index)
 	dataPath := filepath.Join(dir, dataName)
-	if err := writeFileAtomic(dataPath, snapshot.Data); err != nil {
-		return fmt.Errorf("raft: write snapshot data: %w", err)
+	if err := os.Rename(tmpName, dataPath); err != nil {
+		return fmt.Errorf("raft: commit snapshot data: %w", err)
 	}
+	// The rename is durable before the meta file can point at it.
+	if err := syncDir(dir); err != nil {
+		_ = os.Remove(dataPath)
+		return fmt.Errorf("raft: sync snapshot directory: %w", err)
+	}
+
 	meta := snapshotMeta{
-		Index:    snapshot.Index,
-		Term:     snapshot.Term,
+		Index:    index,
+		Term:     term,
 		DataFile: dataName,
-		Size:     int64(len(snapshot.Data)),
-		CRC32:    crc32.ChecksumIEEE(snapshot.Data),
+		Size:     size,
+		CRC32:    hasher.Sum32(),
 	}
 	payload, err := json.Marshal(meta)
 	if err != nil {
+		_ = os.Remove(dataPath)
 		return fmt.Errorf("raft: marshal snapshot metadata: %w", err)
 	}
 	metaPath := filepath.Join(dir, snapshotMetaName)
 	if err := writeFileAtomic(metaPath, payload); err != nil {
+		// The meta file is the commit point, so the newly written data file is
+		// unreferenced and can be removed; the old snapshot still loads.
+		_ = os.Remove(dataPath)
 		return fmt.Errorf("raft: write snapshot metadata: %w", err)
 	}
 	s.snapMeta = meta
-	// Best-effort cleanup of superseded data files. A stale file is harmless:
-	// LoadSnapshot only follows the meta file.
-	if des, err := os.ReadDir(dir); err == nil {
-		for _, de := range des {
-			if de.IsDir() || de.Name() == snapshotMetaName || de.Name() == dataName {
-				continue
-			}
-			if strings.HasPrefix(de.Name(), "data-") || strings.HasSuffix(de.Name(), ".tmp") {
-				_ = os.Remove(filepath.Join(dir, de.Name()))
-			}
+	s.cleanupSupersededSnapshotFiles(dataName)
+	return nil
+}
+
+// OpenSnapshot returns the metadata of the current snapshot and a reader over
+// its data. The caller owns the reader and must close it. When no snapshot has
+// been saved it returns the zero SnapshotMeta, a nil reader and a nil error.
+//
+// OpenSnapshot does not read or checksum the payload; the returned Size and
+// CRC32 let a caller streaming the data (for example to a peer in chunks)
+// verify it as it goes. On Unix the reader stays valid even if a newer
+// snapshot replaces this one and the old file is cleaned up.
+func (s *FileStore) OpenSnapshot() (SnapshotMeta, io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return SnapshotMeta{}, nil, errStoreClosed
+	}
+	meta, f, err := s.openSnapshotLocked()
+	if err != nil {
+		return SnapshotMeta{}, nil, err
+	}
+	if meta.Index == 0 {
+		return SnapshotMeta{}, nil, nil
+	}
+	return SnapshotMeta{
+		Index: meta.Index,
+		Term:  meta.Term,
+		Size:  meta.Size,
+		CRC32: meta.CRC32,
+		File:  filepath.Join(snapshotDirName, meta.DataFile),
+	}, f, nil
+}
+
+// snapshotDirLocked returns the snapshot directory, creating it and syncing
+// its parent when needed. The caller holds s.mu.
+func (s *FileStore) snapshotDirLocked() (string, error) {
+	dir := filepath.Join(s.dir, snapshotDirName)
+	_, err := os.Stat(dir)
+	created := errors.Is(err, os.ErrNotExist)
+	if err != nil && !created {
+		return "", fmt.Errorf("raft: stat snapshot directory: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("raft: create snapshot directory: %w", err)
+	}
+	if created {
+		if err := syncDir(s.dir); err != nil {
+			return "", fmt.Errorf("raft: sync log directory: %w", err)
 		}
 	}
-	return nil
+	return dir, nil
+}
+
+// cleanupSupersededSnapshotFiles removes data files other than keepDataName
+// and any leftover temporary files. Stale files are harmless (openSnapshot
+// only follows meta), so failures are ignored.
+func (s *FileStore) cleanupSupersededSnapshotFiles(keepDataName string) {
+	dir := filepath.Join(s.dir, snapshotDirName)
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, de := range des {
+		if de.IsDir() || de.Name() == snapshotMetaName || de.Name() == keepDataName {
+			continue
+		}
+		if strings.HasPrefix(de.Name(), "data-") || strings.HasSuffix(de.Name(), ".tmp") {
+			_ = os.Remove(filepath.Join(dir, de.Name()))
+		}
+	}
 }
 
 // LoadSnapshot returns the durable snapshot. When none has ever been saved it
@@ -459,11 +567,15 @@ func (s *FileStore) LoadSnapshot() (Snapshot, error) {
 }
 
 func (s *FileStore) loadSnapshotLocked() (Snapshot, error) {
-	meta := s.snapMeta
+	meta, f, err := s.openSnapshotLocked()
+	if err != nil {
+		return Snapshot{}, err
+	}
 	if meta.Index == 0 {
 		return Snapshot{}, nil
 	}
-	data, err := os.ReadFile(filepath.Join(s.dir, snapshotDirName, meta.DataFile))
+	defer f.Close()
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("raft: read snapshot data: %w", err)
 	}
@@ -471,6 +583,31 @@ func (s *FileStore) loadSnapshotLocked() (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("raft: snapshot data at index %d is corrupt", meta.Index)
 	}
 	return Snapshot{Index: meta.Index, Term: meta.Term, Data: data}, nil
+}
+
+// openSnapshotLocked opens the data file described by the current metadata.
+// It returns a zero meta and a nil file when no snapshot exists. The caller
+// holds s.mu or otherwise owns the returned file.
+func (s *FileStore) openSnapshotLocked() (snapshotMeta, *os.File, error) {
+	meta := s.snapMeta
+	if meta.Index == 0 {
+		return snapshotMeta{}, nil, nil
+	}
+	path := filepath.Join(s.dir, snapshotDirName, meta.DataFile)
+	f, err := os.Open(path)
+	if err != nil {
+		return snapshotMeta{}, nil, fmt.Errorf("raft: open snapshot data: %w", err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return snapshotMeta{}, nil, fmt.Errorf("raft: stat snapshot data: %w", err)
+	}
+	if info.Size() != meta.Size {
+		_ = f.Close()
+		return snapshotMeta{}, nil, fmt.Errorf("raft: snapshot data at index %d is corrupt: size %d, want %d", meta.Index, info.Size(), meta.Size)
+	}
+	return meta, f, nil
 }
 
 // readSnapshotMeta loads and validates the snapshot metadata. A missing file

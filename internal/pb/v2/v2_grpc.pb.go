@@ -543,9 +543,10 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	RaftService_RequestVote_FullMethodName     = "/dbv2.RaftService/RequestVote"
-	RaftService_AppendEntries_FullMethodName   = "/dbv2.RaftService/AppendEntries"
-	RaftService_InstallSnapshot_FullMethodName = "/dbv2.RaftService/InstallSnapshot"
+	RaftService_RequestVote_FullMethodName          = "/dbv2.RaftService/RequestVote"
+	RaftService_AppendEntries_FullMethodName        = "/dbv2.RaftService/AppendEntries"
+	RaftService_InstallSnapshot_FullMethodName      = "/dbv2.RaftService/InstallSnapshot"
+	RaftService_InstallSnapshotChunk_FullMethodName = "/dbv2.RaftService/InstallSnapshotChunk"
 )
 
 // RaftServiceClient is the client API for RaftService service.
@@ -556,7 +557,20 @@ const (
 type RaftServiceClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
+	// InstallSnapshot is the legacy unary snapshot transfer. It carries the
+	// whole snapshot in one bytes field and is kept for compatibility.
 	InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error)
+	// InstallSnapshotChunk streams one snapshot as a sequence of chunks. The
+	// leader sends sequential offset values and finishes with done=true.
+	//
+	// The response carries the protocol outcome: term is the follower's current
+	// term (the leader must step down if it is higher), success reports whether
+	// the chunk was accepted, last_index is the follower's last log index (set
+	// when done=true is accepted) and error describes a rejected chunk (bad
+	// offset, size, checksum or restore failure). Transport-level failures such
+	// as an unknown range, a stopped node or a cancelled RPC are reported as
+	// gRPC status errors instead of a response.
+	InstallSnapshotChunk(ctx context.Context, in *InstallSnapshotChunkRequest, opts ...grpc.CallOption) (*InstallSnapshotChunkResponse, error)
 }
 
 type raftServiceClient struct {
@@ -597,6 +611,16 @@ func (c *raftServiceClient) InstallSnapshot(ctx context.Context, in *InstallSnap
 	return out, nil
 }
 
+func (c *raftServiceClient) InstallSnapshotChunk(ctx context.Context, in *InstallSnapshotChunkRequest, opts ...grpc.CallOption) (*InstallSnapshotChunkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InstallSnapshotChunkResponse)
+	err := c.cc.Invoke(ctx, RaftService_InstallSnapshotChunk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServiceServer is the server API for RaftService service.
 // All implementations must embed UnimplementedRaftServiceServer
 // for forward compatibility.
@@ -605,7 +629,20 @@ func (c *raftServiceClient) InstallSnapshot(ctx context.Context, in *InstallSnap
 type RaftServiceServer interface {
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	// InstallSnapshot is the legacy unary snapshot transfer. It carries the
+	// whole snapshot in one bytes field and is kept for compatibility.
 	InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+	// InstallSnapshotChunk streams one snapshot as a sequence of chunks. The
+	// leader sends sequential offset values and finishes with done=true.
+	//
+	// The response carries the protocol outcome: term is the follower's current
+	// term (the leader must step down if it is higher), success reports whether
+	// the chunk was accepted, last_index is the follower's last log index (set
+	// when done=true is accepted) and error describes a rejected chunk (bad
+	// offset, size, checksum or restore failure). Transport-level failures such
+	// as an unknown range, a stopped node or a cancelled RPC are reported as
+	// gRPC status errors instead of a response.
+	InstallSnapshotChunk(context.Context, *InstallSnapshotChunkRequest) (*InstallSnapshotChunkResponse, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -624,6 +661,9 @@ func (UnimplementedRaftServiceServer) AppendEntries(context.Context, *AppendEntr
 }
 func (UnimplementedRaftServiceServer) InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method InstallSnapshot not implemented")
+}
+func (UnimplementedRaftServiceServer) InstallSnapshotChunk(context.Context, *InstallSnapshotChunkRequest) (*InstallSnapshotChunkResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method InstallSnapshotChunk not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 func (UnimplementedRaftServiceServer) testEmbeddedByValue()                     {}
@@ -700,6 +740,24 @@ func _RaftService_InstallSnapshot_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_InstallSnapshotChunk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InstallSnapshotChunkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).InstallSnapshotChunk(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_InstallSnapshotChunk_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).InstallSnapshotChunk(ctx, req.(*InstallSnapshotChunkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -718,6 +776,10 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InstallSnapshot",
 			Handler:    _RaftService_InstallSnapshot_Handler,
+		},
+		{
+			MethodName: "InstallSnapshotChunk",
+			Handler:    _RaftService_InstallSnapshotChunk_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
