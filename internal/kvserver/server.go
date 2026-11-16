@@ -109,7 +109,7 @@ func New(cfg Config) (*Server, error) {
 		transport: tr,
 	}
 
-	sm := &stateMachine{store: s.store}
+	sm := &stateMachine{store: s.store, engine: engine}
 	rn, err := raft.New(raft.Config{
 		ID:                 cfg.ID,
 		Peers:              append([]string(nil), cfg.Peers...),
@@ -244,3 +244,7 @@ func (s *Server) Addr() string {
 
 // Raft exposes the Raft node for status/tests.
 func (s *Server) Raft() *raft.Node { return s.raft }
+
+// Snapshot takes a state-machine snapshot and compacts the local log. It is
+// used by tests and by an operator-triggered maintenance path.
+func (s *Server) Snapshot() (raft.Snapshot, error) { return s.raft.Snapshot() }

@@ -112,6 +112,30 @@ func (t *peerTransport) AppendEntries(ctx context.Context, peer string, req *raf
 	}, nil
 }
 
+func (t *peerTransport) InstallSnapshot(ctx context.Context, peer string, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	c, err := t.client(peer)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.InstallSnapshot(ctx, &pbv2.InstallSnapshotRequest{
+		Term:     req.Term,
+		LeaderId: req.LeaderID,
+		Snapshot: &pbv2.Snapshot{
+			Index: req.Snapshot.Index,
+			Term:  req.Snapshot.Term,
+			Data:  req.Snapshot.Data,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raft.InstallSnapshotResponse{
+		Term:      resp.GetTerm(),
+		Success:   resp.GetSuccess(),
+		LastIndex: resp.GetLastIndex(),
+	}, nil
+}
+
 func (t *peerTransport) Close() {
 	t.mu.Lock()
 	if t.closed {
@@ -131,3 +155,4 @@ func (t *peerTransport) Close() {
 }
 
 var _ raft.Transport = (*peerTransport)(nil)
+var _ raft.SnapshotTransport = (*peerTransport)(nil)

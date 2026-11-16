@@ -270,3 +270,109 @@ func TestV2SingleRangeCluster(t *testing.T) {
 		t.Fatalf("new leader reports empty leader: %+v", got)
 	}
 }
+
+func TestV2SnapshotRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr := v2FreeAddr(t)
+	ms, err := metaserver.New(metaserver.Config{Addr: metaAddr, Logger: v2Logger()})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+	metaCC, err := grpc.NewClient(metaAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("meta dial: %v", err)
+	}
+	t.Cleanup(func() { _ = metaCC.Close() })
+	metaClient := pbv2.NewMetaServiceClient(metaCC)
+
+	addr := v2FreeAddr(t)
+	dir := t.TempDir()
+	cfg := kvserver.Config{
+		ID: addr, RaftAddr: addr, DataDir: dir,
+		ElectionTimeoutMin: 100 * time.Millisecond,
+		ElectionTimeoutMax: 200 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		CacheSize:          8 << 20, MemTableSize: 4 << 20,
+		Logger: v2Logger(),
+	}
+	srv, err := kvserver.New(cfg)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	client := v2Dial(t, addr)
+	waitNode := func(c pbv2.KVServiceClient) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if st := v2Status(t, c); st != nil && strings.EqualFold(st.Role, "leader") {
+				return
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+		t.Fatal("node did not become leader")
+	}
+	waitNode(client)
+
+	resp, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
+	if err != nil {
+		t.Fatalf("ts: %v", err)
+	}
+	startTS, commitTS := resp.Start, resp.Start+1
+	pr, err := client.Prewrite(ctx, &pbv2.PrewriteRequest{
+		StartTs: startTS, Primary: []byte("snap"),
+		Mutations: []*pbv2.Mutation{{Key: []byte("snap"), Value: []byte("value")}},
+	})
+	if err != nil || !pr.GetSuccess() {
+		t.Fatalf("prewrite: %v %+v", err, pr)
+	}
+	cr, err := client.Commit(ctx, &pbv2.CommitRequest{
+		StartTs: startTS, CommitTs: commitTS, Keys: [][]byte{[]byte("snap")},
+	})
+	if err != nil || !cr.GetSuccess() {
+		t.Fatalf("commit: %v %+v", err, cr)
+	}
+	snap, err := srv.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Index == 0 {
+		t.Fatal("snapshot index is zero")
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := srv.Stop(stopCtx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	srv2, err := kvserver.New(cfg)
+	if err != nil {
+		t.Fatalf("restart new: %v", err)
+	}
+	if err := srv2.Start(ctx); err != nil {
+		t.Fatalf("restart start: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv2.Stop(sctx)
+	})
+	client2 := v2Dial(t, addr)
+	waitNode(client2)
+	gr, err := client2.Get(ctx, &pbv2.GetRequest{Key: []byte("snap"), Ts: commitTS})
+	if err != nil {
+		t.Fatalf("get after restart: %v", err)
+	}
+	if !gr.GetFound() || string(gr.GetValue()) != "value" {
+		t.Fatalf("snapshot restart lost value: found=%v value=%q err=%q", gr.GetFound(), gr.GetValue(), gr.GetError())
+	}
+}

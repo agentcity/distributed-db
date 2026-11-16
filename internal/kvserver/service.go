@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"distributed-db/internal/model"
 	"distributed-db/internal/mvcc"
 	pbv2 "distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
+	"distributed-db/internal/storage"
 )
 
 // applyCommand is the JSON payload stored in model.Entry.Value for the three
@@ -25,10 +27,18 @@ type applyCommand struct {
 // stateMachine applies committed Raft commands to MVCC. Exactly one goroutine
 // calls Apply (Raft's apply loop), so no extra mutex is needed.
 type stateMachine struct {
-	store *mvcc.Store
+	store       *mvcc.Store
+	engine      storage.Engine
+	lastApplied atomic.Uint64
 }
 
 func (m *stateMachine) Apply(entry model.Entry) error {
+	err := m.apply(entry)
+	m.lastApplied.Store(entry.Index)
+	return err
+}
+
+func (m *stateMachine) apply(entry model.Entry) error {
 	switch entry.Type {
 	case model.CommandNoop:
 		return nil
@@ -53,6 +63,91 @@ func (m *stateMachine) Apply(entry model.Entry) error {
 	default:
 		return fmt.Errorf("kvserver: unknown command type %q", entry.Type)
 	}
+}
+
+// snapshotPayload is the durable state-machine snapshot. It contains every
+// key/value in the MVCC keyspace plus the applied Raft index.
+type snapshotPayload struct {
+	Index   uint64 `json:"index"`
+	Entries []struct {
+		Key   []byte `json:"k"`
+		Value []byte `json:"v"`
+	} `json:"entries"`
+}
+
+// Snapshot implements raft.Snapshotter.
+func (m *stateMachine) Snapshot() ([]byte, uint64, error) {
+	snap, err := m.engine.Snapshot()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer snap.Close()
+	it, err := snap.NewIter(nil, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer it.Close()
+
+	payload := snapshotPayload{Index: m.lastApplied.Load()}
+	for it.Valid() {
+		key := append([]byte(nil), it.Key()...)
+		value := append([]byte(nil), it.Value()...)
+		payload.Entries = append(payload.Entries, struct {
+			Key   []byte `json:"k"`
+			Value []byte `json:"v"`
+		}{Key: key, Value: value})
+		it.Next()
+	}
+	if err := it.Error(); err != nil {
+		return nil, 0, err
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, 0, err
+	}
+	return data, payload.Index, nil
+}
+
+// RestoreSnapshot implements raft.SnapshotRestorer. It replaces the whole
+// MVCC keyspace; this is acceptable for M1 (small snapshots) and will be
+// replaced by a Pebble snapshot/ingest path later.
+func (m *stateMachine) RestoreSnapshot(data []byte) error {
+	var payload snapshotPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return fmt.Errorf("kvserver: decode snapshot: %w", err)
+	}
+	batch := m.engine.NewBatch()
+	defer batch.Close()
+
+	it, err := m.engine.NewIter(nil, nil)
+	if err != nil {
+		return err
+	}
+	var oldKeys [][]byte
+	for it.Valid() {
+		oldKeys = append(oldKeys, append([]byte(nil), it.Key()...))
+		it.Next()
+	}
+	if err := it.Error(); err != nil {
+		it.Close()
+		return err
+	}
+	_ = it.Close()
+	for _, key := range oldKeys {
+		if err := batch.Delete(key); err != nil {
+			return err
+		}
+	}
+	for _, e := range payload.Entries {
+		if err := batch.Set(e.Key, e.Value); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(); err != nil {
+		return err
+	}
+	m.lastApplied.Store(payload.Index)
+	return nil
 }
 
 func encodeCommand(cmd applyCommand) ([]byte, error) { return json.Marshal(cmd) }
@@ -217,6 +312,29 @@ func (r *raftService) AppendEntries(ctx context.Context, req *pbv2.AppendEntries
 		Success:       resp.Success,
 		MatchIndex:    resp.MatchIndex,
 		ConflictIndex: resp.ConflictIndex,
+	}, nil
+}
+
+func (r *raftService) InstallSnapshot(ctx context.Context, req *pbv2.InstallSnapshotRequest) (*pbv2.InstallSnapshotResponse, error) {
+	if req == nil || req.GetSnapshot() == nil {
+		return nil, errors.New("kvserver: nil InstallSnapshot")
+	}
+	resp, err := r.s.raft.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		Term:     req.GetTerm(),
+		LeaderID: req.GetLeaderId(),
+		Snapshot: raft.Snapshot{
+			Index: req.GetSnapshot().GetIndex(),
+			Term:  req.GetSnapshot().GetTerm(),
+			Data:  req.GetSnapshot().GetData(),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pbv2.InstallSnapshotResponse{
+		Term:      resp.Term,
+		Success:   resp.Success,
+		LastIndex: resp.LastIndex,
 	}, nil
 }
 
