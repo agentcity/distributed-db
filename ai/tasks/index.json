@@ -1,0 +1,20 @@
+[
+  {
+    "id": "0001",
+    "title": "Рабочее Raft-ядро и KV-хранилище",
+    "status": "done",
+    "file": "0001-raft-kv-core.md"
+  },
+  {
+    "id": "0002",
+    "title": "Шардирование, координатор и node-адаптеры",
+    "status": "done",
+    "file": "0002-sharding-coordinator.md"
+  },
+  {
+    "id": "0003",
+    "title": "Деплой, CI и документация",
+    "status": "done",
+    "file": "0003-deploy-docs.md"
+  }
+]
