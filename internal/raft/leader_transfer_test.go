@@ -91,7 +91,10 @@ func TestTransferLeadershipRejectsUnknownTarget(t *testing.T) {
 }
 
 func TestTransferLeadershipRejectsUncaughtUpTarget(t *testing.T) {
-	c := newTestCluster(t, 3)
+	// Longer election timeouts keep the leader stable while the target is
+	// partitioned; otherwise a loaded CI machine can schedule an election
+	// during the 150ms catch-up wait and the call returns ErrNotLeader.
+	c := newTestClusterWithTimeouts(t, 3, 500*time.Millisecond, time.Second, 50*time.Millisecond)
 	leader, leaderID := c.waitLeader(c.ids, testWait)
 	target := otherID(c.ids, leaderID)
 
