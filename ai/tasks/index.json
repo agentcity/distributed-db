@@ -196,5 +196,11 @@
     "title": "Stage 4 — batch entry и pipelining",
     "status": "done",
     "file": "0033-batch-commit.md"
+  },
+  {
+    "id": "0034",
+    "title": "Edge hash cache — Bloom + Merkle + manifest",
+    "status": "in_progress",
+    "file": "0034-edge-hash-cache.md"
   }
 ]
