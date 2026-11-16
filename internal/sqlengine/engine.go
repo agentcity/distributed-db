@@ -385,86 +385,64 @@ func (e *Engine) update(ctx context.Context, tx Txn, s sqlparser.Update) (*Resul
 	if err != nil {
 		return nil, err
 	}
-	pkIdx, _ := schema.PrimaryKeyIndex()
-	pkCol := schema.Columns[pkIdx]
 	if s.Where == nil {
-		return nil, fmt.Errorf("%w: UPDATE requires WHERE on the primary key", ErrUnsupported)
-	}
-	if !strings.EqualFold(s.Where.Column, pkCol.Name) {
-		return nil, fmt.Errorf("%w: WHERE must use primary key %q", ErrUnsupported, pkCol.Name)
-	}
-	pk, err := encodePK(pkCol, s.Where.Value)
-	if err != nil {
-		return nil, err
-	}
-	key := rowKey(schema.ID, pk)
-	raw, err := tx.Get(ctx, key)
-	if errors.Is(err, ErrNotFound) {
-		return nil, ErrRowNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	var row map[string]any
-	if err := json.Unmarshal(raw, &row); err != nil {
-		return nil, err
-	}
-	normalizeRow(schema, row)
-	oldRow := make(map[string]any, len(row))
-	for k, v := range row {
-		oldRow[k] = v
+		return nil, fmt.Errorf("%w: UPDATE requires WHERE", ErrUnsupported)
 	}
 	if len(s.Assignments) == 0 {
 		return nil, fmt.Errorf("%w: SET list is empty", ErrBadColumn)
 	}
-	for _, as := range s.Assignments {
-		name := strings.ToLower(as.Column)
-		idx, ok := columnIndex(schema, name)
-		if !ok {
-			return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, name)
-		}
-		if idx == pkIdx {
-			return nil, fmt.Errorf("%w: primary key cannot be updated", ErrUnsupported)
-		}
-		if err := checkLiteralType(schema.Columns[idx], as.Value); err != nil {
-			return nil, err
-		}
-		row[name] = as.Value.AsAny()
-	}
-	for _, idx := range schema.Indexes {
-		ci, _ := columnIndex(schema, idx.Column)
-		col := schema.Columns[ci]
-		if old, ok := oldRow[idx.Column]; ok {
-			lit, err := anyToLiteral(col, old)
-			if err != nil {
-				return nil, err
-			}
-			encoded, err := encodeValue(col, lit)
-			if err != nil {
-				return nil, err
-			}
-			tx.Delete(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk))
-		}
-	}
-	data, err := json.Marshal(row)
+	pks, err := e.conditionPKs(ctx, tx, schema, s.Where)
 	if err != nil {
 		return nil, err
 	}
-	tx.Set(key, data)
-	for _, idx := range schema.Indexes {
-		ci, _ := columnIndex(schema, idx.Column)
-		col := schema.Columns[ci]
-		lit, err := anyToLiteral(col, row[idx.Column])
+	pkIdx, _ := schema.PrimaryKeyIndex()
+	affected := 0
+	for _, pk := range pks {
+		key := rowKey(schema.ID, pk)
+		raw, err := tx.Get(ctx, key)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
-		encoded, err := encodeValue(col, lit)
+		var row map[string]any
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, err
+		}
+		normalizeRow(schema, row)
+		oldRow := make(map[string]any, len(row))
+		for k, v := range row {
+			oldRow[k] = v
+		}
+		for _, as := range s.Assignments {
+			name := strings.ToLower(as.Column)
+			idx, ok := columnIndex(schema, name)
+			if !ok {
+				return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, name)
+			}
+			if idx == pkIdx {
+				return nil, fmt.Errorf("%w: primary key cannot be updated", ErrUnsupported)
+			}
+			if err := checkLiteralType(schema.Columns[idx], as.Value); err != nil {
+				return nil, err
+			}
+			row[name] = as.Value.AsAny()
+		}
+		if err := e.deleteIndexEntries(tx, schema, oldRow, pk); err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(row)
 		if err != nil {
 			return nil, err
 		}
-		tx.Set(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk), nil)
+		tx.Set(key, data)
+		if err := e.putIndexEntries(tx, schema, row, pk); err != nil {
+			return nil, err
+		}
+		affected++
 	}
-	return &Result{RowsAffected: 1, Message: "row updated"}, nil
+	return &Result{RowsAffected: affected, Message: "rows updated"}, nil
 }
 
 func (e *Engine) delete(ctx context.Context, tx Txn, s sqlparser.Delete) (*Result, error) {
@@ -472,45 +450,108 @@ func (e *Engine) delete(ctx context.Context, tx Txn, s sqlparser.Delete) (*Resul
 	if err != nil {
 		return nil, err
 	}
-	pkIdx, _ := schema.PrimaryKeyIndex()
-	pkCol := schema.Columns[pkIdx]
 	if s.Where == nil {
-		return nil, fmt.Errorf("%w: DELETE requires WHERE on the primary key", ErrUnsupported)
+		return nil, fmt.Errorf("%w: DELETE requires WHERE", ErrUnsupported)
 	}
-	if !strings.EqualFold(s.Where.Column, pkCol.Name) {
-		return nil, fmt.Errorf("%w: WHERE must use primary key %q", ErrUnsupported, pkCol.Name)
-	}
-	pk, err := encodePK(pkCol, s.Where.Value)
+	pks, err := e.conditionPKs(ctx, tx, schema, s.Where)
 	if err != nil {
 		return nil, err
 	}
-	key := rowKey(schema.ID, pk)
-	raw, err := tx.Get(ctx, key)
-	if errors.Is(err, ErrNotFound) {
-		return &Result{RowsAffected: 0}, nil
-	} else if err != nil {
+	affected := 0
+	for _, pk := range pks {
+		key := rowKey(schema.ID, pk)
+		raw, err := tx.Get(ctx, key)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var row map[string]any
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, err
+		}
+		normalizeRow(schema, row)
+		if err := e.deleteIndexEntries(tx, schema, row, pk); err != nil {
+			return nil, err
+		}
+		tx.Delete(key)
+		affected++
+	}
+	return &Result{RowsAffected: affected, Message: "rows deleted"}, nil
+}
+
+// conditionPKs returns the primary keys matching the supported WHERE form:
+// primary key equality or an indexed-column equality.
+func (e *Engine) conditionPKs(ctx context.Context, tx Txn, schema *Schema, where *sqlparser.Condition) ([][]byte, error) {
+	pkIdx, _ := schema.PrimaryKeyIndex()
+	pkCol := schema.Columns[pkIdx]
+	if strings.EqualFold(where.Column, pkCol.Name) {
+		pk, err := encodePK(pkCol, where.Value)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{pk}, nil
+	}
+	column := strings.ToLower(where.Column)
+	ci, ok := columnIndex(schema, column)
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, where.Column)
+	}
+	idx, ok := indexForColumn(schema, column)
+	if !ok {
+		return nil, fmt.Errorf("%w: WHERE must use the primary key or an indexed column", ErrUnsupported)
+	}
+	encoded, err := encodeValue(schema.Columns[ci], where.Value)
+	if err != nil {
 		return nil, err
 	}
-	var row map[string]any
-	if err := json.Unmarshal(raw, &row); err != nil {
+	start := indexValueKey(schema.ID, indexID(idx.Name), encoded)
+	end := indexValueEnd(schema.ID, indexID(idx.Name), encoded)
+	rows, err := tx.Scan(ctx, start, end, 0)
+	if err != nil {
 		return nil, err
 	}
-	normalizeRow(schema, row)
+	out := make([][]byte, 0, len(rows))
+	for _, row := range rows {
+		pk := append([]byte(nil), row.Key[len(start):]...)
+		out = append(out, pk)
+	}
+	return out, nil
+}
+
+func (e *Engine) deleteIndexEntries(tx Txn, schema *Schema, row map[string]any, pk []byte) error {
 	for _, idx := range schema.Indexes {
 		ci, _ := columnIndex(schema, idx.Column)
 		col := schema.Columns[ci]
 		lit, err := anyToLiteral(col, row[idx.Column])
 		if err != nil {
-			return nil, err
+			return err
 		}
 		encoded, err := encodeValue(col, lit)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		tx.Delete(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk))
 	}
-	tx.Delete(key)
-	return &Result{RowsAffected: 1, Message: "row deleted"}, nil
+	return nil
+}
+
+func (e *Engine) putIndexEntries(tx Txn, schema *Schema, row map[string]any, pk []byte) error {
+	for _, idx := range schema.Indexes {
+		ci, _ := columnIndex(schema, idx.Column)
+		col := schema.Columns[ci]
+		lit, err := anyToLiteral(col, row[idx.Column])
+		if err != nil {
+			return err
+		}
+		encoded, err := encodeValue(col, lit)
+		if err != nil {
+			return err
+		}
+		tx.Set(indexEntryKey(schema.ID, indexID(idx.Name), encoded, pk), nil)
+	}
+	return nil
 }
 
 func (e *Engine) readRows(ctx context.Context, tx Txn, schema *Schema, where *sqlparser.Condition, limit int) ([]map[string]any, error) {

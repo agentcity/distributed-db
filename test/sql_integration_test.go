@@ -95,6 +95,14 @@ func TestSQLP0OnKV(t *testing.T) {
 	if len(res.Rows) != 1 || res.Rows[0][0] != int64(1) {
 		t.Fatalf("SQL index after update = %+v", res)
 	}
+	res = exec("UPDATE users SET name = 'bobby' WHERE name = 'bob'")
+	if res.RowsAffected != 1 {
+		t.Fatalf("SQL multi update = %+v", res)
+	}
+	res = exec("SELECT id FROM users WHERE name = 'bobby'")
+	if len(res.Rows) != 1 || res.Rows[0][0] != int64(2) {
+		t.Fatalf("SQL index after multi update = %+v", res)
+	}
 	exec("DELETE FROM users WHERE id = 2")
 	res = exec("SELECT * FROM users")
 	if len(res.Rows) != 1 {

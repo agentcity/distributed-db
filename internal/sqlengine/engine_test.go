@@ -208,3 +208,34 @@ func TestSQLSecondaryIndex(t *testing.T) {
 		t.Fatalf("select after drop index = %v", err)
 	}
 }
+
+func TestSQLMultiRowUpdateDeleteByIndex(t *testing.T) {
+	e := New(newFakeClient())
+	exec(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT)")
+	exec(t, e, "INSERT INTO users VALUES (1, 'a', 'msk')")
+	exec(t, e, "INSERT INTO users VALUES (2, 'b', 'msk')")
+	exec(t, e, "INSERT INTO users VALUES (3, 'c', 'spb')")
+	exec(t, e, "CREATE INDEX idx_city ON users (city)")
+
+	res := exec(t, e, "UPDATE users SET name = 'moscow' WHERE city = 'msk'")
+	if res.RowsAffected != 2 {
+		t.Fatalf("update affected = %d, want 2", res.RowsAffected)
+	}
+	res = exec(t, e, "SELECT name FROM users WHERE city = 'msk'")
+	if len(res.Rows) != 2 || res.Rows[0][0] != "moscow" || res.Rows[1][0] != "moscow" {
+		t.Fatalf("rows after update = %+v", res)
+	}
+
+	res = exec(t, e, "DELETE FROM users WHERE city = 'spb'")
+	if res.RowsAffected != 1 {
+		t.Fatalf("delete affected = %d, want 1", res.RowsAffected)
+	}
+	res = exec(t, e, "SELECT * FROM users")
+	if len(res.Rows) != 2 {
+		t.Fatalf("rows after delete = %+v", res)
+	}
+	res = exec(t, e, "DELETE FROM users WHERE city = 'spb'")
+	if res.RowsAffected != 0 {
+		t.Fatalf("second delete affected = %d, want 0", res.RowsAffected)
+	}
+}
