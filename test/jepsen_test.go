@@ -389,8 +389,8 @@ func TestJepsenKillRestart(t *testing.T) {
 	v2WaitLeader(t, running)
 	rig.verifyAcked()
 
-	if got := len(rig.acked); got < rounds {
-		t.Fatalf("jepsen: only %d acknowledged writes for %d rounds", got, rounds)
+	if got := len(rig.acked); got < 3*rounds {
+		t.Fatalf("jepsen: only %d acknowledged writes for %d rounds, want at least %d", got, rounds, 3*rounds)
 	}
 	t.Logf("jepsen: completed %d rounds in %s with %d acknowledged writes (seed=%d)",
 		rounds, time.Since(started).Round(time.Millisecond), len(rig.acked), seed)
