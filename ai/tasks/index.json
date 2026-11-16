@@ -184,5 +184,11 @@
     "title": "Stage 2 — Add/Remove replica и membership",
     "status": "done",
     "file": "0031-raft-membership.md"
+  },
+  {
+    "id": "0032",
+    "title": "Stage 4 — write path speed",
+    "status": "in_progress",
+    "file": "0032-write-path-speed.md"
   }
 ]
