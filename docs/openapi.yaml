@@ -61,8 +61,6 @@ paths:
       responses:
         "200":
           description: Stored
-        "201":
-          description: Stored
         "401":
           $ref: "#/components/responses/Unauthorized"
         "413":
@@ -92,8 +90,6 @@ paths:
       tags: [kv]
       summary: Delete a key
       responses:
-        "200":
-          description: Deleted
         "204":
           description: Deleted
         "401":

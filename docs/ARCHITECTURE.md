@@ -280,7 +280,8 @@ func (n *Node) Stop(ctx context.Context) error // graceful: HTTP, gRPC, raft, kv
 - Peer transport: lazy `grpc.NewClient`/`grpc.Dial` per peer, TLS credentials
   when `TLSCert` is set, close all on stop.
 - Load report: if `CoordinatorAddr != ""`, every 5 s call
-  `CoordinatorService.ReportLoad` with `Ops` = total KV operations.
+  `CoordinatorService.ReportLoad` with `Load` = operations/sec since the
+  previous sample and `Ops` = total KV operations.
 
 ## Coordinator (`internal/coordinator`)
 
