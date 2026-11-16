@@ -33,6 +33,7 @@ type rangeGroup struct {
 	node       *raft.Node
 	transport  *peerTransport
 	sm         *stateMachine
+	batcher    *commitBatcher
 
 	// frozen blocks client writes while split/merge copies data.
 	frozen   atomic.Bool
@@ -100,7 +101,7 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig) (*rangeGro
 		return nil, fmt.Errorf("kvserver: range %d: create raft: %w", rc.ID, err)
 	}
 
-	return &rangeGroup{
+	g := &rangeGroup{
 		cfg:        rc,
 		log:        log,
 		engine:     engine,
@@ -110,7 +111,9 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig) (*rangeGro
 		node:       node,
 		transport:  tr,
 		sm:         sm,
-	}, nil
+	}
+	g.batcher = newCommitBatcher(g)
+	return g, nil
 }
 
 func (g *rangeGroup) start(ctx context.Context) error {
@@ -126,6 +129,11 @@ func (g *rangeGroup) start(ctx context.Context) error {
 // Close. It is idempotent and safe to call on a partially constructed group.
 func (g *rangeGroup) stop() error {
 	g.stopOnce.Do(func() {
+		// Stop the batcher first so no new 1PC entry is proposed while Raft is
+		// shutting down; in-flight waiters are completed with an error.
+		if g.batcher != nil {
+			g.batcher.stop()
+		}
 		if g.node != nil {
 			g.node.Stop()
 		}

@@ -21,6 +21,12 @@ const (
 	// CommandPrewriteCommit applies both phases in one Raft entry for a
 	// single-range transaction (1PC).
 	CommandPrewriteCommit CommandType = "prewrite_commit"
+	// CommandTxnBatch applies several independent CommandPrewriteCommit
+	// payloads in one Raft entry. Entry.Value is an opaque, state-machine
+	// defined batch: {"id":<batchID>,"commands":[...]}. The per-command
+	// outcome is not part of the replicated state; it is reported separately
+	// to the proposer.
+	CommandTxnBatch CommandType = "txn_batch"
 
 	// Meta control-plane commands. Payload lives in Entry.Value as JSON.
 	CommandMetaAllocTS  CommandType = "meta_alloc_ts"

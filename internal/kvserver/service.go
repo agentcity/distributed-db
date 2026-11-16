@@ -41,6 +41,10 @@ type stateMachine struct {
 	splitKey   []byte
 	mergeLeft  uint64
 	mergeRight uint64
+
+	// batchResults holds the per-command outcome of recently applied
+	// CommandTxnBatch entries until the proposing batcher consumes it.
+	batchResults batchResultStore
 }
 
 func (m *stateMachine) Apply(entry model.Entry) error {
@@ -70,7 +74,25 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode prewrite_commit: %w", err)
 		}
-		return m.store.CommitSingle(cmd.Mutations, cmd.Primary, cmd.StartTS, cmd.CommitTS)
+		return m.applyOne(cmd)
+	case model.CommandTxnBatch:
+		var batch txnBatch
+		if err := json.Unmarshal(entry.Value, &batch); err != nil {
+			return fmt.Errorf("kvserver: decode txn batch: %w", err)
+		}
+		if len(batch.Commands) == 0 {
+			return fmt.Errorf("kvserver: txn batch %d: no commands", batch.ID)
+		}
+		// Per-command failures are client-visible outcomes, not apply
+		// failures: apply every command in order and let the batcher report
+		// each error to its own waiter. Returning an error here would fail
+		// the whole Raft entry for all transactions.
+		errs := make([]error, len(batch.Commands))
+		for i, cmd := range batch.Commands {
+			errs[i] = m.applyOne(cmd)
+		}
+		m.batchResults.put(batch.ID, errs)
+		return nil
 	case model.CommandRollback:
 		var cmd applyCommand
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
@@ -103,6 +125,15 @@ func (m *stateMachine) apply(entry model.Entry) error {
 	default:
 		return fmt.Errorf("kvserver: unknown command type %q", entry.Type)
 	}
+}
+
+// applyOne applies one 1PC transactional command (prewrite+commit in one
+// step) to MVCC. It is shared by CommandPrewriteCommit and every command
+// inside a CommandTxnBatch. The returned error is the transaction's own
+// outcome; callers that batch commands must record it per command instead of
+// failing the whole state-machine apply.
+func (m *stateMachine) applyOne(cmd applyCommand) error {
+	return m.store.CommitSingle(cmd.Mutations, cmd.Primary, cmd.StartTS, cmd.CommitTS)
 }
 
 func (m *stateMachine) splitPrepared() []byte {
@@ -294,14 +325,13 @@ func (k *kvService) CommitSingle(ctx context.Context, req *pbv2.CommitSingleRequ
 	if g.isFrozen() {
 		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
 	}
-	payload, err := encodeCommand(applyCommand{
+	cmd := applyCommand{
 		StartTS: req.GetStartTs(), CommitTS: req.GetCommitTs(),
 		Primary: req.GetPrimary(), Mutations: mutations, Keys: keys,
-	})
-	if err != nil {
-		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: "encode"}, nil
 	}
-	if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandPrewriteCommit, Value: payload}); err != nil {
+	// Dedicated batchers coalesce concurrent 1PC commits into one Raft entry;
+	// each waiter still receives its own transaction's result.
+	if err := g.batcher.submit(ctx, cmd); err != nil {
 		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	return &pbv2.CommitSingleResponse{Success: true, Leader: g.node.Leader()}, nil
