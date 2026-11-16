@@ -28,11 +28,11 @@ scope:
 
 ## Критерии приёмки
 
-- [ ] StreamRange с батчами и тестами.
-- [ ] Split/merge используют потоковый импорт.
-- [ ] RangeStats (size/keys/split_key).
-- [ ] AutoSplit по порогу.
-- [ ] Тесты зелёные.
+- [x] StreamRange с батчами и тестами.
+- [x] Split/merge используют потоковый импорт.
+- [x] RangeStats (size/keys/split_key).
+- [x] AutoSplit по порогу.
+- [x] Тесты зелёные.
 
 ## Не входит в инкремент
 

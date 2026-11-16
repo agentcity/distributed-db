@@ -215,6 +215,8 @@ meta SetRanges после успеха. Распределённый merge то�
 meta scheduler Split/Merge, retry fan-out и partial-merge idempotency готовы;
 range map persist. Остались durable scheduler queue/leader lease.
 Stage 1 speed закрыт: group commit, TSO batch, range cache, 1PC.
+Stage 2.1: потоковый `StreamRange`/split/merge и `AutoSplit` по размеру.
+Остались shared Pebble, потоковый Raft snapshot, rebalancing и backup.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
