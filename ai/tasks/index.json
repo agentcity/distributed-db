@@ -194,7 +194,7 @@
   {
     "id": "0033",
     "title": "Stage 4 — batch entry и pipelining",
-    "status": "in_progress",
+    "status": "done",
     "file": "0033-batch-commit.md"
   }
 ]

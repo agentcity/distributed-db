@@ -24,8 +24,15 @@ log entry, плюс клиентский pipeline. Гарантии strong mode 
 
 ## Критерии
 
-- [ ] Один Raft-entry на пачку.
-- [ ] Индивидуальные результаты.
-- [ ] Batch API клиента.
-- [ ] Benchmark до/после.
-- [ ] Все тесты зелёные.
+- [x] Один Raft-entry на пачку.
+- [x] Индивидуальные результаты.
+- [x] Batch API клиента.
+- [x] Benchmark до/после.
+- [x] Все тесты зелёные.
+
+## Результат
+
+- batch 256: ~0.15 мс/txn, ~6.6–6.9k tx/s;
+- PostgreSQL 13: ~6.8k tx/s (10 клиентов);
+- single txn: ~14 мс (batch window), всё ещё ~20× PostgreSQL;
+- batch не атомарен: каждая txn имеет свой commit point.
