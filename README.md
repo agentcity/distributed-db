@@ -77,6 +77,28 @@ committed/rolled-back/expired locks.
 данных и SQL-слой. Snapshot catch-up, restart из snapshot и gRPC-бенчмарк
 уже есть.
 
+### SQL P0 поверх KV (experimental)
+
+Минимальный SQL-слой: `CREATE/DROP TABLE`, `INSERT`, `SELECT` (projection,
+`WHERE pk = ...`, `LIMIT`), `UPDATE`, `DELETE`. Каталог и строки лежат в KV,
+каждая команда — транзакция.
+
+```bash
+go build -o bin/sqlsrv ./cmd/sqlsrv
+./bin/sqlsrv -http-addr=:8080 -meta=127.0.0.1:9090 \
+  -nodes=127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+
+curl -s -X POST localhost:8080/v1/sql \
+  -d '{"sql":"CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"}'
+curl -s -X POST localhost:8080/v1/sql \
+  -d "{\"sql\":\"INSERT INTO users VALUES (1, 'alice')\"}"
+curl -s -X POST localhost:8080/v1/sql \
+  -d '{"sql":"SELECT * FROM users"}'
+```
+
+P0 не умеет secondary indexes, JOIN, aggregates и pgwire; это следующие
+фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
+
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
 ```bash
