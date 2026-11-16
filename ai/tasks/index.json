@@ -214,5 +214,11 @@
     "title": "Честная оценка проекта и применимость",
     "status": "done",
     "file": "0036-project-assessment.md"
+  },
+  {
+    "id": "0037",
+    "title": "Production plan и ворота G1–G8",
+    "status": "done",
+    "file": "0037-production-plan.md"
   }
 ]
