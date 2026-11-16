@@ -13,6 +13,11 @@ const (
 	CommandPut CommandType = "put"
 	// CommandDelete removes Key.
 	CommandDelete CommandType = "delete"
+
+	// V2 transactional commands. The payload lives in Entry.Value as JSON.
+	CommandPrewrite CommandType = "prewrite"
+	CommandCommit   CommandType = "commit"
+	CommandRollback CommandType = "rollback"
 )
 
 // Entry is a single replicated log entry. Index is 1-based. Value is nil for
