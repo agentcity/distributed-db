@@ -188,7 +188,7 @@ SQL не начинается, пока KV не даёт стабильные т
 
 ## Статус на 2026-11-16
 
-Сделано (M0 + часть M1):
+Сделано (M0–M2, часть M3/M5):
 
 - storage на Pebble, MVCC/2PC, Raft snapshots/InstallSnapshot, Multi-Raft host,
   meta/range/TSO, smart client, benchmark harness;

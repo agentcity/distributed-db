@@ -43,15 +43,13 @@ metadata/TSO и smart client; поверх него — SQL-слой. План, 
 [docs/CONTRACTS-V2.md](docs/CONTRACTS-V2.md), решения:
 [docs/adr/](docs/adr/README.md).
 
-### v2: single-range (experimental)
+### v2: Multi-Raft KV (experimental)
 
-v2 уже умеет одну Raft-группу с MVCC и транзакциями. Отдельный бинарь:
+v2 — транзакционный KV с несколькими Raft-группами на процесс, replicated
+meta/TSO, range routing и split/merge через meta scheduler. Отдельные бинари:
 
 ```bash
 go build -o bin/kv2 ./cmd/kv2
-
-# meta/TSO: один узел
-./bin/kv2 -mode=meta -addr=:9090
 
 # meta/TSO: replicated Raft-кластер (3 узла, каждый в своём терминале)
 ./bin/kv2 -mode=meta -addr=127.0.0.1:9090 -meta-id=127.0.0.1:9090 \
@@ -61,7 +59,7 @@ go build -o bin/kv2 ./cmd/kv2
 ./bin/kv2 -mode=meta -addr=127.0.0.1:9092 -meta-id=127.0.0.1:9092 \
   -meta-peers=127.0.0.1:9090,127.0.0.1:9091 -meta-data-dir=./data/meta3
 
-# три узла (в разных терминалах)
+# три KV-узла (в разных терминалах), один range на процесс
 ./bin/kv2 -mode=node -id=127.0.0.1:7001 -raft-addr=127.0.0.1:7001 \
   -data-dir=./data/v2/n1 -peers=127.0.0.1:7002,127.0.0.1:7003
 ./bin/kv2 -mode=node -id=127.0.0.1:7002 -raft-addr=127.0.0.1:7002 \
@@ -70,31 +68,32 @@ go build -o bin/kv2 ./cmd/kv2
   -data-dir=./data/v2/n3 -peers=127.0.0.1:7001,127.0.0.1:7002
 ```
 
-Клиент v2 — Go-пакет `internal/v2client`; e2e-проверка:
+Клиент v2 — Go-пакет `internal/v2client`; e2e:
 
 ```bash
-go test -race ./test -run TestV2SingleRangeCluster -v
+go test -race ./test -run 'TestV2MetaSchedulerSplitMerge|TestV2RangeHostSplitMerge|TestV2LockResolution' -v
+JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 ```
 
-Есть 2 диапазона × 3 реплики: meta отдаёт `GetRange/ListRanges`, клиент
-маршрутизирует ключ по range ID и обновляет лидера при failover. Meta/TSO
-теперь можно запустить как Raft-кластер из 3 узлов (`-mode=meta` + peers).
-`kvserver.Config.Ranges` host-ит несколько Raft-групп в одном процессе;
-split/merge идут через meta scheduler, epoch/fencing отсекает stale клиентов.
-Jepsen kill/restart: `JEPSEN=1 go test ./test -run TestJepsen`.
+Что уже работает:
 
-Split теперь умеет распределённый режим: `KVService.SplitRange` реплицирует
-prepare, замораживает все реплики и создаёт новую Raft-группу на каждой;
-meta обновляется после успеха. Распределённый merge также работает:
-prepare в обеих группах, перенос right→left на каждой реплике. Остались
-epoch/fencing и persist range map RangeHost. Транзакции
-поддерживают `CheckTxnStatus/ResolveLock`, `Get` разрешает
-committed/rolled-back locks, а фоновый resolver на лидере range
-откатывает expired locks через Raft.
+- Meta/TSO — Raft 3/5 узлов, `Leader`, клиентский redirect и failover.
+- `kvserver.Config.Ranges` host-ит несколько Raft-групп в одном процессе;
+  у каждой группы свой Pebble, Raft log, MVCC, snapshot и transport.
+- `GetRange/ListRanges`, routing по ключу/range ID; epoch/fencing через
+  `x-range-epoch`.
+- `MetaService.SplitRange/MergeRanges`: scheduler вызывает все реплики,
+  обновляет карту только после успеха; partial-merge retry идемпотентен.
+- `ranges.json` переживает restart; распределённый split/merge проверен
+  на 3 KV + 3 meta.
+- Lock resolution: `CheckTxnStatus/ResolveLock`, авто-разрешение в `Get`,
+  фоновый resolver expired locks, GC safe point без удаления locks.
+- Snapshot/InstallSnapshot, restart из snapshot, gRPC benchmark (~20 ms/op
+  на 4-RPC транзакцию, один узел).
 
-Пока нет: Multi-Raft host внутри одного процесса, split/merge с переносом
-данных и SQL-слой. Snapshot catch-up, restart из snapshot и gRPC-бенчмарк
-уже есть.
+Пока нет: durable scheduler queue/leader lease; cross-range 2PC
+(клиент запрещает транзакции через два range); network partitions/clock
+skew в Jepsen; production TLS/auth; SQL planner/extended protocol.
 
 ### SQL P0 поверх KV (experimental)
 

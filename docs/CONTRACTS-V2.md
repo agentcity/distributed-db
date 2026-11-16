@@ -200,6 +200,10 @@ func (c *Cluster) AllocID() uint64
 func (c *Cluster) AllocTS(n int) (start uint64, count int)
 func (c *Cluster) Heartbeat(node string, ranges []uint64) error
 func (c *Cluster) Snapshot() []Range
+func (c *Cluster) SetRanges(ranges []Range) error
+func (c *Cluster) Export() State
+func (c *Cluster) Restore(state State) error
+func (c *Cluster) AdvanceTS(last uint64)
 ```
 
 Requirements:
@@ -214,7 +218,10 @@ Requirements:
 - TSO: physical milliseconds << 18 | logical; monotonic under concurrency;
   `AllocTS(n)` reserves n consecutive timestamps and returns `(start, n)`;
   `n <= 0` returns `(0, 0)`.
-- Heartbeat records last-seen; no scheduler yet.
+- Heartbeat records last-seen; placement scheduler живёт в `internal/metaserver`.
+- `State` содержит ranges + TSO high-water + nextID; `Export/Restore` используются
+  meta Raft snapshot. `AdvanceTS` применяет timestamp, выбранный лидером, без
+  локальных часов (иначе state machines разойдутся).
 - Tests: lookup, split/merge, invalid boundaries, concurrent TSO monotonic,
   AllocID uniqueness, snapshot isolation of returned slices.
 
@@ -279,3 +286,59 @@ Research and write an ADR for the SQL layer on top of transactional KV:
   allows.
 
 No code. Only `docs/adr/0004-sql-layer.md`.
+
+## 9. v2 runtime: `internal/metaserver` и `internal/kvserver`
+
+Эти пакеты не входят в первоначальный контракт M1, но описывают текущий
+control/data plane.
+
+### `internal/metaserver`
+
+```go
+type Config struct {
+    Addr string
+    Ranges []meta.Range
+    ID, DataDir string
+    Peers []string
+    Replicated bool
+    ElectionTimeoutMin, ElectionTimeoutMax, HeartbeatInterval time.Duration
+}
+
+func New(Config) (*Server, error)
+func (*Server) Start(ctx) error
+func (*Server) Stop() error
+func (*Server) AllocTS(ctx, *pbv2.AllocTSRequest) (*pbv2.AllocTSResponse, error)
+func (*Server) SetRanges(ctx, *pbv2.SetRangesRequest) (*pbv2.SetRangesResponse, error)
+func (*Server) SplitRange(ctx, *pbv2.MetaSplitRangeRequest) (*pbv2.MetaSplitRangeResponse, error)
+func (*Server) MergeRanges(ctx, *pbv2.MetaMergeRangesRequest) (*pbv2.MetaMergeRangesResponse, error)
+```
+
+- replicated mode: Raft 3/5, TSO через replicated command, `Leader` RPC;
+- scheduler split/merge вызывает все реплики KV и обновляет карту только
+  после успеха; есть retry fan-out и partial-merge idempotency.
+
+### `internal/kvserver`
+
+```go
+type RangeConfig struct { ID uint64; Start, End []byte; Peers []string; Epoch uint64 }
+type Config struct { Ranges []RangeConfig; ... }
+
+func (*Server) Groups() []uint64
+func (*Server) Ranges() []RangeConfig
+func (*Server) SplitRange(ctx, rangeID uint64, splitKey []byte, newID uint64) ([]RangeConfig, error)
+func (*Server) MergeRanges(ctx context.Context, leftID, rightID uint64) ([]RangeConfig, error)
+```
+
+- один процесс host-ит N Raft-групп; KV маршрутизируется по ключу,
+  Raft — по `range_id`;
+- `RangeConfig.Epoch` и `x-range-epoch` отсекают stale клиентов;
+- split/merge переносят MVCC-записи (`ExportRange`/`ImportRecords`/
+  `DeleteRange`) и сохраняют `ranges.json`.
+
+### SQL P0
+
+`internal/sqlparser` + `internal/sqlengine` + `internal/sqlhttp` +
+`internal/pgwire` + `cmd/sqlsrv`/`cmd/pgsrv`: каталог/строки/индексы в KV,
+P0 subset (CREATE/INSERT/SELECT/UPDATE/DELETE, indexes, aggregates,
+GROUP BY, INNER JOIN), HTTP и simple pgwire. CBO/planner, extended protocol
+и cross-range 2PC не реализованы.

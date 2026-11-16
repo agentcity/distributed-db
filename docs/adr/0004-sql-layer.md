@@ -1,10 +1,29 @@
 # ADR 0004: SQL-слой поверх транзакционного KV
 
-- Статус: proposed
+- Статус: accepted (P0 реализован частично)
 - Дата: 2026-11-16
 - Контекст: M5, зависит от M3 (2PC, TSO, smart client)
 - Связанные документы: `docs/ROADMAP.md`, `docs/CONTRACTS-V2.md`,
   `docs/adr/0002-mvcc-percolator.md`
+
+## Статус реализации (2026-11-16)
+
+Реализовано в P0:
+
+- parser/AST: CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT,
+  UPDATE, DELETE; projection, WHERE, LIMIT, aggregates, GROUP BY, INNER JOIN;
+- каталог/строки/индексы в KV, order-preserving PK;
+- executor на KV-транзакциях, secondary indexes, multi-row UPDATE/DELETE;
+- HTTP `POST /v1/sql`, минимальный pgwire (`cmd/pgsrv`, psql simple query);
+- e2e на реальном KV, включая 3 узла и kill лидера.
+
+Не реализовано (следующие фазы):
+
+- cost-based planner / JOIN order / statistics;
+- extended query protocol, JDBC/pgx, TLS/auth, pg_catalog;
+- LEFT/RIGHT JOIN, >2 таблиц, CTE/оконные функции;
+- DECIMAL/NULL/JSON, внешние ключи, blocking DDL;
+- cross-range SQL-транзакции через 2PC.
 
 ## Контекст
 

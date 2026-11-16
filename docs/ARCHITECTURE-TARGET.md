@@ -247,24 +247,28 @@ pgwire → parse → bind catalog → logical plan → optimize
 
 - [x] Meta Raft 3 узла; `AllocTS` монотонен после failover.
 - [x] `RangeHost` держит 2+ группы в одном процессе; gRPC `range_id`.
-- [x] Split: freeze → copy → new group → commit map; e2e чтение обеих половин (host-local MVP).
-- [x] Merge: freeze right → copy → drop group; e2e (host-local MVP).
-- [ ] Kill лидера meta и range во время split/merge; повтор идемпотентен.
-- [ ] Клиентский watch/refresh карты; stale epoch отвергается.
+- [x] Split: freeze → copy → new group → commit map; e2e обеих половин, распределённо.
+- [x] Merge: freeze right → copy → drop group; e2e распределённо.
+- [x] Partial-merge retry идемпотентен.
+- [ ] Kill meta/range во время split/merge.
+- [x] Stale epoch отвергается.
+- [ ] Watch/refresh карты (клиент читает meta при операции).
 
 ### M3
 
-- [ ] Cross-range 2PC + recovery.
-- [ ] Background lock resolver + MVCC GC safe point.
-- [ ] Jepsen/stress: partitions, kills, clock skew; инварианты.
+- [ ] Cross-range 2PC + recovery (сейчас клиент запрещает cross-range).
+- [x] Background lock resolver + MVCC GC safe point.
+- [x] Jepsen kill/restart.
+- [ ] Network partitions, clock skew, longer soak.
 - [ ] Метрики: oldest lock, resolved locks, GC versions.
 
 ### M5
 
-- [ ] pgwire: psql/JDBC simple + extended.
-- [ ] Planner: index selection, JOIN order, aggregates.
-- [ ] Hash join + GROUP BY + COUNT/SUM/AVG/MIN/MAX.
-- [ ] Cross-range SQL txn через 2PC; e2e 3 узла.
+- [x] pgwire simple query (psql).
+- [ ] Extended protocol / JDBC / TLS.
+- [ ] Planner: index selection есть, cost-based JOIN order — нет.
+- [x] Hash join + GROUP BY + COUNT/SUM/AVG/MIN/MAX.
+- [ ] Cross-range SQL txn через 2PC; e2e 3 узла (single-range SQL уже есть).
 
 ### AI
 
