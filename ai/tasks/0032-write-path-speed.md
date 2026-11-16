@@ -23,7 +23,15 @@ scope: {backend: true, console: false, mobile: false}
 
 ## Критерии
 
-- [ ] 1PC один batch/fsync.
-- [ ] Параллельный cross-range commit.
-- [ ] Benchmark до/после.
-- [ ] Все тесты зелёные.
+- [x] 1PC один batch/fsync.
+- [x] Параллельный cross-range commit.
+- [x] Benchmark до/после.
+- [x] Все тесты зелёные.
+
+## Результат
+
+- 3-node sequential: ~33 мс → ~23 мс.
+- 3-node parallel: ~24 мс/op → ~16 мс/op (~625 tx/s).
+- PostgreSQL 13 на том же железе: ~0.68 мс/1 469 tps (1 клиент),
+  ~1.47 мс/6 835 tps (10 клиентов).
+- Разрыв всё ещё ~11× (10 клиентов) и ~34× (1 клиент).
