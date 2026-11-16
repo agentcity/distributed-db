@@ -46,7 +46,8 @@ kvctl -nodes ... backup -out ./backup
 ## 4. Главные находки
 
 1. **Скорость:** старые 5.5k tx/s — ошибка единиц; fast 10 клиентов
-   ~480–820 tx/s; production sync ~40–70 tx/s, p50 151 мс.
+   ~480–820 tx/s; production sync до фикса ~40–70 tx/s, после одного
+   Pebble batch/fsync на Raft-батч — ~185 tx/s (1 клиент ~44 tx/s).
 2. **Sync batching:** fsync на каждую команду внутри Raft-батча; один
    Pebble batch на батч — ожидаемо 5–10×.
 3. **Объём:** 1 ТБ диска влезет, процесс — нет: GC/WAL/split/backup.
