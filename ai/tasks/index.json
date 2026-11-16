@@ -88,5 +88,11 @@
     "title": "Stage 1 — group commit, TSO batch, 1PC и range cache",
     "status": "done",
     "file": "0015-stage1-speed.md"
+  },
+  {
+    "id": "0016",
+    "title": "Stage 2 — потоковый split и авто-split",
+    "status": "in_progress",
+    "file": "0016-stage2-volume.md"
   }
 ]
