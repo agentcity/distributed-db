@@ -40,5 +40,11 @@
     "title": "M2 — range map, routing и два диапазона",
     "status": "in_progress",
     "file": "0007-m2-range-routing.md"
+  },
+  {
+    "id": "0008",
+    "title": "M3 — lock resolution и транзакционные конфликты",
+    "status": "in_progress",
+    "file": "0008-m3-lock-resolution.md"
   }
 ]
