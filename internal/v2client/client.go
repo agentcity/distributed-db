@@ -2,9 +2,9 @@
 //
 // It discovers the shard leader by polling KVService.Status, caches it for a
 // short time, and exposes a small Begin/Set/Get/Commit/Rollback transaction
-// API. TSO comes from the meta service. M1 has a single range, so there is no
-// range cache yet; the interface is shaped so a range-aware router can be
-// added without changing callers.
+// API. TSO comes from the meta service and is fetched in batches. Range
+// descriptors are cached briefly so a retry storm does not turn into a meta
+// RPC storm; both caches are invalidated when the meta leader moves.
 package v2client
 
 import (
@@ -16,12 +16,11 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
 	pbv2 "distributed-db/internal/pb/v2"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -31,6 +30,8 @@ var (
 	ErrNotLeader = errors.New("v2client: not leader")
 	// ErrConflict is returned for lock/write conflicts.
 	ErrConflict = errors.New("v2client: transaction conflict")
+	// errClientClosed is returned after Close.
+	errClientClosed = errors.New("v2client: closed")
 )
 
 const (
@@ -42,22 +43,42 @@ const (
 
 // Client is a transactional v2 KV client. It is safe for concurrent use.
 type Client struct {
-	meta      pbv2.MetaServiceClient
-	metaCC    *grpc.ClientConn
-	metaAddr  string
-	metaSeeds []string
-	addrs     []string
-
-	metaMu          sync.Mutex
-	metaConns       []*grpc.ClientConn
-	metaLeaderAddr  string
-	metaLeaderUntil time.Time
-
+	// KV node connections and leader hints.
 	mu      sync.Mutex
 	clients map[string]pbv2.KVServiceClient
 	conns   map[string]*grpc.ClientConn
 	leaders map[uint64]leaderEntry // range ID -> cached leader
 	closed  bool
+
+	addrs []string
+
+	// Meta service connection pool and leader discovery. Connections are
+	// pooled by address so repeated failover does not create a new gRPC
+	// connection per call.
+	metaMu          sync.Mutex
+	meta            metaAPI
+	metaAddr        string
+	metaSeeds       []string
+	metaPool        map[string]*metaEntry
+	metaDial        func(string) (*grpc.ClientConn, metaAPI, error)
+	metaLeaderAddr  string
+	metaLeaderUntil time.Time
+	metaGen         uint64
+	metaClosed      bool
+
+	// TSO batch. All fields are guarded by tso.mu.
+	tso             tsoBatcher
+	tsBatchSize     int32
+	tsBatchTTL      time.Duration
+	tsIdleCheck     time.Duration
+	tsValidateEvery uint64
+
+	// Range descriptor cache.
+	rangeMu  sync.Mutex
+	ranges   map[uint64]*rangeEntry
+	rangeSeq uint64
+	rangeTTL time.Duration
+	rangeCap int
 }
 
 type leaderEntry struct {
@@ -78,16 +99,24 @@ func New(metaAddr string, addrs []string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("v2client: dial meta: %w", err)
 	}
+	mc := pbv2.NewMetaServiceClient(cc)
 	return &Client{
-		meta:      pbv2.NewMetaServiceClient(cc),
-		metaCC:    cc,
-		metaAddr:  metaAddr,
-		metaSeeds: []string{metaAddr},
-		metaConns: []*grpc.ClientConn{cc},
-		addrs:     append([]string(nil), addrs...),
-		clients:   make(map[string]pbv2.KVServiceClient),
-		conns:     make(map[string]*grpc.ClientConn),
-		leaders:   make(map[uint64]leaderEntry),
+		meta:            mc,
+		metaAddr:        metaAddr,
+		metaSeeds:       []string{metaAddr},
+		metaPool:        map[string]*metaEntry{metaAddr: {cc: cc, mc: mc}},
+		metaDial:        dialMeta,
+		addrs:           append([]string(nil), addrs...),
+		clients:         make(map[string]pbv2.KVServiceClient),
+		conns:           make(map[string]*grpc.ClientConn),
+		leaders:         make(map[uint64]leaderEntry),
+		tsBatchSize:     defaultTSOBatchSize,
+		tsBatchTTL:      defaultTSOBatchTTL,
+		tsIdleCheck:     defaultTSOIdleCheck,
+		tsValidateEvery: defaultTSOValidateEvery,
+		ranges:          make(map[uint64]*rangeEntry),
+		rangeTTL:        defaultRangeTTL,
+		rangeCap:        defaultRangeCacheMax,
 	}, nil
 }
 
@@ -105,17 +134,27 @@ func (c *Client) Close() error {
 	c.mu.Unlock()
 
 	c.metaMu.Lock()
-	metaConns := c.metaConns
-	c.metaConns = nil
-	c.metaCC = nil
+	metaClosed := c.metaClosed
+	c.metaClosed = true
+	// Invalidating the generation makes any in-flight TSO/range cache entry
+	// unusable after Close.
+	c.metaGen++
+	pool := c.metaPool
+	c.metaPool = nil
+	c.meta = nil
 	c.metaMu.Unlock()
+	c.clearRangeCache()
 
 	var errs []error
 	for _, cc := range conns {
 		errs = append(errs, cc.Close())
 	}
-	for _, cc := range metaConns {
-		errs = append(errs, cc.Close())
+	if !metaClosed {
+		for _, e := range pool {
+			if e != nil && e.cc != nil {
+				errs = append(errs, e.cc.Close())
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -124,7 +163,7 @@ func (c *Client) node(addr string) (pbv2.KVServiceClient, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return nil, errors.New("v2client: closed")
+		return nil, errClientClosed
 	}
 	if cl, ok := c.clients[addr]; ok {
 		return cl, nil
@@ -160,127 +199,15 @@ func (c *Client) invalidateLeader(rangeID uint64) {
 	c.mu.Unlock()
 }
 
-// tryMetaSeeds re-discovers the leader from the original meta seed addresses.
-// It is used when the cached leader is gone.
-func (c *Client) tryMetaSeeds(ctx context.Context) (pbv2.MetaServiceClient, bool) {
-	c.metaMu.Lock()
-	seeds := append([]string(nil), c.metaSeeds...)
-	c.metaMu.Unlock()
-	for _, addr := range seeds {
-		cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			continue
-		}
-		mc := pbv2.NewMetaServiceClient(cc)
-		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
-		resp, err := mc.Leader(probeCtx, &pbv2.LeaderRequest{})
-		cancel()
-		if err != nil {
-			_ = cc.Close()
-			continue
-		}
-		target, targetCC, targetMC := addr, cc, mc
-		if leader := resp.GetLeader(); leader != "" && leader != addr {
-			lcc, err := grpc.NewClient(leader, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				_ = cc.Close()
-				continue
-			}
-			target, targetCC, targetMC = leader, lcc, pbv2.NewMetaServiceClient(lcc)
-		}
-		c.metaMu.Lock()
-		c.meta = targetMC
-		c.metaCC = targetCC
-		c.metaAddr = target
-		c.metaConns = append(c.metaConns, targetCC)
-		c.metaLeaderAddr = target
-		c.metaLeaderUntil = time.Now().Add(leaderTTL)
-		c.metaMu.Unlock()
-		if target != addr {
-			_ = cc.Close()
-		}
-		return targetMC, true
-	}
-	return nil, false
-}
-
-// metaClient returns a client connected to the current meta leader. A follower
-// answers Leader with the current leader, so callers can start from any meta
-// node and get redirected without a separate discovery service.
-func (c *Client) metaClient(ctx context.Context) (pbv2.MetaServiceClient, error) {
-	c.metaMu.Lock()
-	mc := c.meta
-	addr := c.metaAddr
-	cached := c.metaLeaderAddr
-	until := c.metaLeaderUntil
-	c.metaMu.Unlock()
-	if cached != "" && cached == addr && time.Now().Before(until) {
-		return mc, nil
-	}
-
-	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
-	resp, err := mc.Leader(probeCtx, &pbv2.LeaderRequest{})
-	cancel()
-	if err != nil {
-		if seeded, ok := c.tryMetaSeeds(ctx); ok {
-			return seeded, nil
-		}
-		return mc, nil
-	}
-	leader := resp.GetLeader()
-	if leader == "" || leader == addr {
-		c.metaMu.Lock()
-		c.metaLeaderAddr = addr
-		c.metaLeaderUntil = time.Now().Add(leaderTTL)
-		c.metaMu.Unlock()
-		return mc, nil
-	}
-	cc, err := grpc.NewClient(leader, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return mc, nil
-	}
-	next := pbv2.NewMetaServiceClient(cc)
-	c.metaMu.Lock()
-	c.meta = next
-	c.metaCC = cc
-	c.metaAddr = leader
-	c.metaConns = append(c.metaConns, cc)
-	c.metaLeaderAddr = leader
-	c.metaLeaderUntil = time.Now().Add(leaderTTL)
-	c.metaMu.Unlock()
-	return next, nil
-}
-
-func (c *Client) invalidateMetaLeader() {
-	c.metaMu.Lock()
-	c.metaLeaderAddr = ""
-	c.metaLeaderUntil = time.Time{}
-	c.metaMu.Unlock()
-}
-
-// rangeFor asks the meta service which range owns key. A meta failure is not
-// fatal: the client falls back to probing every configured node.
-func (c *Client) rangeFor(ctx context.Context, key []byte) (*pbv2.RangeInfo, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	mc, err := c.metaClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	r, err := mc.GetRange(probeCtx, &pbv2.GetRangeRequest{Key: key})
-	if err != nil {
-		return nil, err
-	}
-	return r, nil
-}
-
 // discoverLeader probes the meta range's replicas (leader hint first) and
-// returns the first node that reports leadership.
-func (c *Client) discoverLeader(ctx context.Context, key []byte) (string, uint64, error) {
+// returns the first node that reports leadership, together with the range
+// descriptor version used for the probe.
+func (c *Client) discoverLeader(ctx context.Context, key []byte) (string, uint64, uint64, error) {
 	var candidates []string
-	var rangeID uint64
+	var rangeID, version uint64
 	if r, err := c.rangeFor(ctx, key); err == nil {
 		rangeID = r.GetId()
+		version = r.GetVersion()
 		if r.GetLeader() != "" {
 			candidates = append(candidates, r.GetLeader())
 		}
@@ -312,17 +239,17 @@ func (c *Client) discoverLeader(ctx context.Context, key []byte) (string, uint64
 		}
 		if resp.GetLeader() != "" {
 			c.setLeader(rangeID, resp.GetLeader())
-			return resp.GetLeader(), rangeID, nil
+			return resp.GetLeader(), rangeID, version, nil
 		}
 		if resp.GetRole() == "leader" {
 			c.setLeader(rangeID, addr)
-			return addr, rangeID, nil
+			return addr, rangeID, version, nil
 		}
 	}
 	if lastErr == nil {
 		lastErr = ErrNotLeader
 	}
-	return "", rangeID, fmt.Errorf("v2client: discover leader: %w", lastErr)
+	return "", rangeID, version, fmt.Errorf("v2client: discover leader: %w", lastErr)
 }
 
 type callFunc func(ctx context.Context, cl pbv2.KVServiceClient) (leaderHint, errMsg string, err error)
@@ -339,6 +266,7 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 		rangeEpoch = r.GetVersion()
 	}
 	var lastErr error
+	refreshedRange := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -350,10 +278,14 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 		addr := c.cachedLeader(rangeID)
 		if addr == "" {
 			var err error
-			addr, _, err = c.discoverLeader(ctx, key)
+			var rid, version uint64
+			addr, rid, version, err = c.discoverLeader(ctx, key)
 			if err != nil {
 				lastErr = err
 				continue
+			}
+			if rid != 0 {
+				rangeID, rangeEpoch = rid, version
 			}
 		}
 		cl, err := c.node(addr)
@@ -371,52 +303,47 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 			c.invalidateLeader(rangeID)
 			continue
 		}
-		if msg == "not leader" {
+		switch msg {
+		case "":
+			return nil
+		case "not leader":
 			c.invalidateLeader(rangeID)
 			lastErr = ErrNotLeader
 			if hint != "" {
 				c.setLeader(rangeID, hint)
 			}
 			continue
-		}
-		if msg == "range frozen" {
+		case "range frozen":
 			lastErr = ErrConflict
 			continue
-		}
-		if msg != "" {
+		case "stale epoch", "not hosted":
+			// The cached descriptor is no longer valid (split/merge or the
+			// range moved). Drop everything for this key and re-resolve it
+			// through meta exactly once before retrying the RPC.
+			c.invalidateLeader(rangeID)
+			c.invalidateRangeForKey(rangeID, key)
+			if refreshedRange {
+				return fmt.Errorf("v2client: %s", msg)
+			}
+			refreshedRange = true
+			nr, rerr := c.rangeForFresh(ctx, key)
+			if rerr != nil {
+				return fmt.Errorf("v2client: refresh range after %q: %w", msg, rerr)
+			}
+			rangeID, rangeEpoch = nr.GetId(), nr.GetVersion()
+			lastErr = fmt.Errorf("%s", msg)
+			// The meta round-trip already provided the retry opportunity, so
+			// it does not consume the attempt budget.
+			attempt--
+			continue
+		default:
 			return fmt.Errorf("v2client: %s", msg)
 		}
-		return nil
 	}
 	if lastErr == nil {
 		lastErr = ErrNotLeader
 	}
 	return fmt.Errorf("v2client: %w", lastErr)
-}
-
-// AllocTS reserves one timestamp from the meta service.
-func (c *Client) AllocTS(ctx context.Context) (uint64, error) {
-	var lastErr error
-	deadline := time.Now().Add(defaultTimeout)
-	for attempt := 0; time.Now().Before(deadline); attempt++ {
-		mc, err := c.metaClient(ctx)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		resp, err := mc.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 1})
-		if err == nil {
-			return resp.GetStart(), nil
-		}
-		lastErr = err
-		c.invalidateMetaLeader()
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-	return 0, fmt.Errorf("v2client: alloc ts: %w", lastErr)
 }
 
 // KV is one row returned by Txn.Scan.
@@ -588,23 +515,8 @@ func (t *Txn) Commit(ctx context.Context) error {
 		}
 	}
 
-	var prewriteMsg string
-	if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
-		resp, err := cl.Prewrite(ctx, &pbv2.PrewriteRequest{
-			StartTs: t.startTS, Primary: primary, Mutations: mutations,
-		})
-		if err != nil {
-			return "", "", err
-		}
-		prewriteMsg = resp.GetError()
-		return resp.GetLeader(), resp.GetError(), nil
-	}); err != nil {
-		return err
-	}
-	if prewriteMsg != "" {
-		return fmt.Errorf("v2client: prewrite: %s", prewriteMsg)
-	}
-
+	// The whole transaction is in one range: apply prewrite+commit in one
+	// Raft entry (1PC). commitTS is allocated before the single round.
 	commitTS, err := t.c.AllocTS(ctx)
 	if err != nil {
 		return err
@@ -615,14 +527,10 @@ func (t *Txn) Commit(ctx context.Context) error {
 			return err
 		}
 	}
-	keyBytes := make([][]byte, 0, len(keys))
-	for _, k := range keys {
-		keyBytes = append(keyBytes, []byte(k))
-	}
 	var commitMsg string
 	if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
-		resp, err := cl.Commit(ctx, &pbv2.CommitRequest{
-			StartTs: t.startTS, CommitTs: commitTS, Keys: keyBytes,
+		resp, err := cl.CommitSingle(ctx, &pbv2.CommitSingleRequest{
+			StartTs: t.startTS, CommitTs: commitTS, Primary: primary, Mutations: mutations,
 		})
 		if err != nil {
 			return "", "", err
