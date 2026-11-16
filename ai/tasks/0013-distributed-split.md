@@ -1,7 +1,7 @@
 ---
 task_id: "0013"
 type: feature
-title: M2.4 — распределённый split на всех репликах
+title: M2.4 — распределённые split и merge
 created_at: 2026-11-16T07:30:00Z
 author: saron
 scope:
@@ -35,7 +35,7 @@ M2.3 split/merge были host-local: данные и новая Raft-групп
 - [x] новая Raft-группа на каждой реплике.
 - [x] meta обновляется после всех реплик.
 - [x] e2e 3 узла: чтение a/m/z и запись zz в range 2.
-- [ ] Распределённый merge.
+- [x] Распределённый merge.
 - [ ] Epoch/fencing и persist range map RangeHost.
 
 ## Ссылки
