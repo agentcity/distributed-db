@@ -67,6 +67,10 @@ type Server struct {
 	// guarded by mu and Stop cancels it.
 	autoSplit *autoSplitLoop
 
+	// lifecycle tracks the optional combined auto-split + auto-merge loop.
+	// Access is guarded by mu and Stop cancels and waits for it.
+	lifecycle *lifecycleLoop
+
 	// tsMu serializes TSO reservations so two proposals cannot reserve the
 	// same timestamp on one leader.
 	tsMu sync.Mutex
@@ -75,6 +79,12 @@ type Server struct {
 // autoSplitLoop is the cancel handle for one StartAutoSplit goroutine.
 type autoSplitLoop struct {
 	cancel context.CancelFunc
+}
+
+// lifecycleLoop is the cancel/join handle for one StartLifecycle goroutine.
+type lifecycleLoop struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // New creates a meta server. Start binds the listener and, in replicated mode,
@@ -205,6 +215,8 @@ func (s *Server) Stop() error {
 	s.stopped = true
 	autoSplit := s.autoSplit
 	s.autoSplit = nil
+	lifecycle := s.lifecycle
+	s.lifecycle = nil
 	grpcSrv := s.grpc
 	lis := s.lis
 	node := s.raft
@@ -213,6 +225,10 @@ func (s *Server) Stop() error {
 
 	if autoSplit != nil {
 		autoSplit.cancel()
+	}
+	if lifecycle != nil {
+		lifecycle.cancel()
+		<-lifecycle.done
 	}
 	if node != nil {
 		node.Stop()

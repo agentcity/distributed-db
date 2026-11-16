@@ -172,7 +172,17 @@ func (s *Server) MergeRanges(ctx context.Context, req *pbv2.MetaMergeRangesReque
 	}
 	schedulerMu.Lock()
 	defer schedulerMu.Unlock()
+	return s.mergeRangesLocked(ctx, req)
+}
 
+// mergeRangesLocked is MergeRanges without the process-wide scheduler lock.
+// The caller must hold schedulerMu. It is shared by the public MergeRanges RPC
+// and AutoMerge so one auto-merge pass cannot interleave with another
+// scheduling operation.
+func (s *Server) mergeRangesLocked(ctx context.Context, req *pbv2.MetaMergeRangesRequest) (*pbv2.MetaMergeRangesResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
@@ -339,6 +349,119 @@ func (s *Server) AutoSplit(ctx context.Context, maxRangeBytes uint64) (int, erro
 	return splits, errors.Join(errs...)
 }
 
+// AutoMerge performs one size-based auto-merge pass and returns the number of
+// adjacent pairs that were merged. The caller must be the meta leader.
+//
+// The range map is snapshotted once. For each adjacent pair in that snapshot
+// the scheduler asks both ranges for RangeStats (reusing queryRangeStats, so
+// stale/leader-hinted replicas are handled the same way as AutoSplit) and
+// merges the pair when all of these hold:
+//
+//   - left.End == right.Start (the descriptors are adjacent);
+//   - both sizes are >= minRangeBytes, so underfull ranges are left for
+//     placement/rebalancing instead of being folded into a neighbour;
+//   - both sizes are <= maxRangeBytes and left+right <= maxRangeBytes, so the
+//     merged range stays within one target range size.
+//
+// The merge itself goes through mergeRangesLocked, the same path as the
+// MergeRanges RPC: it re-reads the current range map, fans out to every
+// replica with the scheduler retry policy, and only then applies the range map.
+// A pair whose stats or merge fail is skipped (the map is left unchanged) and
+// the failure is included in the returned error. A successful merge absorbs
+// the right range, so the next pair considered is the one after it; newly
+// merged ranges are not merged again in the same pass.
+func (s *Server) AutoMerge(ctx context.Context, maxRangeBytes, minRangeBytes uint64) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maxRangeBytes == 0 {
+		return 0, errors.New("auto-merge: maxRangeBytes must be positive")
+	}
+	if minRangeBytes == 0 {
+		return 0, errors.New("auto-merge: minRangeBytes must be positive")
+	}
+	if minRangeBytes > maxRangeBytes {
+		return 0, errors.New("auto-merge: minRangeBytes must not exceed maxRangeBytes")
+	}
+
+	schedulerMu.Lock()
+	defer schedulerMu.Unlock()
+
+	if err := s.requireLeader(ctx); err != nil {
+		return 0, err
+	}
+
+	rows := s.cluster.Snapshot()
+	merges := 0
+	var errs []error
+	for i := 0; i+1 < len(rows); i++ {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		left, right := rows[i], rows[i+1]
+		if !adjacent(left, right) {
+			continue
+		}
+
+		leftStats, err := s.queryRangeStats(ctx, left)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("auto-merge range %d: stats: %w", left.ID, err))
+			continue
+		}
+		rightStats, err := s.queryRangeStats(ctx, right)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("auto-merge range %d: stats: %w", right.ID, err))
+			continue
+		}
+		if leftStats.GetSizeBytes() < minRangeBytes || rightStats.GetSizeBytes() < minRangeBytes {
+			// At least one side is underfull; leave it to placement policy
+			// rather than merging it away.
+			continue
+		}
+		if !mergeSizeFits(leftStats.GetSizeBytes(), rightStats.GetSizeBytes(), maxRangeBytes) {
+			continue
+		}
+
+		resp, err := s.mergeRangesLocked(ctx, &pbv2.MetaMergeRangesRequest{
+			LeftRangeId:  left.ID,
+			RightRangeId: right.ID,
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("auto-merge ranges %d and %d: %w", left.ID, right.ID, err))
+			continue
+		}
+		if !resp.GetSuccess() {
+			msg := resp.GetError()
+			if msg == "" {
+				msg = "unspecified failure"
+			}
+			errs = append(errs, fmt.Errorf("auto-merge ranges %d and %d: %s", left.ID, right.ID, msg))
+			continue
+		}
+
+		merges++
+		if s.log != nil {
+			s.log.Info("auto-merge ranges", "left_range", left.ID, "right_range", right.ID,
+				"left_bytes", leftStats.GetSizeBytes(), "right_bytes", rightStats.GetSizeBytes(),
+				"max_bytes", maxRangeBytes, "min_bytes", minRangeBytes)
+		}
+		// rows[i+1] has been absorbed into rows[i]; the next mergeable pair
+		// starts after it. This pass does not revisit the merged range.
+		i++
+	}
+	return merges, errors.Join(errs...)
+}
+
+// mergeSizeFits reports whether two ranges may be combined without exceeding
+// max. The checks are written as subtractions so the sum cannot overflow.
+func mergeSizeFits(left, right, max uint64) bool {
+	if left > max || right > max {
+		return false
+	}
+	return right <= max-left
+}
+
 // StartAutoSplit starts a background loop that runs one AutoSplit pass every
 // interval. It is leader-only: on a replicated meta group only the current
 // leader performs a pass, followers silently skip their turn, and an election
@@ -365,6 +488,10 @@ func (s *Server) StartAutoSplit(ctx context.Context, interval time.Duration, max
 	if s.autoSplit != nil {
 		s.mu.Unlock()
 		return errors.New("metaserver: auto-split already running")
+	}
+	if s.lifecycle != nil {
+		s.mu.Unlock()
+		return errors.New("metaserver: lifecycle already running")
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	loop := &autoSplitLoop{cancel: cancel}
@@ -400,6 +527,93 @@ func (s *Server) StartAutoSplit(ctx context.Context, interval time.Duration, max
 					s.log.Warn("auto-split pass finished with errors", "splits", splits, "error", err)
 				} else if splits > 0 {
 					s.log.Info("auto-split pass", "splits", splits)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+// StartLifecycle starts a background loop that runs one AutoSplit pass and
+// then one AutoMerge pass every interval. It is the combined range lifecycle
+// policy: AutoSplit caps ranges at maxRangeBytes, then AutoMerge folds
+// adjacent ranges whose sizes are all between minRangeBytes and maxRangeBytes
+// back together when the result still fits in maxRangeBytes.
+//
+// The loop is leader-only: on a replicated meta group only the current leader
+// performs passes, followers silently skip their turn, and an election moves
+// the work to the new leader. The loop stops when ctx is canceled or
+// Server.Stop is called. Only one scheduler loop (lifecycle or standalone
+// auto-split) may run per Server.
+//
+// The first pass runs after one interval, not immediately. minRangeBytes must
+// be positive and no larger than maxRangeBytes.
+func (s *Server) StartLifecycle(ctx context.Context, interval time.Duration, maxRangeBytes, minRangeBytes uint64) error {
+	if interval <= 0 {
+		return errors.New("metaserver: lifecycle interval must be positive")
+	}
+	if maxRangeBytes == 0 {
+		return errors.New("metaserver: lifecycle maxRangeBytes must be positive")
+	}
+	if minRangeBytes == 0 {
+		return errors.New("metaserver: lifecycle minRangeBytes must be positive")
+	}
+	if minRangeBytes > maxRangeBytes {
+		return errors.New("metaserver: lifecycle minRangeBytes must not exceed maxRangeBytes")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return errors.New("metaserver: stopped")
+	}
+	if s.lifecycle != nil {
+		s.mu.Unlock()
+		return errors.New("metaserver: lifecycle already running")
+	}
+	if s.autoSplit != nil {
+		s.mu.Unlock()
+		return errors.New("metaserver: auto-split already running")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	loop := &lifecycleLoop{cancel: cancel, done: make(chan struct{})}
+	s.lifecycle = loop
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			if s.lifecycle == loop {
+				s.lifecycle = nil
+			}
+			s.mu.Unlock()
+			close(loop.done)
+		}()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.requireLeader(runCtx); err != nil {
+					// Followers must not schedule; the leader owns the pass.
+					continue
+				}
+				splits, splitErr := s.AutoSplit(runCtx, maxRangeBytes)
+				merges, mergeErr := s.AutoMerge(runCtx, maxRangeBytes, minRangeBytes)
+				if s.log == nil {
+					continue
+				}
+				err := errors.Join(splitErr, mergeErr)
+				if err != nil {
+					s.log.Warn("range lifecycle pass finished with errors",
+						"splits", splits, "merges", merges, "error", err)
+				} else if splits > 0 || merges > 0 {
+					s.log.Info("range lifecycle pass", "splits", splits, "merges", merges)
 				}
 			}
 		}

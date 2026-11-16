@@ -723,3 +723,276 @@ func TestV2MetaSchedulerAutoSplitLoopStops(t *testing.T) {
 		t.Fatal("StartAutoSplit after Stop succeeded, want error")
 	}
 }
+
+func TestV2MetaSchedulerAutoMergeMergesAdjacentSmallRanges(t *testing.T) {
+	addr1, kv1 := startFakeKV(t, "", "")
+	addr2, kv2 := startFakeKV(t, "", "")
+	replicas := []string{addr1, addr2}
+	kv1.setRangeStats(1, fakeRangeStats(addr1, 1<<20, 100, "", nil, []byte("m")))
+	kv2.setRangeStats(4, fakeRangeStats(addr2, 1<<20, 100, "", []byte("m"), []byte("t")))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: []byte("m"), Replicas: replicas, Leader: addr1, Version: 2},
+		{ID: 4, Start: []byte("m"), End: []byte("t"), Replicas: replicas, Leader: addr2, Version: 2},
+		{ID: 9, Start: []byte("t"), End: nil, Replicas: replicas, Leader: addr1, Version: 1},
+	})
+
+	n, err := s.AutoMerge(context.Background(), 4<<20, 1<<10)
+	if err != nil {
+		t.Fatalf("AutoMerge: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("AutoMerge merges = %d, want 1", n)
+	}
+
+	rows := snapshotByID(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("range map after auto-merge = %+v, want 2 ranges", rows)
+	}
+	merged := rows[1]
+	if !bytes.Equal(merged.Start, nil) || !bytes.Equal(merged.End, []byte("t")) {
+		t.Fatalf("merged bounds = [%q, %q), want [-inf, t)", merged.Start, merged.End)
+	}
+	if merged.Version != 3 || merged.Leader != addr1 {
+		t.Fatalf("merged range = %+v, want version 3 and leader %q", merged, addr1)
+	}
+	if _, ok := rows[4]; ok {
+		t.Fatalf("right range 4 still present after auto-merge")
+	}
+	if rows[9].Version != 1 {
+		t.Fatalf("unrelated range 9 changed: %+v", rows[9])
+	}
+
+	for name, fake := range map[string]*fakeKV{"kv1": kv1, "kv2": kv2} {
+		reqs := fake.mergeRequests()
+		if len(reqs) != 1 {
+			t.Fatalf("%s merge requests = %d, want 1", name, len(reqs))
+		}
+		req := reqs[0]
+		if req.GetLeftRangeId() != 1 || req.GetRightRangeId() != 4 || req.GetEpoch() != 2 {
+			t.Fatalf("%s merge request = %+v, want {left 1, right 4, epoch 2}", name, req)
+		}
+	}
+}
+
+func TestV2MetaSchedulerAutoMergeSkipsLargeAndUnderfull(t *testing.T) {
+	t.Run("combined too large", func(t *testing.T) {
+		addr, fake := startFakeKV(t, "", "")
+		fake.setRangeStats(1, fakeRangeStats(addr, 3<<20, 100, "", nil, []byte("m")))
+		fake.setRangeStats(2, fakeRangeStats(addr, 3<<20, 100, "", []byte("m"), nil))
+
+		s := newSchedulerServer(t, []meta.Range{
+			{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{addr}, Leader: addr, Version: 5},
+			{ID: 2, Start: []byte("m"), End: nil, Replicas: []string{addr}, Leader: addr, Version: 5},
+		})
+
+		n, err := s.AutoMerge(context.Background(), 4<<20, 1<<10)
+		if err != nil {
+			t.Fatalf("AutoMerge: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("AutoMerge merges = %d, want 0 when combined size exceeds max", n)
+		}
+		if got := len(fake.mergeRequests()); got != 0 {
+			t.Fatalf("MergeRanges calls = %d, want 0", got)
+		}
+		rows := snapshotByID(t, s)
+		if len(rows) != 2 || rows[1].Version != 5 || rows[2].Version != 5 {
+			t.Fatalf("range map changed for an oversized pair: %+v", rows)
+		}
+	})
+
+	t.Run("underfull pair", func(t *testing.T) {
+		addr, fake := startFakeKV(t, "", "")
+		fake.setRangeStats(1, fakeRangeStats(addr, 512<<10, 10, "", nil, []byte("m")))
+		fake.setRangeStats(2, fakeRangeStats(addr, 1<<20, 20, "", []byte("m"), nil))
+
+		s := newSchedulerServer(t, []meta.Range{
+			{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{addr}, Leader: addr, Version: 3},
+			{ID: 2, Start: []byte("m"), End: nil, Replicas: []string{addr}, Leader: addr, Version: 3},
+		})
+
+		n, err := s.AutoMerge(context.Background(), 4<<20, 1<<20)
+		if err != nil {
+			t.Fatalf("AutoMerge: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("AutoMerge merges = %d, want 0 when a range is underfull", n)
+		}
+		if got := len(fake.mergeRequests()); got != 0 {
+			t.Fatalf("MergeRanges calls = %d, want 0", got)
+		}
+		if rows := snapshotByID(t, s); len(rows) != 2 {
+			t.Fatalf("range map changed for an underfull pair: %+v", rows)
+		}
+	})
+}
+
+func TestV2MetaSchedulerAutoMergeFailedReplicaLeavesMapUnchanged(t *testing.T) {
+	healthy, healthyFake := startFakeKV(t, "", "")
+	stale, _ := startFakeKV(t, "", "injected merge failure")
+	replicas := []string{healthy, stale}
+	healthyFake.setRangeStats(1, fakeRangeStats(healthy, 1<<20, 100, "", nil, []byte("m")))
+	healthyFake.setRangeStats(2, fakeRangeStats(healthy, 1<<20, 100, "", []byte("m"), nil))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: []byte("m"), Replicas: replicas, Leader: healthy, Version: 6},
+		{ID: 2, Start: []byte("m"), End: nil, Replicas: replicas, Leader: healthy, Version: 6},
+	})
+
+	n, err := s.AutoMerge(context.Background(), 4<<20, 1<<10)
+	if err == nil {
+		t.Fatalf("AutoMerge succeeded despite a failing replica (merges=%d)", n)
+	}
+	if n != 0 {
+		t.Fatalf("AutoMerge merges = %d, want 0 when a replica fails", n)
+	}
+	if !strings.Contains(err.Error(), stale) || !strings.Contains(err.Error(), "1/2 replicas") {
+		t.Fatalf("AutoMerge error = %q, want failing replica and failure count", err)
+	}
+	if got := len(healthyFake.mergeRequests()); got == 0 {
+		t.Fatal("healthy replica was not asked to merge")
+	}
+
+	rows := snapshotByID(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("range map changed after failed merge fan-out: %+v", rows)
+	}
+	if rows[1].End == nil || !bytes.Equal(rows[1].End, []byte("m")) || rows[1].Version != 6 {
+		t.Fatalf("left range changed after failed fan-out: %+v", rows[1])
+	}
+	if rows[2].Version != 6 {
+		t.Fatalf("right range changed after failed fan-out: %+v", rows[2])
+	}
+}
+
+func TestV2MetaSchedulerAutoMergeRequiresLeader(t *testing.T) {
+	s := &Server{
+		cfg:     Config{Replicated: true},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cluster: meta.New(),
+	}
+	n, err := s.AutoMerge(context.Background(), 1<<20, 1<<10)
+	if err == nil {
+		t.Fatalf("AutoMerge on a non-leader succeeded with %d merges, want error", n)
+	}
+	if n != 0 {
+		t.Fatalf("AutoMerge merges = %d, want 0 on a non-leader", n)
+	}
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Fatalf("AutoMerge error code = %v (%v), want Unavailable", code, err)
+	}
+}
+
+func TestV2MetaSchedulerStartLifecycleValidationAndSingleLoop(t *testing.T) {
+	addr, _ := startFakeKV(t, "", "")
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 1},
+	})
+	t.Cleanup(func() { _ = s.Stop() })
+	ctx := context.Background()
+
+	invalid := []struct {
+		name     string
+		interval time.Duration
+		max      uint64
+		min      uint64
+	}{
+		{name: "zero interval", interval: 0, max: 1 << 20, min: 1},
+		{name: "zero max", interval: time.Hour, max: 0, min: 1},
+		{name: "zero min", interval: time.Hour, max: 1 << 20, min: 0},
+		{name: "min over max", interval: time.Hour, max: 1 << 20, min: 2 << 20},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.StartLifecycle(ctx, tc.interval, tc.max, tc.min); err == nil {
+				t.Fatalf("StartLifecycle(%s) succeeded, want validation error", tc.name)
+			}
+		})
+	}
+
+	if err := s.StartLifecycle(ctx, time.Hour, 1<<20, 1<<10); err != nil {
+		t.Fatalf("StartLifecycle: %v", err)
+	}
+	if err := s.StartLifecycle(ctx, time.Hour, 1<<20, 1<<10); err == nil ||
+		!strings.Contains(err.Error(), "already running") {
+		t.Fatalf("second StartLifecycle = %v, want already-running error", err)
+	}
+	if err := s.StartAutoSplit(ctx, time.Hour, 1<<20); err == nil ||
+		!strings.Contains(err.Error(), "lifecycle already running") {
+		t.Fatalf("StartAutoSplit alongside lifecycle = %v, want lifecycle-already-running error", err)
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := s.StartLifecycle(ctx, time.Hour, 1<<20, 1<<10); err == nil ||
+		!strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("StartLifecycle after Stop = %v, want stopped error", err)
+	}
+}
+
+func TestV2MetaSchedulerLifecycleMergesAndStops(t *testing.T) {
+	addr, fake := startFakeKV(t, "", "")
+	fake.setRangeStats(1, fakeRangeStats(addr, 1<<10, 10, "", nil, []byte("m")))
+	fake.setRangeStats(2, fakeRangeStats(addr, 1<<10, 10, "", []byte("m"), nil))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{addr}, Leader: addr, Version: 1},
+		{ID: 2, Start: []byte("m"), End: nil, Replicas: []string{addr}, Leader: addr, Version: 1},
+	})
+	t.Cleanup(func() { _ = s.Stop() })
+
+	if err := s.StartLifecycle(context.Background(), 10*time.Millisecond, 8<<20, 1<<10); err != nil {
+		t.Fatalf("StartLifecycle: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(snapshotByID(t, s)) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rows := snapshotByID(t, s)
+	if len(rows) != 1 {
+		t.Fatalf("lifecycle loop did not merge the small pair: %+v", rows)
+	}
+	if rows[1].Version != 2 || rows[1].End != nil {
+		t.Fatalf("merged range = %+v, want [nil, nil) at version 2", rows[1])
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	stoppedAt := len(fake.statsRequests())
+	time.Sleep(60 * time.Millisecond)
+	if got := len(fake.statsRequests()); got != stoppedAt {
+		t.Fatalf("lifecycle loop still running after Stop: stats requests %d -> %d", stoppedAt, got)
+	}
+	if err := s.StartLifecycle(context.Background(), 10*time.Millisecond, 8<<20, 1<<10); err == nil {
+		t.Fatal("StartLifecycle after Stop succeeded, want error")
+	}
+}
+
+func TestV2MetaSchedulerLifecycleLeaderOnly(t *testing.T) {
+	addr, fake := startFakeKV(t, "", "")
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 1},
+	})
+	// Replicated mode with no Raft node: requireLeader reports Unavailable,
+	// exactly like a follower that has not discovered a leader yet.
+	s.cfg.Replicated = true
+	t.Cleanup(func() { _ = s.Stop() })
+
+	if err := s.StartLifecycle(context.Background(), 10*time.Millisecond, 8<<20, 1<<10); err != nil {
+		t.Fatalf("StartLifecycle: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if got := len(fake.statsRequests()); got != 0 {
+		t.Fatalf("non-leader lifecycle loop made %d RangeStats calls, want 0", got)
+	}
+	if rows := snapshotByID(t, s); len(rows) != 1 || rows[1].Version != 1 {
+		t.Fatalf("non-leader lifecycle loop changed the range map: %+v", rows)
+	}
+}
