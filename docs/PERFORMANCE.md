@@ -51,6 +51,8 @@ Raft-лог): **sequential ~11.6 мс, parallel ~1.8 мс/op (~5.5k tx/s)**.
    PostgreSQL на одном узле не платит за консенсус.
 2. **Один fsync на транзакцию** после отказа от Pebble SyncWrites; durability
    state machine обеспечивается реплеем Raft-лога. Snapshot fsync'ится.
+   Вернуть отдельный fsync можно через `kvserver.Config.SyncStateMachine=true`
+   (медленнее, но state machine durable независимо от лога).
 3. **gRPC/RPC overhead**: TSO (батчится), CommitSingle, range lookup.
 4. **Apply loop / group commit window**: 1 мс batching window добавляет
    latency одиночному клиенту.
