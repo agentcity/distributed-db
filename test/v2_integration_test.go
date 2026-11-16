@@ -449,24 +449,29 @@ func TestV2SnapshotCatchUp(t *testing.T) {
 
 	put := func(key, value string) uint64 {
 		t.Helper()
-		r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
-		if err != nil {
-			t.Fatalf("ts: %v", err)
+		for attempt := 0; attempt < 10; attempt++ {
+			r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
+			if err != nil {
+				t.Fatalf("ts: %v", err)
+			}
+			pr, err := leader.client.Prewrite(ctx, &pbv2.PrewriteRequest{
+				StartTs: r.Start, Primary: []byte(key),
+				Mutations: []*pbv2.Mutation{{Key: []byte(key), Value: []byte(value)}},
+			})
+			if err == nil && pr.GetSuccess() {
+				cr, cerr := leader.client.Commit(ctx, &pbv2.CommitRequest{
+					StartTs: r.Start, CommitTs: r.Start + 1, Keys: [][]byte{[]byte(key)},
+				})
+				if cerr == nil && cr.GetSuccess() {
+					return r.Start + 1
+				}
+			}
+			// A stopped follower shrinks the quorum window; rediscover the
+			// current leader instead of pinning the pre-fault node.
+			leader = v2WaitLeader(t, nodes)
 		}
-		pr, err := leader.client.Prewrite(ctx, &pbv2.PrewriteRequest{
-			StartTs: r.Start, Primary: []byte(key),
-			Mutations: []*pbv2.Mutation{{Key: []byte(key), Value: []byte(value)}},
-		})
-		if err != nil || !pr.GetSuccess() {
-			t.Fatalf("prewrite %s: %v %+v", key, err, pr)
-		}
-		cr, err := leader.client.Commit(ctx, &pbv2.CommitRequest{
-			StartTs: r.Start, CommitTs: r.Start + 1, Keys: [][]byte{[]byte(key)},
-		})
-		if err != nil || !cr.GetSuccess() {
-			t.Fatalf("commit %s: %v %+v", key, err, cr)
-		}
-		return r.Start + 1
+		t.Fatalf("put %s failed after leader rediscovery", key)
+		return 0
 	}
 	commitTS := put("snap-key", "snap-value")
 	put("snap-key2", "snap-value2")
