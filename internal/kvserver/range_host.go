@@ -16,10 +16,10 @@ import (
 // other Raft members of the range (their RaftAddr); it does not include the
 // local node.
 type RangeConfig struct {
-	ID    uint64
-	Start []byte
-	End   []byte
-	Peers []string
+	ID    uint64   `json:"id"`
+	Start []byte   `json:"start,omitempty"`
+	End   []byte   `json:"end,omitempty"`
+	Peers []string `json:"peers,omitempty"`
 }
 
 var (

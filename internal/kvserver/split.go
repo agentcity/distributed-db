@@ -169,4 +169,7 @@ func (s *Server) rebuildRangeOrder() {
 		g := s.groups[id]
 		s.cfg.Ranges = append(s.cfg.Ranges, g.cfg)
 	}
+	if err := s.persistRangesLocked(); err != nil {
+		s.log.Error("persist range map failed", "error", err)
+	}
 }

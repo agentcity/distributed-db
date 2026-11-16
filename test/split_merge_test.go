@@ -476,3 +476,119 @@ func errString(err error) string {
 	}
 	return err.Error()
 }
+
+func TestV2RangeHostSplitPersist(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr := v2FreeAddr(t)
+	addr := v2FreeAddr(t)
+	dir := t.TempDir()
+	ms, err := metaserver.New(metaserver.Config{
+		Addr: metaAddr,
+		Ranges: []meta.Range{{
+			ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 1,
+		}},
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+
+	cfg := kvserver.Config{
+		ID: addr, RaftAddr: addr, DataDir: dir,
+		Ranges:             []kvserver.RangeConfig{{ID: 1, Start: nil, End: nil}},
+		ElectionTimeoutMin: 80 * time.Millisecond,
+		ElectionTimeoutMax: 160 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		CacheSize:          8 << 20, MemTableSize: 4 << 20,
+		Logger: v2Logger(),
+	}
+	srv, err := kvserver.New(cfg)
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !waitGroupLeader(t, srv, 1) {
+		t.Fatal("range 1 did not become leader")
+	}
+	client, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	for _, kv := range [][2]string{{"a", "left"}, {"z", "right"}} {
+		txn, err := client.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		txn.Set([]byte(kv[0]), []byte(kv[1]))
+		if err := txn.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	ranges, err := srv.SplitRange(ctx, 1, []byte("m"), 2)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	metaRanges := make([]meta.Range, 0, len(ranges))
+	for _, r := range ranges {
+		metaRanges = append(metaRanges, meta.Range{
+			ID: r.ID, Start: r.Start, End: r.End,
+			Replicas: []string{addr}, Version: 1,
+		})
+	}
+	if err := ms.ApplyRanges(ctx, metaRanges); err != nil {
+		t.Fatalf("meta ranges: %v", err)
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := srv.Stop(sctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	cancel()
+
+	// Restart with the original single-range config; ranges.json must win.
+	restarted, err := kvserver.New(cfg)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if err := restarted.Start(ctx); err != nil {
+		t.Fatalf("restart start: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = restarted.Stop(sctx)
+	})
+	if got := restarted.Groups(); len(got) != 2 {
+		t.Fatalf("restored groups = %v, want 2", got)
+	}
+	if !waitGroupLeader(t, restarted, 1) || !waitGroupLeader(t, restarted, 2) {
+		t.Fatal("restored ranges did not elect leaders")
+	}
+	client2, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("client2: %v", err)
+	}
+	t.Cleanup(func() { _ = client2.Close() })
+	get := func(key, want string) {
+		t.Helper()
+		txn, err := client2.Begin(ctx)
+		if err != nil {
+			t.Fatalf("read begin: %v", err)
+		}
+		got, err := txn.Get(ctx, []byte(key))
+		if err != nil || string(got) != want {
+			t.Fatalf("get %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	get("a", "left")
+	get("z", "right")
+}

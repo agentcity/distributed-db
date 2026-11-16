@@ -36,7 +36,8 @@ M2.3 split/merge были host-local: данные и новая Raft-групп
 - [x] meta обновляется после всех реплик.
 - [x] e2e 3 узла: чтение a/m/z и запись zz в range 2.
 - [x] Распределённый merge.
-- [ ] Epoch/fencing и persist range map RangeHost.
+- [ ] Epoch/fencing.
+- [x] Persist range map RangeHost между рестартами.
 
 ## Ссылки
 

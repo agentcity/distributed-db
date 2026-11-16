@@ -2,11 +2,13 @@ package kvserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -93,6 +95,11 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 100 * time.Millisecond
+	}
+	if persisted, err := loadPersistedRanges(cfg.DataDir); err != nil {
+		return nil, err
+	} else if len(persisted) > 0 {
+		cfg.Ranges = persisted
 	}
 	ranges, err := normalizeRanges(cfg)
 	if err != nil {
@@ -252,4 +259,37 @@ func (s *Server) Snapshot() (raft.Snapshot, error) {
 		return raft.Snapshot{}, fmt.Errorf("%w: no default range", ErrRangeNotFound)
 	}
 	return g.node.Snapshot()
+}
+
+// loadPersistedRanges loads the range map written after split/merge. A missing
+// file means "use the static config".
+func loadPersistedRanges(dataDir string) ([]RangeConfig, error) {
+	path := filepath.Join(dataDir, "ranges.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: read range map: %w", err)
+	}
+	var ranges []RangeConfig
+	if err := json.Unmarshal(data, &ranges); err != nil {
+		return nil, fmt.Errorf("kvserver: decode range map: %w", err)
+	}
+	return ranges, nil
+}
+
+// persistRangesLocked writes the current range map atomically. Caller holds
+// hostMu.
+func (s *Server) persistRangesLocked() error {
+	data, err := json.Marshal(s.cfg.Ranges)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(s.cfg.DataDir, "ranges.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
