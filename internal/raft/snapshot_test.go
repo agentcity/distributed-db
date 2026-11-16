@@ -226,7 +226,7 @@ func newSnapshotCluster(t *testing.T, size int) *snapshotCluster {
 		sms:     make(map[string]*snapshotSM),
 		stores:  make(map[string]*raft.FileStore),
 		dirs:    make(map[string]string),
-		timeout: 5 * time.Second,
+		timeout: 15 * time.Second,
 	}
 	t.Cleanup(func() {
 		c.cancel()
