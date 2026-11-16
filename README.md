@@ -96,13 +96,18 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
   `'R'|rangeID|0x00`.
 - Stage 2.2b: потоковый snapshot (NDJSON, батчи) и chunked InstallSnapshot.
 - Stage 3.1: cross-range 2PC (primary-first) в клиенте.
+- Stage 3.2: SQL после split (split-aware ScanRanges, range predicates,
+  CBO/plan cache), extended pgwire, 2PC recovery, Jepsen partitions.
+- Stage 2.3: auto-merge/lifecycle, backup/restore (`cmd/kvbackup`),
+  gzip snapshot compression.
+- Stage 1.3: SLO-метрики (`internal/metrics`, `cmd/metricsrv`), KV interceptor.
 - Замеры на M1 Pro/loopback: 3 узла sequential ~40 мс/транзакция,
   parallel ~28 мс/op (~350 tx/s), Get ~0.15–1 мс; Raft group commit
   ~7.8× throughput на конкурентных proposal’ах.
 
-Пока нет: durable scheduler queue/leader lease; distributed deadlock
-detection; network partitions/clock skew в Jepsen; production TLS/auth;
-SQL planner/extended protocol; backup/restore и rebalancing.
+Пока нет: rebalancing/leader transfer (0028), snapshot resume (0029),
+SQL/pgwire-метрики и встроенный endpoint (0030), durable scheduler
+queue/leader lease, production TLS/auth.
 
 ### SQL P0 поверх KV (experimental)
 

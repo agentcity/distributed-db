@@ -268,10 +268,10 @@ pgwire → parse → bind catalog → logical plan → optimize
 ### M5
 
 - [x] pgwire simple query (psql).
-- [ ] Extended protocol / JDBC / TLS.
-- [ ] Planner: index selection есть, cost-based JOIN order — нет.
+- [x] Extended protocol/prepared statements; TLS/auth — нет.
+- [x] Planner: range predicates, index selection, cost-based join order, plan cache.
 - [x] Hash join + GROUP BY + COUNT/SUM/AVG/MIN/MAX.
-- [ ] Cross-range SQL txn через 2PC; e2e 3 узла (single-range SQL уже есть).
+- [x] Cross-range SQL txn через 2PC; SQL после split (0023).
 
 ### AI
 
