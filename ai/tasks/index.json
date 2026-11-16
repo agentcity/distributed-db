@@ -208,5 +208,11 @@
     "title": "Edge hash cache — production hardening",
     "status": "done",
     "file": "0035-edgehash-hardening.md"
+  },
+  {
+    "id": "0036",
+    "title": "Честная оценка проекта и применимость",
+    "status": "done",
+    "file": "0036-project-assessment.md"
   }
 ]
