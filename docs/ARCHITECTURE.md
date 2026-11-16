@@ -1,4 +1,8 @@
-# Architecture and package contracts
+# Architecture and package contracts (v1)
+
+> Это описание **v1** (координатор + hash-шардинг + один Raft-груп на узел).
+> Текущий v2 (Multi-Raft host, range map, replicated meta/TSO, split/merge,
+> SQL) описан в [ARCHITECTURE-TARGET.md](ARCHITECTURE-TARGET.md) и ADR 0003.
 
 This document is the integration contract between packages. Keep it in sync
 with the code. The project is a sharded, replicated key/value store:
