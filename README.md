@@ -43,6 +43,34 @@ metadata/TSO и smart client; поверх него — SQL-слой. План, 
 [docs/CONTRACTS-V2.md](docs/CONTRACTS-V2.md), решения:
 [docs/adr/](docs/adr/README.md).
 
+### v2: single-range (experimental)
+
+v2 уже умеет одну Raft-группу с MVCC и транзакциями. Отдельный бинарь:
+
+```bash
+go build -o bin/kv2 ./cmd/kv2
+
+# meta/TSO
+./bin/kv2 -mode=meta -addr=:9090
+
+# три узла (в разных терминалах)
+./bin/kv2 -mode=node -id=127.0.0.1:7001 -raft-addr=127.0.0.1:7001 \
+  -data-dir=./data/v2/n1 -peers=127.0.0.1:7002,127.0.0.1:7003
+./bin/kv2 -mode=node -id=127.0.0.1:7002 -raft-addr=127.0.0.1:7002 \
+  -data-dir=./data/v2/n2 -peers=127.0.0.1:7001,127.0.0.1:7003
+./bin/kv2 -mode=node -id=127.0.0.1:7003 -raft-addr=127.0.0.1:7003 \
+  -data-dir=./data/v2/n3 -peers=127.0.0.1:7001,127.0.0.1:7002
+```
+
+Клиент v2 — Go-пакет `internal/v2client`; e2e-проверка:
+
+```bash
+go test -race ./test -run TestV2SingleRangeCluster -v
+```
+
+Пока нет: Multi-Raft по range, InstallSnapshot по сети, бенчмарка на
+реальном сервере. Это следующие шаги 0006/M2.
+
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
 ```bash

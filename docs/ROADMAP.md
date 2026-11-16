@@ -185,3 +185,21 @@ SQL не начинается, пока KV не даёт стабильные т
 - Chaos: kill -9 лидера/фолловера, партиция, медленный диск.
 - Correctness: linearizability checker, snapshot isolation tests, Jepsen.
 - Recovery: snapshot + replay, RTO, целостность после сбоя.
+
+## Статус на 2026-11-16
+
+Сделано (M0 + часть M1):
+
+- storage на Pebble, MVCC/2PC, Raft snapshots/InstallSnapshot, Multi-Raft host,
+  meta/range/TSO, smart client, benchmark harness;
+- single-range v2: gRPC KVService/RaftService, `kv2 node|meta`, клиентский
+  транзакционный SDK;
+- e2e 3 узла: prewrite/commit/get/scan, kill лидера, новая транзакция и
+  клиентский commit после failover.
+
+Осталось до закрытия 0006/M1:
+
+- adapter `internal/multiraft` → `raft.Node` вместо одной группы напрямую;
+- InstallSnapshot в gRPC-транспорте и snapshot catch-up в e2e;
+- benchmark v2 на реальном gRPC (сейчас bench меряет in-memory engine);
+- проверка рестарта узла с применённым MVCC (applied index/snapshot).
