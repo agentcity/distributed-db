@@ -51,9 +51,8 @@ func (s *Store) CheckTxnStatus(key []byte, startTS uint64, now time.Time) (TxnSt
 		age := now.UnixMilli() - int64(lock.startTS>>18)
 		expired := age > int64(lock.ttlMillis)
 		if expired {
-			if err := s.Rollback(keys, lock.startTS); err != nil {
-				return TxnStatus{}, err
-			}
+			// Do not mutate state here: in a replicated group the rollback must
+			// go through Raft. Callers resolve the returned transaction.
 			return TxnStatus{
 				RolledBack: true, LockPrimary: append([]byte(nil), lock.primary...),
 				LockTS: lock.startTS, TTLMillis: lock.ttlMillis, Expired: true, Keys: keys,
@@ -131,6 +130,33 @@ func (s *Store) writeForStart(key []byte, startTS uint64) (uint64, byte, bool, e
 		return 0, 0, false, err
 	}
 	return 0, 0, false, nil
+}
+
+// ExpiredLockKeys returns the user keys whose lock TTL has elapsed at now.
+// It does not mutate state; the caller must resolve the transaction through
+// Raft.
+func (s *Store) ExpiredLockKeys(now time.Time) ([][]byte, error) {
+	it, err := s.engine.NewIter([]byte{lockCF}, []byte{lockCF + 1})
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var keys [][]byte
+	for it.Valid() {
+		rec, err := decodeLock(it.Value())
+		if err != nil {
+			return nil, err
+		}
+		age := now.UnixMilli() - int64(rec.startTS>>18)
+		if age > int64(rec.ttlMillis) {
+			keys = append(keys, append([]byte(nil), it.Key()[1:]...))
+		}
+		it.Next()
+	}
+	if err := it.Error(); err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 // ResolveLock commits (commitTS > 0) or rolls back (commitTS == 0) all keys of

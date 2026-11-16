@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"distributed-db/internal/pb/v2"
@@ -64,6 +65,9 @@ type Server struct {
 
 	// hostMu protects groups/groupIDs/defaultID/cfg.Ranges after Start.
 	hostMu sync.RWMutex
+
+	resolverCancel context.CancelFunc
+	locksResolved  atomic.Uint64
 
 	mu       sync.Mutex
 	started  bool
@@ -175,6 +179,11 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	resolverCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.resolverCancel = cancel
+	s.mu.Unlock()
+	go s.resolveLocksLoop(resolverCtx)
 	s.log.Info("kvserver started",
 		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID)
 	return nil
@@ -196,9 +205,13 @@ func (s *Server) stop(ctx context.Context) error {
 		return nil
 	}
 	s.stopped = true
+	cancel := s.resolverCancel
 	grpcSrv := s.grpcSrv
 	lis := s.lis
 	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -229,6 +242,49 @@ func (s *Server) stop(ctx context.Context) error {
 	}
 	s.log.Info("kvserver stopped")
 	return errors.Join(errs...)
+}
+
+// ResolvedLocks reports how many abandoned locks the background resolver has
+// rolled back. It is useful for tests and metrics.
+func (s *Server) ResolvedLocks() uint64 { return s.locksResolved.Load() }
+
+func (s *Server) resolveLocksLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	s.resolveExpiredLocks(time.Now())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.resolveExpiredLocks(now)
+		}
+	}
+}
+
+func (s *Server) resolveExpiredLocks(now time.Time) {
+	for _, id := range s.Groups() {
+		g, err := s.groupForID(id)
+		if err != nil || !g.node.IsLeader() || g.isFrozen() {
+			continue
+		}
+		keys, err := g.store.ExpiredLockKeys(now)
+		if err != nil {
+			s.log.Warn("scan expired locks", "range", id, "error", err)
+			continue
+		}
+		for _, key := range keys {
+			st, err := g.store.CheckTxnStatus(key, 0, now)
+			if err != nil || (!st.Committed && !st.RolledBack) {
+				continue
+			}
+			if err := g.resolveLock(context.Background(), st, key); err != nil {
+				s.log.Debug("resolve expired lock", "range", id, "error", err)
+				continue
+			}
+			s.locksResolved.Add(1)
+		}
+	}
 }
 
 // Addr returns the bound gRPC address.

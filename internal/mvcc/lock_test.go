@@ -73,6 +73,9 @@ func TestCheckTxnStatusExpiredRollsBack(t *testing.T) {
 	if !st.RolledBack || !st.Expired {
 		t.Fatalf("status = %+v, want expired rolled back", st)
 	}
+	if err := store.ResolveLock(st.Keys, st.LockTS, 0); err != nil {
+		t.Fatalf("ResolveLock expired: %v", err)
+	}
 	if _, err := store.Get([]byte("k"), start+1); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("Get after expiry = %v, want ErrKeyNotFound", err)
 	}
