@@ -11,7 +11,8 @@
 > `-durability=sync` (fsync state machine); `fast` — opt-in. Это ещё
 > **не production-СУБД**: gRPC/meta TLS не интегрирован, PITR и joint
 > consensus только в ADR, SLO p99/1 ТБ не подтверждены.
-> Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
+> Практическое руководство (терминал, curl, SQL, psql): [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
+Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 Что реализовать до production: [docs/PRODUCTION-PLAN.md](docs/PRODUCTION-PLAN.md).
 Гейты и путь: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 Сравнение скорости с PostgreSQL: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
