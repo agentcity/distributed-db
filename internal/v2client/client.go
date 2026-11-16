@@ -35,8 +35,8 @@ var (
 
 const (
 	leaderTTL      = time.Second
-	maxAttempts    = 4
-	backoff        = 20 * time.Millisecond
+	maxAttempts    = 8
+	backoff        = 50 * time.Millisecond
 	defaultTimeout = 5 * time.Second
 )
 

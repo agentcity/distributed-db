@@ -476,7 +476,7 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 		if err != nil {
 			return &pbv2.SplitRangeResponse{Leader: leader, Error: "encode"}, nil
 		}
-		if _, err := g.node.Propose(ctx, model.Entry{Type: model.CommandSplitPrepare, Value: payload}); err != nil {
+		if err := proposeWhileLeader(ctx, g, model.Entry{Type: model.CommandSplitPrepare, Value: payload}); err != nil {
 			return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
 		}
 	}
@@ -532,18 +532,24 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "encode"}, nil
 	}
 	if left.node.IsLeader() {
-		if _, err := left.node.Propose(ctx, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
+		if err := proposeWhileLeader(ctx, left, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
 			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 		}
 	}
 	if right.node.IsLeader() {
-		if _, err := right.node.Propose(ctx, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
+		if err := proposeWhileLeader(ctx, right, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
 			return &pbv2.MergeRangesResponse{Leader: right.node.Leader(), Error: opError(err)}, nil
 		}
 	}
 
 	deadline := time.Now().Add(30 * time.Second)
+	lastTry := time.Time{}
 	for {
+		if time.Since(lastTry) > 250*time.Millisecond {
+			tryPrepare(ctx, left, model.Entry{Type: model.CommandMergePrepare, Value: payload})
+			tryPrepare(ctx, right, model.Entry{Type: model.CommandMergePrepare, Value: payload})
+			lastTry = time.Now()
+		}
 		ll, lr := left.sm.mergePrepared()
 		rl, rr := right.sm.mergePrepared()
 		if ll == left.cfg.ID && lr == right.cfg.ID && rl == left.cfg.ID && rr == right.cfg.ID {
@@ -712,6 +718,39 @@ func opError(err error) string {
 		return "timeout"
 	default:
 		return "internal error"
+	}
+}
+
+// tryPrepare proposes a prepare command once if this node currently leads the
+// group. It is used by the wait loop to recover from leadership changes.
+func tryPrepare(ctx context.Context, g *rangeGroup, entry model.Entry) {
+	if !g.node.IsLeader() {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	_, _ = g.node.Propose(pctx, entry)
+}
+
+// proposeWhileLeader retries a prepare proposal while this node is the leader.
+// If leadership moves, it returns nil and lets the new leader's RPC propose.
+func proposeWhileLeader(ctx context.Context, g *rangeGroup, entry model.Entry) error {
+	for {
+		if !g.node.IsLeader() {
+			return nil
+		}
+		_, err := g.node.Propose(ctx, entry)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, raft.ErrNotLeader) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 

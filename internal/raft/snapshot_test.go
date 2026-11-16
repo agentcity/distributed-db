@@ -207,9 +207,9 @@ func newSnapshotCluster(t *testing.T, size int) *snapshotCluster {
 	// Realistic timers: fsync plus -race can deschedule a follower long enough
 	// for a 40ms lease to expire.
 	const (
-		electionMin = 120 * time.Millisecond
-		electionMax = 250 * time.Millisecond
-		heartbeat   = 25 * time.Millisecond
+		electionMin = 500 * time.Millisecond
+		electionMax = 1 * time.Second
+		heartbeat   = 100 * time.Millisecond
 	)
 	ids := make([]string, size)
 	for i := range ids {

@@ -378,9 +378,9 @@ func TestV2DistributedMerge(t *testing.T) {
 				{ID: 1, Start: nil, End: []byte("m"), Peers: peers},
 				{ID: 2, Start: []byte("m"), End: nil, Peers: peers},
 			},
-			ElectionTimeoutMin: 120 * time.Millisecond,
-			ElectionTimeoutMax: 240 * time.Millisecond,
-			HeartbeatInterval:  25 * time.Millisecond,
+			ElectionTimeoutMin: 500 * time.Millisecond,
+			ElectionTimeoutMax: 1 * time.Second,
+			HeartbeatInterval:  100 * time.Millisecond,
 			CacheSize:          8 << 20, MemTableSize: 4 << 20,
 			Logger: v2Logger(),
 		}
