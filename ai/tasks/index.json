@@ -20,13 +20,19 @@
   {
     "id": "0004",
     "title": "KV v2 — storage, MVCC, Multi-Raft, metadata, client, benchmarks",
-    "status": "in_progress",
+    "status": "done",
     "file": "0004-kv-v2-foundation.md"
   },
   {
     "id": "0005",
     "title": "SQL-слой поверх транзакционного KV — ADR",
-    "status": "in_progress",
+    "status": "done",
     "file": "0005-sql-layer-adr.md"
+  },
+  {
+    "id": "0006",
+    "title": "M1 — single-range KV server и end-to-end",
+    "status": "pending",
+    "file": "0006-single-range-kv-server.md"
   }
 ]

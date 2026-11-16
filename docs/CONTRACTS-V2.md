@@ -207,11 +207,13 @@ Requirements:
 - Initial cluster has one range `[nil,nil)` with ID 1.
 - Ranges sorted by `Start`; no overlaps/gaps; `RangeForKey` handles nil
   boundaries and `[]byte` lexicographic order.
-- `Split` validates `at` is strictly inside the range, returns two ranges with
-  fresh IDs and version bump; `Merge` requires adjacent ranges and same
-  replicas.
+- `Split` validates `at` is strictly inside the range; the left range keeps the
+  original ID, the right range gets a fresh ID (from `AllocID`, which starts at
+  2 so ID 1 is never reissued); both get a version bump. `Merge` requires
+  adjacent ranges and same replicas.
 - TSO: physical milliseconds << 18 | logical; monotonic under concurrency;
-  `AllocTS(n)` reserves n consecutive timestamps and returns start+count.
+  `AllocTS(n)` reserves n consecutive timestamps and returns `(start, n)`;
+  `n <= 0` returns `(0, 0)`.
 - Heartbeat records last-seen; no scheduler yet.
 - Tests: lookup, split/merge, invalid boundaries, concurrent TSO monotonic,
   AllocID uniqueness, snapshot isolation of returned slices.
