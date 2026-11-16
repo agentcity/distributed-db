@@ -9,7 +9,8 @@
 > Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, dynamic
 > membership, chunked snapshots, SQL P0. Это ещё **не production-СУБД**:
 > нет TLS/auth, PITR, joint consensus и подтверждённого SLO.
-> Продуктовая оценка и путь к production: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
+> Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
+Путь к production: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 Сравнение скорости с PostgreSQL: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd, mobile): [docs/EDGE-HASH-CACHE.md](docs/EDGE-HASH-CACHE.md).
 
@@ -44,6 +45,21 @@ Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd, mobile): [docs/EDGE-HASH-
 Сейчас проект пригоден для **внутренних прототипов, dev/test, учебных задач и
 private single-tenant metadata store**, но не для публичного DBaaS, регулируемых
 данных и больших OLAP-нагрузок.
+
+Отдельный трек — **edge hash cache** (`cmd/edgehash`): read-only membership
+(Bloom + Merkle + Ed25519) для дедупликации/blocklists. Это самая готовая
+часть, но mobile SDK — scaffold, а CDN — только headers/layout.
+
+Коротко, где можно использовать:
+
+| Сценарий | Вердикт |
+|---|---|
+| Учебный стенд Raft/MVCC/2PC | да |
+| Dev/test/CI с failover и split/merge | да |
+| Внутренний metadata/config store, single-region, low QPS | условно, после P0 |
+| SQL-песочница на 10⁴–10⁵ строк | да |
+| Edge membership: Bloom/Merkle, private CDN | да, серверная часть |
+| Публичный DBaaS, regulated, OLAP, замена PostgreSQL | нет |
 
 Что уже есть: Raft group commit, Multi-Raft, MVCC/Percolator, cross-range 2PC,
 split/merge, replicated meta/TSO, learner→voter membership, leader transfer,
@@ -126,9 +142,10 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 - Stage 2.5: snapshot resume по `next_offset`.
 - Stage 2.6: Add/Remove replica (learner → voter), meta orchestration,
   membership persist; single-server change, без joint consensus.
-- Замеры на M1 Pro/loopback: 3 узла sequential ~40 мс/транзакция,
-  parallel ~28 мс/op (~350 tx/s), Get ~0.15–1 мс; Raft group commit
-  ~7.8× throughput на конкурентных proposal’ах.
+- Замеры на M1 Pro/loopback: 3 узла single txn ~11.6 мс (~86 tx/s),
+  parallel ~1.8 мс/op (~5.5k tx/s), batch 256 ~0.15 мс/txn
+  (~6.6–6.9k tx/s); PostgreSQL 13 рядом — ~6.8k tx/s на 10 клиентах.
+  Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
 
 Пока нет: joint consensus/decommission, per-chunk CRC, durable scheduler
 queue/leader lease, production TLS/auth, SLO p99 прогон, расширенный SQL
@@ -155,9 +172,10 @@ curl -s -X POST localhost:8080/v1/sql \
   -d '{"sql":"SELECT * FROM users"}'
 ```
 
-Есть минимальный pgwire (`cmd/pgsrv`, psql simple query). P0 не умеет
-JOIN более двух таблиц, LEFT/RIGHT JOIN и extended protocol; это следующие
-фазы ADR 0004. E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
+Есть pgwire simple + extended (`cmd/pgsrv`, psql). P0 не умеет `AND/OR`,
+JOIN более двух таблиц, LEFT/RIGHT JOIN, NULL/DECIMAL/JSON/FK, online DDL и
+pg_catalog/JDBC; это следующие фазы ADR 0004.
+E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
