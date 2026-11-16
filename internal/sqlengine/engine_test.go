@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"sort"
 	"testing"
 )
@@ -268,6 +269,169 @@ func TestSQLAggregates(t *testing.T) {
 		}
 		if len(res.Rows) != 1 || len(res.Rows[0]) != 1 || res.Rows[0][0] != tc.want {
 			t.Fatalf("%q = %+v, want %v", tc.sql, res.Rows, tc.want)
+		}
+	}
+}
+
+func TestSQLGroupBy(t *testing.T) {
+	e := New(newFakeClient())
+	ctx := context.Background()
+
+	exec(t, e, "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT)")
+	exec(t, e, "INSERT INTO sales VALUES (1, 'eu', 10)")
+	exec(t, e, "INSERT INTO sales VALUES (2, 'us', 20)")
+	exec(t, e, "INSERT INTO sales VALUES (3, 'eu', 30)")
+	exec(t, e, "INSERT INTO sales VALUES (4, 'us', 40)")
+	exec(t, e, "INSERT INTO sales VALUES (5, 'ap', 5)")
+
+	cases := []struct {
+		name string
+		sql  string
+		cols []string
+		rows [][]any
+	}{
+		{
+			name: "text group count star",
+			sql:  "SELECT COUNT(*) FROM sales GROUP BY region",
+			cols: []string{"region", "count"},
+			rows: [][]any{{"ap", int64(1)}, {"eu", int64(2)}, {"us", int64(2)}},
+		},
+		{
+			name: "text group count column",
+			sql:  "SELECT COUNT(amount) FROM sales GROUP BY region",
+			cols: []string{"region", "count"},
+			rows: [][]any{{"ap", int64(1)}, {"eu", int64(2)}, {"us", int64(2)}},
+		},
+		{
+			name: "text group sum",
+			sql:  "SELECT SUM(amount) FROM sales GROUP BY region",
+			cols: []string{"region", "sum"},
+			rows: [][]any{{"ap", int64(5)}, {"eu", int64(40)}, {"us", int64(60)}},
+		},
+		{
+			name: "text group avg",
+			sql:  "SELECT AVG(amount) FROM sales GROUP BY region",
+			cols: []string{"region", "avg"},
+			rows: [][]any{{"ap", int64(5)}, {"eu", int64(20)}, {"us", int64(30)}},
+		},
+		{
+			name: "text group min",
+			sql:  "SELECT MIN(amount) FROM sales GROUP BY region",
+			cols: []string{"region", "min"},
+			rows: [][]any{{"ap", int64(5)}, {"eu", int64(10)}, {"us", int64(20)}},
+		},
+		{
+			name: "text group max",
+			sql:  "SELECT MAX(amount) FROM sales GROUP BY region",
+			cols: []string{"region", "max"},
+			rows: [][]any{{"ap", int64(5)}, {"eu", int64(30)}, {"us", int64(40)}},
+		},
+		{
+			name: "where filters before grouping",
+			sql:  "SELECT COUNT(*) FROM sales WHERE id = 3 GROUP BY region",
+			cols: []string{"region", "count"},
+			rows: [][]any{{"eu", int64(1)}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := e.Execute(ctx, tc.sql)
+			if err != nil {
+				t.Fatalf("%q: %v", tc.sql, err)
+			}
+			if !reflect.DeepEqual(res.Columns, tc.cols) {
+				t.Fatalf("%q columns = %v, want %v", tc.sql, res.Columns, tc.cols)
+			}
+			if !reflect.DeepEqual(res.Rows, tc.rows) {
+				t.Fatalf("%q rows = %v, want %v", tc.sql, res.Rows, tc.rows)
+			}
+		})
+	}
+
+	exec(t, e, "CREATE TABLE metrics (id INT PRIMARY KEY, bucket INT, value INT)")
+	exec(t, e, "INSERT INTO metrics VALUES (1, 2, 100)")
+	exec(t, e, "INSERT INTO metrics VALUES (2, 1, 7)")
+	exec(t, e, "INSERT INTO metrics VALUES (3, 2, 5)")
+	exec(t, e, "INSERT INTO metrics VALUES (4, 1, 3)")
+
+	intCases := []struct {
+		name string
+		sql  string
+		cols []string
+		rows [][]any
+	}{
+		{
+			name: "int group count",
+			sql:  "SELECT COUNT(*) FROM metrics GROUP BY bucket",
+			cols: []string{"bucket", "count"},
+			rows: [][]any{{int64(1), int64(2)}, {int64(2), int64(2)}},
+		},
+		{
+			name: "int group sum sorted by key",
+			sql:  "SELECT SUM(value) FROM metrics GROUP BY bucket",
+			cols: []string{"bucket", "sum"},
+			rows: [][]any{{int64(1), int64(10)}, {int64(2), int64(105)}},
+		},
+		{
+			name: "int group avg",
+			sql:  "SELECT AVG(value) FROM metrics GROUP BY bucket",
+			cols: []string{"bucket", "avg"},
+			rows: [][]any{{int64(1), int64(5)}, {int64(2), int64(52)}},
+		},
+		{
+			name: "int group min",
+			sql:  "SELECT MIN(value) FROM metrics GROUP BY bucket",
+			cols: []string{"bucket", "min"},
+			rows: [][]any{{int64(1), int64(3)}, {int64(2), int64(5)}},
+		},
+		{
+			name: "int group max",
+			sql:  "SELECT MAX(value) FROM metrics GROUP BY bucket",
+			cols: []string{"bucket", "max"},
+			rows: [][]any{{int64(1), int64(7)}, {int64(2), int64(100)}},
+		},
+	}
+	for _, tc := range intCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := e.Execute(ctx, tc.sql)
+			if err != nil {
+				t.Fatalf("%q: %v", tc.sql, err)
+			}
+			if !reflect.DeepEqual(res.Columns, tc.cols) {
+				t.Fatalf("%q columns = %v, want %v", tc.sql, res.Columns, tc.cols)
+			}
+			if !reflect.DeepEqual(res.Rows, tc.rows) {
+				t.Fatalf("%q rows = %v, want %v", tc.sql, res.Rows, tc.rows)
+			}
+		})
+	}
+
+	exec(t, e, "CREATE TABLE empty_sales (id INT PRIMARY KEY, region TEXT, amount INT)")
+	for _, sql := range []string{
+		"SELECT COUNT(*) FROM empty_sales GROUP BY region",
+		"SELECT SUM(amount) FROM empty_sales GROUP BY region",
+		"SELECT MIN(region) FROM empty_sales GROUP BY region",
+	} {
+		res, err := e.Execute(ctx, sql)
+		if err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
+		if len(res.Columns) != 2 || len(res.Rows) != 0 {
+			t.Fatalf("%q = %+v, want two columns and no rows", sql, res)
+		}
+	}
+
+	errorCases := []struct {
+		sql string
+		err error
+	}{
+		{"SELECT COUNT(*) FROM sales GROUP BY nope", ErrBadColumn},
+		{"SELECT SUM(nope) FROM sales GROUP BY region", ErrBadColumn},
+		{"SELECT SUM(region) FROM sales GROUP BY region", ErrBadColumn},
+	}
+	for _, tc := range errorCases {
+		if _, err := e.Execute(ctx, tc.sql); !errors.Is(err, tc.err) {
+			t.Errorf("%q: err = %v, want %v", tc.sql, err, tc.err)
 		}
 	}
 }

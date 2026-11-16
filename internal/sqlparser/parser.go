@@ -347,7 +347,8 @@ func (p *parser) tryParseAggregate() (*Aggregate, bool, error) {
 	return agg, true, nil
 }
 
-// parseSelect parses SELECT *|col[, ...] FROM name [WHERE ...] [LIMIT n].
+// parseSelect parses SELECT *|col[, ...] FROM name [WHERE ...]
+// [GROUP BY col] [LIMIT n]. GROUP BY is only valid with an aggregate.
 func (p *parser) parseSelect() (Statement, error) {
 	sel := &Select{}
 	if p.peek().kind == tokenStar {
@@ -387,6 +388,23 @@ func (p *parser) parseSelect() (Statement, error) {
 			return nil, err
 		}
 		sel.Where = cond
+	}
+	if groupTok := p.peek(); isKeyword(groupTok, "GROUP") {
+		if sel.Aggregate == nil {
+			return nil, p.errorf(groupTok.pos, "GROUP BY requires an aggregate")
+		}
+		p.next()
+		if err := p.expectKeyword("BY", " after GROUP"); err != nil {
+			return nil, err
+		}
+		col, err := p.expectIdent("column name in GROUP BY")
+		if err != nil {
+			return nil, err
+		}
+		sel.GroupBy = col.text
+		if p.peek().kind == tokenComma {
+			return nil, p.errorf(p.peek().pos, "GROUP BY supports exactly one column")
+		}
 	}
 	if p.matchKeyword("LIMIT") {
 		limit, err := p.parseLimit()

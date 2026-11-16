@@ -450,3 +450,47 @@ func TestParseAggregates(t *testing.T) {
 		t.Fatal("SUM(*) accepted")
 	}
 }
+
+func TestParseGroupBy(t *testing.T) {
+	valid := []struct {
+		sql   string
+		group string
+	}{
+		{"SELECT COUNT(*) FROM users GROUP BY city", "city"},
+		{"SELECT sum(amount) FROM orders WHERE id = 1 GROUP BY region", "region"},
+		{"SELECT AVG(amount) FROM orders WHERE id = 1 GROUP BY region LIMIT 3", "region"},
+	}
+	for _, tc := range valid {
+		stmt, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.sql, err)
+		}
+		sel, ok := stmt.(*Select)
+		if !ok || sel.Aggregate == nil {
+			t.Fatalf("%q: aggregate not parsed: %#v", tc.sql, stmt)
+		}
+		if sel.GroupBy != tc.group {
+			t.Fatalf("%q: GroupBy = %q, want %q", tc.sql, sel.GroupBy, tc.group)
+		}
+	}
+
+	invalid := []string{
+		"SELECT id FROM users GROUP BY id",
+		"SELECT * FROM users GROUP BY city",
+		"SELECT COUNT(*) FROM users GROUP BY city, region",
+		"SELECT COUNT(*) FROM users GROUP BY",
+		"SELECT COUNT(*) FROM users GROUP BY 1",
+		"SELECT COUNT(*) FROM users GROUP city",
+		"SELECT COUNT(*) FROM users GROUP BY city WHERE id = 1",
+	}
+	for _, sql := range invalid {
+		stmt, err := Parse(sql)
+		if err == nil {
+			t.Fatalf("Parse(%q) = %#v, want error", sql, stmt)
+		}
+		var pe *ParseError
+		if !errors.As(err, &pe) {
+			t.Fatalf("Parse(%q) error type = %T, want *ParseError", sql, err)
+		}
+	}
+}

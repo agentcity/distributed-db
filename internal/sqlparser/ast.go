@@ -67,6 +67,7 @@ type Select struct {
 	Columns   []string // empty or ["*"] means all columns
 	Aggregate *Aggregate
 	Where     *Condition
+	GroupBy   string // empty means no grouping
 	Limit     int
 }
 

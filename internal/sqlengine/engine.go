@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"distributed-db/internal/sqlparser"
@@ -384,6 +385,9 @@ func (e *Engine) selectRows(ctx context.Context, tx Txn, s sqlparser.Select) (*R
 }
 
 func (e *Engine) aggregate(ctx context.Context, tx Txn, schema *Schema, s sqlparser.Select) (*Result, error) {
+	if s.GroupBy != "" {
+		return e.aggregateGroups(ctx, tx, schema, s)
+	}
 	rows, err := e.readRows(ctx, tx, schema, s.Where, 0)
 	if err != nil {
 		return nil, err
@@ -440,6 +444,125 @@ func (e *Engine) aggregate(ctx context.Context, tx Txn, schema *Schema, s sqlpar
 			}
 		}
 		return &Result{Columns: []string{name}, Rows: [][]any{{best}}}, nil
+	default:
+		return nil, fmt.Errorf("%w: aggregate %s", ErrUnsupported, fn)
+	}
+}
+
+// aggregateGroups executes an aggregate with GROUP BY: one output row per
+// distinct group key, sorted by that key.
+func (e *Engine) aggregateGroups(ctx context.Context, tx Txn, schema *Schema, s sqlparser.Select) (*Result, error) {
+	gi, ok := columnIndex(schema, strings.ToLower(s.GroupBy))
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown group column %q", ErrBadColumn, s.GroupBy)
+	}
+	groupCol := schema.Columns[gi]
+
+	fn := strings.ToUpper(s.Aggregate.Func)
+	name := strings.ToLower(fn)
+	var aggCol Column
+	if s.Aggregate.Star {
+		if fn != "COUNT" {
+			return nil, fmt.Errorf("%w: %s(*)", ErrUnsupported, fn)
+		}
+	} else {
+		ai, ok := columnIndex(schema, strings.ToLower(s.Aggregate.Column))
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown column %q", ErrBadColumn, s.Aggregate.Column)
+		}
+		aggCol = schema.Columns[ai]
+		if (fn == "SUM" || fn == "AVG") && aggCol.Type != "INT" {
+			return nil, fmt.Errorf("%w: %s requires INT", ErrBadColumn, fn)
+		}
+		switch fn {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		default:
+			return nil, fmt.Errorf("%w: aggregate %s", ErrUnsupported, fn)
+		}
+	}
+
+	rows, err := e.readRows(ctx, tx, schema, s.Where, 0)
+	if err != nil {
+		return nil, err
+	}
+	cols := []string{groupCol.Name, name}
+	if len(rows) == 0 {
+		return &Result{Columns: cols, Rows: [][]any{}}, nil
+	}
+
+	type bucket struct {
+		key  any
+		rows []map[string]any
+	}
+	buckets := make([]bucket, 0)
+	byKey := make(map[any]int)
+	for _, row := range rows {
+		lit, err := anyToLiteral(groupCol, row[groupCol.Name])
+		if err != nil {
+			return nil, err
+		}
+		key := lit.AsAny()
+		pos, ok := byKey[key]
+		if !ok {
+			pos = len(buckets)
+			byKey[key] = pos
+			buckets = append(buckets, bucket{key: key})
+		}
+		buckets[pos].rows = append(buckets[pos].rows, row)
+	}
+	sort.Slice(buckets, func(i, j int) bool {
+		if groupCol.Type == "INT" {
+			return buckets[i].key.(int64) < buckets[j].key.(int64)
+		}
+		return buckets[i].key.(string) < buckets[j].key.(string)
+	})
+
+	out := make([][]any, 0, len(buckets))
+	for _, b := range buckets {
+		v, err := aggregateGroupValue(fn, aggCol, b.rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, []any{b.key, v})
+	}
+	return &Result{Columns: cols, Rows: out}, nil
+}
+
+// aggregateGroupValue computes one aggregate over the rows of a single group.
+// Every group has at least one row.
+func aggregateGroupValue(fn string, col Column, rows []map[string]any) (any, error) {
+	switch fn {
+	case "COUNT":
+		return int64(len(rows)), nil
+	case "SUM", "AVG":
+		var sum int64
+		for _, row := range rows {
+			n, _ := row[col.Name].(int64)
+			sum += n
+		}
+		if fn == "AVG" {
+			return sum / int64(len(rows)), nil
+		}
+		return sum, nil
+	case "MIN", "MAX":
+		if col.Type == "INT" {
+			best, _ := rows[0][col.Name].(int64)
+			for _, row := range rows[1:] {
+				n, _ := row[col.Name].(int64)
+				if (fn == "MIN" && n < best) || (fn == "MAX" && n > best) {
+					best = n
+				}
+			}
+			return best, nil
+		}
+		best, _ := rows[0][col.Name].(string)
+		for _, row := range rows[1:] {
+			v, _ := row[col.Name].(string)
+			if (fn == "MIN" && v < best) || (fn == "MAX" && v > best) {
+				best = v
+			}
+		}
+		return best, nil
 	default:
 		return nil, fmt.Errorf("%w: aggregate %s", ErrUnsupported, fn)
 	}
