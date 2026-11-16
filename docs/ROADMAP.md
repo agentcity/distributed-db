@@ -199,7 +199,9 @@ SQL не начинается, пока KV не даёт стабильные т
 - InstallSnapshot по gRPC, state-machine snapshot MVCC и restart из snapshot;
 - e2e catch-up отставшей реплики через InstallSnapshot;
 - adapter `multiraft` → `raft.Node`;
-- benchmark v2 на реальном gRPC (~20 ms/op для 4-RPC транзакции на одном узле).
+- benchmark v2 на реальном gRPC; Stage 1: group commit, TSO batch,
+  range cache, 1PC; 3 узла ~40 мс/транзакция sequential, ~350 tx/s parallel,
+  Get ~0.15–1 мс.
 
 M1/0006 закрыт. В M2 сделано: `meta.SetRanges`, `GetRange/ListRanges`,
 range identity в Status, клиентский routing по range ID и e2e
@@ -212,6 +214,7 @@ split: prepare через Raft, freeze всех реплик, новая гру�
 meta SetRanges после успеха. Распределённый merge тоже сделан. Epoch/fencing,
 meta scheduler Split/Merge, retry fan-out и partial-merge idempotency готовы;
 range map persist. Остались durable scheduler queue/leader lease.
+Stage 1 speed закрыт: group commit, TSO batch, range cache, 1PC.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.

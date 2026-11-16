@@ -88,12 +88,16 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
   на 3 KV + 3 meta.
 - Lock resolution: `CheckTxnStatus/ResolveLock`, авто-разрешение в `Get`,
   фоновый resolver expired locks, GC safe point без удаления locks.
-- Snapshot/InstallSnapshot, restart из snapshot, gRPC benchmark (~20 ms/op
-  на 4-RPC транзакцию, один узел).
+- Snapshot/InstallSnapshot, restart из snapshot.
+- Stage 1 speed: group commit, TSO batch, range cache, 1PC `CommitSingle`.
+- Замеры на M1 Pro/loopback: 3 узла sequential ~40 мс/транзакция,
+  parallel ~28 мс/op (~350 tx/s), Get ~0.15–1 мс; Raft group commit
+  ~7.8× throughput на конкурентных proposal’ах.
 
 Пока нет: durable scheduler queue/leader lease; cross-range 2PC
 (клиент запрещает транзакции через два range); network partitions/clock
-skew в Jepsen; production TLS/auth; SQL planner/extended protocol.
+skew в Jepsen; production TLS/auth; SQL planner/extended protocol;
+streaming split/snapshot (Stage 2).
 
 ### SQL P0 поверх KV (experimental)
 
