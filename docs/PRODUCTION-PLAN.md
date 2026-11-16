@@ -174,17 +174,39 @@ TLS/Bearer.
 | Фаза | Что | Длительность |
 |---|---|---|
 | 0 | Заморозить ICP, production-профиль, crash/SLO harness | 2–4 недели |
-| 1 | Durability + membership safety | 6–8 недель |
+| 1 | Durability + membership safety | 10–14 недель (G2 alone 14–19.5 pw) |
 | 2 | PITR/backup + restore drills | 4–6 недель |
 | 3 | Security (TLS/mTLS/RBAC/audit/encryption) | 4–6 недель |
 | 4 | Upgrade/operator/observability | 4–6 недель |
 | 5 | 1 ТБ soak, chaos, SLO, security review | 4–8 недель |
-| **Итого** | private single-tenant production | **6–9 месяцев** |
+| **Итого** | private single-tenant production | **9–12 месяцев** |
 | SQL | P0+ до production-уровня | +6–12 месяцев |
 | DBaaS | multi-tenant/compliance/billing | +12 месяцев и больше |
 
 Фазы можно частично параллелить, но **G1/G2 нельзя обходить**: это safety,
 а не фичи.
+
+## 6.1 Статус Sprint 1 (2026-11-16)
+
+Сделано:
+
+- production-профиль `-durability=sync` по умолчанию; `fast` — opt-in;
+- crash-injection harness: SIGKILL + restart, fast и sync; подтверждённых
+  потерь нет, fast восстанавливается replay Raft-лога;
+- ADR 0005 membership safety (joint consensus) и ADR 0006 PITR;
+- pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS helper
+  `internal/grpctls` (в kvserver/v2client ещё не интегрирован);
+- 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
+- nightly chaos CI + script; Jepsen partition harness исправлен
+  (stable voter IDs + PeerAddrs), 15/15 smoke-тестов проходят.
+
+Не закрыто:
+
+- joint consensus и membership snapshot (ADR, не код);
+- PITR (ADR, не код);
+- gRPC/meta TLS integration и mTLS;
+- libpq-compatible pgwire TLS (сейчас direct TLS, не SSLRequest upgrade);
+- 1 ТБ реальный прогон, real-network soak.
 
 ## 7. Первый спринт (2–4 недели)
 
