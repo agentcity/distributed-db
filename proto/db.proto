@@ -1,90 +1,120 @@
 syntax = "proto3";
 
-package proto;
+package db;
 
-option go_package = "distributed-db/proto";
+option go_package = "distributed-db/internal/pb;pb";
 
-// Coordinator service
-service CoordinatorService {
-    rpc HandleShardAssignment(ShardAssignment) returns (ShardAssignmentResponse);
- rpc HandleLoadReport(LoadReport) returns (LoadReportResponse);
-}
-message ShardAssignment {
-    int32 ShardId = 1;
-    string CoordinatorAddress = 2;
-    repeated string NodeAddresses = 3;
-}
-message ShardAssignmentResponse {
-    bool Success = 1;
-}
-message LoadReport {
-    int32 NodeId = 1;
- int32 ShardId = 2;
-    int64 Load = 3;
-}
-message LoadReportResponse {
-    bool Success = 1;
-}
-
-// Node service
+// NodeService is implemented by every database node.
+// RequestVote/AppendEntries are the Raft transport.
+// Get/Put/Delete are client operations and always hit the node directly.
 service NodeService {
- rpc PutData(PutRequest) returns (PutResponse);
- rpc GetData(GetRequest) returns (GetResponse);
- rpc HandleAppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
- rpc HandleHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
- rpc RequestVote(VoteRequest) returns (VoteResponse);
- rpc SendMetrics(MetricsRequest) returns (MetricsResponse);
- rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
 }
 
-message PutRequest {
- string Key = 1;
+// CoordinatorService is the cluster entry point.
+service CoordinatorService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc ReportLoad(LoadReportRequest) returns (LoadReportResponse);
 }
 
-message PutResponse {
- bool Success = 1;
+message RequestVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  string type = 3;
+  string key = 4;
+  bytes value = 5;
+}
+
+message AppendEntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;
+  uint64 conflict_index = 4;
 }
 
 message GetRequest {
- string Key = 1;
+  string key = 1;
 }
 
 message GetResponse {
- bool Value = 1;
-}
-message LogEntry {
-    int32 Term = 1;
-    string Key = 2;
- bool Committed = 3;
-}
-message AppendEntriesRequest {
- int32 Term = 1;
- int32 LeaderId = 2;
- int32 PrevLogIndex = 3;
- int32 PrevLogTerm = 4;
- repeated LogEntry Entries = 5;
- int32 LeaderCommitIndex = 6;
-}
-message AppendEntriesResponse {
-    bool Success = 1;
+  bool found = 1;
+  bytes value = 2;
+  string leader = 3;
+  string error = 4;
 }
 
-message HeartbeatRequest {
- int32 Term = 1;
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
 }
-message HeartbeatResponse {
-}
-message VoteRequest {
- int32 Term = 1;
- int32 LastLogIndex = 2;
- int32 LastLogTerm = 3;
-}
-message VoteResponse {
-    bool Voted = 1;
-}
-message MetricsRequest {
 
+message PutResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+  uint64 index = 4;
 }
-message MetricsResponse {
- int64 Load = 1;
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+  uint64 index = 4;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string id = 1;
+  string role = 2;
+  uint64 term = 3;
+  string leader = 4;
+  uint64 commit_index = 5;
+  uint64 last_index = 6;
+  uint64 last_applied = 7;
+  string shard = 8;
+}
+
+message LoadReportRequest {
+  string node_id = 1;
+  string shard = 2;
+  double load = 3;
+  uint64 ops = 4;
+}
+
+message LoadReportResponse {
+  bool success = 1;
 }
