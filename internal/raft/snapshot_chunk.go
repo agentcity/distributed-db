@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -20,15 +21,28 @@ const SnapshotChunkSize = 1 << 20
 
 const (
 	// snapshotChunkIdleTimeout is the default for how long an incomplete
-	// upload may sit without a chunk before its temporary file is removed. The
-	// leader restarts a failed install from offset zero, so keeping partial
-	// data longer only wastes disk. Node copies it into a per-node field so a
-	// test can shorten it without racing the timer goroutine.
+	// upload may sit without a chunk before its temporary file is removed. A
+	// leader resumes from the last confirmed offset, so the partial data is
+	// kept while the retry can still reach this node; only an upload that
+	// makes no progress for this long is discarded. Node copies it into a
+	// per-node field so a test can shorten it without racing the timer
+	// goroutine.
 	snapshotChunkIdleTimeout = 30 * time.Second
 	// maxSnapshotChunkStreams bounds the partial-upload map. Only the current
 	// leader can legitimately send a snapshot, so this is generous; it exists
 	// to keep a misbehaving peer from growing the map without bound.
 	maxSnapshotChunkStreams = 8
+	// maxSnapshotChunkFailures bounds how many consecutive chunk RPCs may fail
+	// without receiver-confirmed forward progress. A peer that stops answering
+	// cannot keep one replicate loop busy indefinitely; the next round resumes
+	// from the last confirmed offset instead of restarting the upload.
+	maxSnapshotChunkFailures = 5
+	// snapshotChunkRetryDelay is the first pause before retrying a failed
+	// chunk RPC. The delay grows linearly with the failure count and is capped
+	// by snapshotChunkMaxRetryDelay, so a short transport outage is ridden out
+	// without blocking the replicate loop for long.
+	snapshotChunkRetryDelay    = 20 * time.Millisecond
+	snapshotChunkMaxRetryDelay = 200 * time.Millisecond
 )
 
 // snapshotChunkRecv is one in-progress chunked snapshot upload. The payload is
@@ -130,21 +144,36 @@ func (n *Node) evictOldestSnapshotChunkLocked() {
 }
 
 // discardAllSnapshotChunks removes every partial upload and its temporary
-// file. It is called from Stop so a restarted node starts clean.
+// file, and forgets this node's sender resume points. It is called from Stop so
+// a restarted node starts clean.
 func (n *Node) discardAllSnapshotChunks() {
 	n.snapshotRecvMu.Lock()
-	defer n.snapshotRecvMu.Unlock()
 	for key := range n.snapshotRecv {
 		n.dropSnapshotChunkLocked(key)
 	}
+	n.snapshotRecvMu.Unlock()
+	clearSnapshotChunkSendOffsetsForNode(n)
 }
 
 // sendInstallSnapshotChunks streams the current stored snapshot through a
 // SnapshotChunkTransport. attempted is false only when the store holds no
 // snapshot but the node has an in-memory payload, which is the one case where
-// the legacy unary path can still work. Store, read and RPC failures report
-// attempted=true so the caller retries (from offset zero) instead of
-// materialising the whole payload.
+// the legacy unary path can still work.
+//
+// A failed chunk RPC does not restart the transfer from zero. The receiver
+// reports NextOffset (the number of payload bytes it accepted) with every
+// response, and the sender seeks the snapshot stream there, so bytes the
+// follower already has are neither re-read nor re-sent. A transport error
+// leaves the receiver state unknown, so the same chunk is retried; that is
+// idempotent because the receiver recognises an exact retry of its last
+// accepted chunk. Progress is remembered per peer, so a failure that outlives
+// the retry budget resumes on the next replicate round. Only a rejection
+// without a usable NextOffset (the follower lost the upload or refused the
+// snapshot) falls back to a fresh upload at offset zero.
+//
+// Store and snapshot read failures report attempted=true so the caller retries
+// the install instead of materialising the whole payload. Leadership loss and
+// a higher term from the follower stop the stream immediately.
 func (n *Node) sendInstallSnapshotChunks(
 	leaderCtx context.Context,
 	peer string,
@@ -180,73 +209,339 @@ func (n *Node) sendInstallSnapshotChunks(
 		return false, true
 	}
 
-	buf := make([]byte, SnapshotChunkSize)
-	var offset uint64
-	for {
-		nread, rerr := io.ReadFull(rc, buf)
-		if nread > 0 {
-			if meta.Size > 0 && offset+uint64(nread) > uint64(meta.Size) {
-				n.logger.Warn("raft: streamed snapshot grew while sending",
-					"id", n.cfg.ID, "peer", peer, "sent", offset+uint64(nread), "size", meta.Size)
-				return false, true
-			}
-			req := &InstallSnapshotChunkRequest{
-				Term:         term,
-				LeaderID:     n.cfg.ID,
-				Index:        meta.Index,
-				SnapshotTerm: meta.Term,
-				Offset:       offset,
-				// Copy the chunk: a transport is allowed to retain the request
-				// after the call, and buf is reused for the next chunk.
-				Data:  append([]byte(nil), buf[:nread]...),
-				Size:  meta.Size,
-				CRC32: meta.CRC32,
-			}
-			resp, err := n.callSnapshotChunk(leaderCtx, tr, peer, req)
-			if err != nil {
-				n.logger.Warn("raft: send snapshot chunk", "id", n.cfg.ID, "peer", peer,
-					"offset", offset, "bytes", nread, "error", err)
-				return false, true
-			}
-			if !n.acceptSnapshotChunkResponse(term, peer, resp) {
-				return false, true
-			}
-			offset += uint64(nread)
-		}
-		if rerr == nil {
-			continue
-		}
-		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
-			break
-		}
-		n.logger.Warn("raft: read streamed snapshot for install", "id", n.cfg.ID, "peer", peer, "error", rerr)
-		return false, true
+	// Resume where this leader last had bytes confirmed for this peer. The
+	// receiver validates the offset against its own partial upload, so a stale
+	// entry costs one rejected chunk, not a corrupt install.
+	offset := loadSnapshotChunkSendOffset(n, peer, meta.Index, meta.Term)
+	if meta.Size > 0 && offset > uint64(meta.Size) {
+		offset = 0
 	}
-	if meta.Size > 0 && int64(offset) != meta.Size {
-		n.logger.Warn("raft: streamed snapshot size changed", "id", n.cfg.ID, "peer", peer,
-			"read", offset, "size", meta.Size)
-		return false, true
+	stream := &snapshotChunkStream{r: rc}
+	if offset > 0 {
+		if err := stream.position(offset); err != nil {
+			n.logger.Warn("raft: seek streamed snapshot for resume", "id", n.cfg.ID, "peer", peer,
+				"offset", offset, "error", err)
+			clearSnapshotChunkSendOffset(n, peer)
+			return false, true
+		}
 	}
 
-	req := &InstallSnapshotChunkRequest{
-		Term:         term,
-		LeaderID:     n.cfg.ID,
-		Index:        meta.Index,
-		SnapshotTerm: meta.Term,
-		Offset:       offset,
-		Done:         true,
-		Size:         meta.Size,
-		CRC32:        meta.CRC32,
+	// One reusable 1 MiB read buffer bounds the memory used by the sender.
+	buf := make([]byte, SnapshotChunkSize)
+	var pending []byte // bytes of the chunk currently being retried
+	eof := false
+	failures := 0
+
+	for {
+		if !n.isLeaderFor(term) {
+			return false, true
+		}
+
+		if pending == nil && !eof {
+			nread, rerr := stream.read(buf)
+			if nread > 0 {
+				if meta.Size > 0 && offset+uint64(nread) > uint64(meta.Size) {
+					n.logger.Warn("raft: streamed snapshot grew while sending",
+						"id", n.cfg.ID, "peer", peer, "sent", offset+uint64(nread), "size", meta.Size)
+					clearSnapshotChunkSendOffset(n, peer)
+					return false, true
+				}
+				pending = buf[:nread]
+			}
+			if rerr != nil {
+				if !isSnapshotChunkEOF(rerr) {
+					n.logger.Warn("raft: read streamed snapshot for install", "id", n.cfg.ID, "peer", peer, "error", rerr)
+					clearSnapshotChunkSendOffset(n, peer)
+					return false, true
+				}
+				eof = true
+			}
+			if pending == nil && !eof {
+				// io.ReadFull does not normally return (0, nil); treat it as a
+				// transient read and retry within the same failure budget.
+				failures++
+				if failures >= maxSnapshotChunkFailures || !n.waitSnapshotChunkRetry(leaderCtx, failures) {
+					return false, true
+				}
+				continue
+			}
+		}
+
+		isDone := pending == nil
+		if isDone && meta.Size > 0 && int64(offset) != meta.Size {
+			n.logger.Warn("raft: streamed snapshot size changed", "id", n.cfg.ID, "peer", peer,
+				"read", offset, "size", meta.Size)
+			clearSnapshotChunkSendOffset(n, peer)
+			return false, true
+		}
+		req := &InstallSnapshotChunkRequest{
+			Term:         term,
+			LeaderID:     n.cfg.ID,
+			Index:        meta.Index,
+			SnapshotTerm: meta.Term,
+			Offset:       offset,
+			Size:         meta.Size,
+			CRC32:        meta.CRC32,
+		}
+		if isDone {
+			req.Done = true
+		} else {
+			// Copy the chunk: a transport is allowed to retain the request
+			// after the call, and buf is reused for the next chunk.
+			req.Data = append([]byte(nil), pending...)
+		}
+
+		resp, rpcErr := n.callSnapshotChunk(leaderCtx, tr, peer, req)
+		if n.acceptSnapshotChunkResponse(term, peer, resp) {
+			if isDone {
+				// Clear the resume point so a later install of a newer
+				// snapshot starts from the beginning.
+				clearSnapshotChunkSendOffset(n, peer)
+				return n.finishSnapshotInstall(peer, term, meta.Index, resp.LastIndex), true
+			}
+			offset += uint64(len(pending))
+			pending = nil
+			failures = 0
+			storeSnapshotChunkSendOffset(n, peer, meta.Index, meta.Term, offset)
+			continue
+		}
+
+		// The chunk was rejected or the RPC failed. Leadership may have
+		// changed while the request was in flight; never retry for an old term.
+		if !n.isLeaderFor(term) {
+			return false, true
+		}
+
+		chunkLen := uint64(len(pending)) // zero for the Done marker
+		if rpcErr == nil && resp != nil && !resp.Success {
+			next, ok := snapshotChunkResumeOffset(resp, meta.Size, offset, chunkLen)
+			if !ok {
+				// The follower has no upload to continue (it timed out,
+				// restarted or refused this snapshot). Forget the resume point
+				// and let the next attempt start at offset zero.
+				n.logger.Warn("raft: follower cannot resume snapshot upload",
+					"id", n.cfg.ID, "peer", peer, "offset", offset, "error", resp.Error)
+				clearSnapshotChunkSendOffset(n, peer)
+				return false, true
+			}
+			switch {
+			case next > offset:
+				// The receiver confirmed bytes before next. Drop the prefix of
+				// the chunk it already has instead of re-reading or re-sending
+				// it, then continue at next.
+				if next < offset+chunkLen {
+					pending = pending[next-offset:]
+				} else {
+					pending = nil
+				}
+				offset = next
+				failures = 0
+			case next < offset:
+				// The receiver is behind the stream; rewind and resend from
+				// its offset. Non-seekable snapshot streams cannot rewind, so
+				// fall back to a fresh upload in that case.
+				if err := stream.position(next); err != nil {
+					n.logger.Warn("raft: cannot rewind streamed snapshot", "id", n.cfg.ID, "peer", peer,
+						"offset", next, "error", err)
+					clearSnapshotChunkSendOffset(n, peer)
+					return false, true
+				}
+				offset = next
+				pending = nil
+				eof = false
+				failures++
+			default:
+				// Same offset: retry the chunk or the Done marker.
+				failures++
+			}
+			storeSnapshotChunkSendOffset(n, peer, meta.Index, meta.Term, offset)
+			if failures >= maxSnapshotChunkFailures {
+				n.logger.Warn("raft: snapshot chunk rejected repeatedly",
+					"id", n.cfg.ID, "peer", peer, "offset", offset, "error", resp.Error)
+				return false, true
+			}
+			if failures > 0 && !n.waitSnapshotChunkRetry(leaderCtx, failures) {
+				return false, true
+			}
+			continue
+		}
+
+		// Transport error or nil response. The receiver may or may not have
+		// accepted the chunk, so resend exactly these bytes: an exact retry is
+		// idempotent at the receiver, which answers with its NextOffset.
+		failures++
+		if failures >= maxSnapshotChunkFailures {
+			n.logger.Warn("raft: send snapshot chunk failed repeatedly",
+				"id", n.cfg.ID, "peer", peer, "offset", offset, "error", rpcErr)
+			// Keep the confirmed offset so the next replicate round resumes
+			// here instead of starting over.
+			return false, true
+		}
+		if !n.waitSnapshotChunkRetry(leaderCtx, failures) {
+			return false, true
+		}
 	}
-	resp, err := n.callSnapshotChunk(leaderCtx, tr, peer, req)
-	if err != nil {
-		n.logger.Warn("raft: finish snapshot chunk install", "id", n.cfg.ID, "peer", peer, "error", err)
-		return false, true
+}
+
+// snapshotChunkResumeOffset extracts a usable resume offset from a rejection.
+// next is the number of payload bytes the receiver accepted. It must be
+// positive (zero means the follower has no upload to resume), cannot exceed
+// the declared snapshot size, and cannot be ahead of the bytes this request
+// carried.
+func snapshotChunkResumeOffset(resp *InstallSnapshotChunkResponse, size int64, offset, chunkLen uint64) (uint64, bool) {
+	if resp == nil || resp.Success || resp.NextOffset <= 0 {
+		return 0, false
 	}
-	if !n.acceptSnapshotChunkResponse(term, peer, resp) {
-		return false, true
+	next := uint64(resp.NextOffset)
+	if next > offset+chunkLen {
+		return 0, false
 	}
-	return n.finishSnapshotInstall(peer, term, meta.Index, resp.LastIndex), true
+	if size > 0 && next > uint64(size) {
+		return 0, false
+	}
+	return next, true
+}
+
+// isSnapshotChunkEOF reports whether a short read simply means the snapshot
+// stream ended.
+func isSnapshotChunkEOF(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// waitSnapshotChunkRetry pauses before retrying a chunk RPC and reports whether
+// the retry may proceed. The delay grows linearly with the failure count and is
+// capped, so a brief transport outage is ridden out without stalling the
+// replicate loop for long. It returns false when the term context ends (the
+// node stopped or lost leadership).
+func (n *Node) waitSnapshotChunkRetry(ctx context.Context, failures int) bool {
+	delay := snapshotChunkRetryDelay * time.Duration(failures)
+	if delay > snapshotChunkMaxRetryDelay {
+		delay = snapshotChunkMaxRetryDelay
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// snapshotChunkSendKey identifies one leader-to-peer chunked snapshot
+// transfer. The node pointer keeps state from different nodes (and from test
+// clusters that reuse ids) apart.
+type snapshotChunkSendKey struct {
+	node *Node
+	peer string
+}
+
+// snapshotChunkSendProgress is how far one peer has confirmed a snapshot
+// upload: enough to resume a retry in a later replicate round without
+// re-reading the whole snapshot.
+type snapshotChunkSendProgress struct {
+	index   uint64
+	term    uint64
+	offset  uint64
+	updated time.Time
+}
+
+// snapshotChunkSends is a bounded resume cache: at most one entry per
+// (node, peer). Entries are replaced on snapshot changes, dropped on completion
+// and on Node.Stop, and ignored after snapshotChunkIdleTimeout without an
+// update. It lives in this file so the chunked sender is self-contained.
+var snapshotChunkSends = struct {
+	mu sync.Mutex
+	m  map[snapshotChunkSendKey]snapshotChunkSendProgress
+}{m: make(map[snapshotChunkSendKey]snapshotChunkSendProgress)}
+
+// loadSnapshotChunkSendOffset returns how many bytes of snapshot {index, term}
+// this peer already confirmed, or zero when the transfer must start over.
+func loadSnapshotChunkSendOffset(n *Node, peer string, index, term uint64) uint64 {
+	snapshotChunkSends.mu.Lock()
+	defer snapshotChunkSends.mu.Unlock()
+	key := snapshotChunkSendKey{node: n, peer: peer}
+	progress, ok := snapshotChunkSends.m[key]
+	if !ok {
+		return 0
+	}
+	if progress.index != index || progress.term != term || time.Since(progress.updated) >= n.snapshotChunkTimeout {
+		delete(snapshotChunkSends.m, key)
+		return 0
+	}
+	return progress.offset
+}
+
+// storeSnapshotChunkSendOffset records receiver-confirmed progress. offset is
+// the number of payload bytes the follower has accepted.
+func storeSnapshotChunkSendOffset(n *Node, peer string, index, term, offset uint64) {
+	snapshotChunkSends.mu.Lock()
+	defer snapshotChunkSends.mu.Unlock()
+	snapshotChunkSends.m[snapshotChunkSendKey{node: n, peer: peer}] = snapshotChunkSendProgress{
+		index:   index,
+		term:    term,
+		offset:  offset,
+		updated: time.Now(),
+	}
+}
+
+// clearSnapshotChunkSendOffset forgets the resume point for one peer.
+func clearSnapshotChunkSendOffset(n *Node, peer string) {
+	snapshotChunkSends.mu.Lock()
+	defer snapshotChunkSends.mu.Unlock()
+	delete(snapshotChunkSends.m, snapshotChunkSendKey{node: n, peer: peer})
+}
+
+// clearSnapshotChunkSendOffsetsForNode removes every resume point of one node.
+// It is called from Stop.
+func clearSnapshotChunkSendOffsetsForNode(n *Node) {
+	snapshotChunkSends.mu.Lock()
+	defer snapshotChunkSends.mu.Unlock()
+	for key := range snapshotChunkSends.m {
+		if key.node == n {
+			delete(snapshotChunkSends.m, key)
+		}
+	}
+}
+
+// snapshotChunkStream reads the stored snapshot sequentially and can be
+// repositioned to an offset the receiver confirmed. FileStore returns an
+// *os.File, so resuming is a Seek; a non-seekable snapshot stream can still
+// skip forward without allocating, but cannot rewind.
+type snapshotChunkStream struct {
+	r   io.Reader
+	pos uint64
+}
+
+// errSnapshotChunkRewind reports that a non-seekable snapshot stream cannot
+// return to an earlier offset.
+var errSnapshotChunkRewind = errors.New("raft: snapshot stream cannot rewind")
+
+func (s *snapshotChunkStream) position(off uint64) error {
+	if off == s.pos {
+		return nil
+	}
+	if seeker, ok := s.r.(io.Seeker); ok {
+		if _, err := seeker.Seek(int64(off), io.SeekStart); err != nil {
+			return err
+		}
+		s.pos = off
+		return nil
+	}
+	if off < s.pos {
+		return errSnapshotChunkRewind
+	}
+	if _, err := io.CopyN(io.Discard, s.r, int64(off-s.pos)); err != nil {
+		return err
+	}
+	s.pos = off
+	return nil
+}
+
+func (s *snapshotChunkStream) read(buf []byte) (int, error) {
+	n, err := io.ReadFull(s.r, buf)
+	s.pos += uint64(n)
+	return n, err
 }
 
 func (n *Node) callSnapshotChunk(leaderCtx context.Context, tr SnapshotChunkTransport, peer string, req *InstallSnapshotChunkRequest) (*InstallSnapshotChunkResponse, error) {
@@ -305,10 +600,19 @@ func (n *Node) finishSnapshotInstall(peer string, term, snapIndex, lastIndex uin
 //
 // Term and leader handling match HandleInstallSnapshot. Duplicate chunks are
 // detected by offset and content: an immediate retry of the last accepted
-// chunk succeeds without writing it twice, while an overlapping or gapped
-// chunk is rejected cleanly. A leader retry that starts again at offset zero
-// truncates the partial upload and restarts it. Partial uploads are bounded in
-// number and removed after snapshotChunkIdleTimeout without progress.
+// chunk succeeds without writing it twice. A chunk beyond the current offset
+// (a gap) or one that overlaps already accepted data is rejected, but the
+// partial upload is kept; the response's NextOffset tells the leader which
+// offset to resume from. A leader retry that starts again at offset zero is the
+// only supported reset: it discards (truncates) the partial upload and starts
+// over, because the protocol has no upload identifier. Partial uploads are
+// bounded in number and removed after snapshotChunkIdleTimeout without
+// progress.
+//
+// NextOffset is set in every response: the number of accepted payload bytes
+// after an accepted chunk, the current offset after an idempotent retry, the
+// current offset after a gap rejection, and the final snapshot size after a
+// successful Done.
 //
 // The response Error field reports protocol and restore failures; nil error is
 // returned with Success=false for those. A nil request, a stopped node or a
@@ -372,9 +676,19 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 	}
 	if upToDate {
 		// The snapshot was already installed (or covered by commit); this also
-		// makes a retried final chunk idempotent.
+		// makes a retried final chunk idempotent. Report the final size so a
+		// leader that lost the response knows the upload is complete.
 		n.dropSnapshotChunkLocked(req.LeaderID)
-		return &InstallSnapshotChunkResponse{Term: term, Success: true, LastIndex: last}, nil
+		next := req.Offset + uint64(len(req.Data))
+		if req.Size > 0 && next > uint64(req.Size) {
+			next = uint64(req.Size)
+		}
+		return &InstallSnapshotChunkResponse{
+			Term:       term,
+			Success:    true,
+			LastIndex:  last,
+			NextOffset: int64(next),
+		}, nil
 	}
 
 	recv := n.snapshotRecv[req.LeaderID]
@@ -387,7 +701,10 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 	}
 	if recv != nil && req.Offset == 0 && recv.offset > 0 {
 		// The leader restarted the upload from the beginning after a failed or
-		// lost attempt. Discard the partial data instead of wedging.
+		// lost attempt. This is the only supported way to reset an upload
+		// (the protocol has no upload identifier), so discard the partial
+		// data, truncate it and start over instead of wedging. Every other
+		// rejection keeps the partial upload so the leader can resume it.
 		n.dropSnapshotChunkLocked(req.LeaderID)
 		recv = nil
 	}
@@ -436,12 +753,14 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 		if req.Offset == recv.lastOffset && bytes.Equal(req.Data, recv.lastData) && req.Done == recv.lastDone {
 			// A retry of the last accepted chunk: acknowledge it without
 			// appending the bytes a second time.
-			return &InstallSnapshotChunkResponse{Term: term, Success: true}, nil
+			return &InstallSnapshotChunkResponse{Term: term, Success: true, NextOffset: int64(recv.offset)}, nil
 		}
 		return n.rejectSnapshotChunk(term, fmt.Sprintf("overlapping chunk at offset %d, next offset %d", req.Offset, recv.offset))
 	}
 	if req.Offset > recv.offset {
-		return n.rejectSnapshotChunk(term, fmt.Sprintf("chunk offset gap: got %d, want %d", req.Offset, recv.offset))
+		// Tell the leader which offset the upload has actually reached so it
+		// can seek there and continue instead of restarting at zero.
+		return n.rejectSnapshotChunkAt(term, recv.offset, fmt.Sprintf("chunk offset gap: got %d, want %d", req.Offset, recv.offset))
 	}
 	if recv.size > 0 && recv.offset+uint64(len(req.Data)) > uint64(recv.size) {
 		n.dropSnapshotChunkLocked(req.LeaderID)
@@ -462,9 +781,10 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 	}
 
 	if !req.Done {
-		return &InstallSnapshotChunkResponse{Term: term, Success: true}, nil
+		return &InstallSnapshotChunkResponse{Term: term, Success: true, NextOffset: int64(recv.offset)}, nil
 	}
 
+	nextOffset := int64(recv.offset)
 	resp, err := n.finishSnapshotChunk(recv)
 	n.dropSnapshotChunkLocked(req.LeaderID)
 	if err != nil {
@@ -473,6 +793,7 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 		n.mu.Unlock()
 		return n.rejectSnapshotChunk(term, err.Error())
 	}
+	resp.NextOffset = nextOffset
 	return resp, nil
 }
 
@@ -517,4 +838,16 @@ func (n *Node) rejectSnapshotChunk(term uint64, format string, args ...any) (*In
 		message = fmt.Sprintf(format, args...)
 	}
 	return &InstallSnapshotChunkResponse{Term: term, Error: message}, nil
+}
+
+// rejectSnapshotChunkAt builds a rejection that also reports the offset the
+// receiver has already accepted. The leader uses it to resume the upload from
+// that point; a rejection without a usable NextOffset makes the leader restart
+// from zero.
+func (n *Node) rejectSnapshotChunkAt(term, nextOffset uint64, format string, args ...any) (*InstallSnapshotChunkResponse, error) {
+	resp, err := n.rejectSnapshotChunk(term, format, args...)
+	if resp != nil {
+		resp.NextOffset = int64(nextOffset)
+	}
+	return resp, err
 }

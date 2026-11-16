@@ -322,7 +322,13 @@ func TestInstallSnapshotChunkSuccess(t *testing.T) {
 		t.Fatalf("fixture produced %d requests, want several", len(reqs))
 	}
 	for _, req := range reqs {
-		requireChunkSuccess(t, f.node, req)
+		resp := requireChunkSuccess(t, f.node, req)
+		// next_offset reports the bytes accepted so far, i.e. the offset a
+		// resumed upload should continue from.
+		want := int64(req.Offset) + int64(len(req.Data))
+		if resp.NextOffset != want {
+			t.Fatalf("chunk offset %d next_offset = %d, want %d", req.Offset, resp.NextOffset, want)
+		}
 	}
 	st := f.node.Status()
 	if st.CommitIndex != f.meta.Index || st.LastApplied != f.meta.Index || st.LastIndex != f.meta.Index {
