@@ -100,5 +100,17 @@
     "title": "Stage 2.2a — shared Pebble и prefix-диапазоны",
     "status": "done",
     "file": "0017-stage2-shared-pebble.md"
+  },
+  {
+    "id": "0018",
+    "title": "Stage 2.2b — потоковый и chunked Raft snapshot",
+    "status": "done",
+    "file": "0018-stage2-stream-snapshot.md"
+  },
+  {
+    "id": "0019",
+    "title": "Stage 3.1 — cross-range 2PC primary-first",
+    "status": "done",
+    "file": "0019-stage3-cross-range-2pc.md"
   }
 ]
