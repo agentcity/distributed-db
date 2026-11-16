@@ -250,7 +250,7 @@ pgwire → parse → bind catalog → logical plan → optimize
 - [x] Split: freeze → copy → new group → commit map; e2e обеих половин, распределённо.
 - [x] Потоковый split/merge (батчи, без range в RAM).
 - [x] Shared Pebble на узел (range-префиксы).
-- [ ] Потоковый Raft snapshot/InstallSnapshot.
+- [x] Потоковый state-machine snapshot и chunked InstallSnapshot.
 - [x] Merge: freeze right → copy → drop group; e2e распределённо.
 - [x] Partial-merge retry идемпотентен.
 - [ ] Kill meta/range во время split/merge.
@@ -259,7 +259,7 @@ pgwire → parse → bind catalog → logical plan → optimize
 
 ### M3
 
-- [ ] Cross-range 2PC + recovery (сейчас клиент запрещает cross-range).
+- [x] Cross-range 2PC primary-first; distributed deadlock/recovery — нет.
 - [x] Background lock resolver + MVCC GC safe point.
 - [x] Jepsen kill/restart.
 - [ ] Network partitions, clock skew, longer soak.
