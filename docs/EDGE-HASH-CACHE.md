@@ -1,27 +1,24 @@
 # Edge hash cache: Bloom + Merkle + manifest
 
 - Дата: 2026-11-16
-- Задача: 0034
-- Код: `internal/edgeset`, `internal/edgehttp`, `internal/edgecache`, `cmd/edgehash`
+- Задачи: 0034, 0035
+- Код: `internal/edgeset`, `internal/edgehttp`, `internal/edgecache`, `cmd/edgehash`, `mobile/`
 
 ## 1. Зачем
 
 Проверять «есть ли такой хеш в огромном наборе» на телефонах/edge-узлах,
 не отправляя каждый запрос на сервер.
 
-Идея:
-
 - **авторитетные серверы** хранят точный набор и immutable сегменты;
-- **телефон/edge** кэширует Bloom-сегменты и отвечает локально:
+- **телефон/edge** кэширует Bloom-сегменты:
   - Bloom negative → «нет» без сети;
-  - Bloom maybe → запрос на сервер + Merkle-proof.
+  - Bloom maybe → exact lookup; положительный ответ проверяется Merkle-proof.
 
-Это не транзакционная БД и не распределённая память. Это read-only
-(immutable) set с версионированием.
+Это read-only immutable set с версионированием, не транзакционная БД.
 
 ## 2. Формат
 
-### Сегмент
+### Сегмент v2
 
 Набор разбит по старшим байтам хеша:
 
@@ -32,34 +29,50 @@
 
 ```
 magic "EDGSEG01"
-version u32
+version u32 = 2
 prefix u16
-reserved u16
+compression u8     # 0 none, 1 zstd
+reserved u8
 count u32
 bloom_bits u64
 bloom_k u32
 bloom_bytes u64
-bloom bitset
-sorted hashes [32]byte * count
+raw_size u64
+payload            # Bloom bitset + sorted hashes, maybe zstd
 ```
 
+v1 (40-byte header, без compression/raw_size) читается для совместимости.
+Новые сборки пишут v2. SHA-256 и size в manifest покрывают **stored** файл;
+сжатие проверяется после size/SHA.
+
 Merkle root не дублируется в файле — он в manifest и пересчитывается при
-загрузке. SHA-256 файла тоже в manifest; при загрузке проверяются size и
-SHA-256.
+загрузке.
 
 ### Bloom
 
-- целевой false-positive rate по умолчанию 0.01;
+- target FP 0.01 по умолчанию;
 - `m = ceil(-n ln p / (ln 2)^2)`, `k = round(m/n ln 2)`;
 - double hashing от SHA-256;
-- **false negatives = 0** (проверяется тестами).
+- **false negatives = 0**.
 
-### Merkle
+### Merkle и absence
 
-- листья: `SHA256("edgeset:merkle-leaf:v1\0" || hash)`;
-- узлы: `SHA256("edgeset:merkle-node:v1\0" || left || right)`;
-- дерево дополняется `emptyLeaf` до степени двойки;
-- proof: `Path`, `Right`, `Index`; verifier проверяет и путь, и Index.
+- leaf: `SHA256("edgeset:merkle-leaf:v1\0" || hash)`;
+- node: `SHA256("edgeset:merkle-node:v1\0" || left || right)`;
+- padding: domain-separated `emptyLeaf`.
+
+Inclusion proof: `Path`, `Right`, `Index`.
+
+Non-membership proof (`AbsenceProof`):
+
+- `h < first` → proof первого листа;
+- `h` между → proof двух **соседних** листьев `left < h < right`;
+- `h > last` → proof последнего листа (пустые правые siblings).
+- Проверяются root, prefix, индексы и строгий порядок; non-adjacent
+  индексы отвергаются.
+
+Absence proof актуален только для версии manifest; stale Bloom может дать
+false negative.
 
 ### Manifest
 
@@ -70,57 +83,89 @@ SHA-256.
   "segments": [
     {"prefix": 4660, "count": 1234, "bloom_bits": 12340, "bloom_k": 7,
      "root": "hex", "file": "segments/1234.seg", "size": 45678,
-     "sha256": "hex"}
+     "sha256": "hex", "compression": "zstd"}
   ],
-  "signature": "hex"
+  "signature": "hex",
+  "signature_alg": "ed25519"
 }
 ```
 
-`signature` — HMAC-SHA256 по каноническому JSON всех полей кроме signature.
-Ключ задаётся при build/serve/cache. HMAC — не публичная подпись; для
-недоверенных клиентов нужен Ed25519/публичный ключ (не в этом срезе).
+Подпись покрывает канонический JSON всех полей кроме `signature`.
+
+- `signature_alg: "ed25519"` — публичная подпись; телефону нужен только
+  public key. Рекомендуемый режим.
+- `signature_alg` пустой/`"hmac-sha256"` — legacy HMAC; ключ симметричный,
+  подходит только для доверенного контура.
 
 ## 3. Сервер
 
-`cmd/edgehash serve -dir DIR -addr :8080 -key HEX`
+```bash
+edgehash serve -dir DIR -addr :8080 \
+  -verify-ed25519 pubkey.hex \
+  -tls-cert server.crt -tls-key server.key \
+  -auth-token TOKEN -rate-limit 100 -rate-burst 200
+```
 
 - `GET /healthz`
-- `GET /v1/manifest`
-- `GET /v1/segment/{prefix}` — raw segment bytes
-- `GET /v1/lookup/{hash}`:
-  - `{"present":false}` — Bloom negative или нет в сегменте;
-  - `{"present":true,"proof":{...},"root":"hex","prefix":"hex"}`.
+- `GET /v1/manifest` — no-cache + ETag/304
+- `GET /v1/manifest/version`
+- `GET /v1/segment/{prefix}`:
+  - raw stored bytes (zstd — как есть);
+  - `Range`/206/416, `Accept-Ranges: bytes`;
+  - `Cache-Control: public, max-age=31536000, immutable`;
+  - strong ETag по SHA-256.
+- `GET /v1/lookup/{hash}?absence=1`:
+  - `present:true` + inclusion proof;
+  - `present:false` + `absence_proof` (если запрошено);
+  - `root`, `prefix`.
 
-Сервер загружает immutable store, проверяет manifest/segments на старте.
+TLS, Bearer auth и per-IP rate limit включаются опциями/флагами.
+`/healthz` можно оставить без auth (LB health check).
 
 ## 4. Клиент/телефон
 
 `internal/edgecache`:
 
-- `Sync(ctx)` — скачать manifest, проверить HMAC, скачать недостающие сегменты
-  атомарно;
+- `Sync(ctx)`:
+  - скачивает manifest, проверяет Ed25519/HMAC;
+  - пишет **новую generation directory**;
+  - проверяет все сегменты, fsync, atomic rename;
+  - атомарно переключает `CURRENT`;
+  - старая generation остаётся fallback; при битом `CURRENT` выбирается
+    последняя валидная.
 - `Contains(ctx,h)`:
-  1. локальный `MayContain` (Bloom) — false → ответ без сети;
-  2. локальный `Contains` — true → ответ;
-  3. иначе remote lookup + проверка Merkle-proof по root из manifest.
+  1. локальный `MayContain` false → ответ без сети;
+  2. локальный exact hit → true;
+  3. иначе remote lookup + проверка proof (inclusion/absence).
+- Eviction/TTL:
+  - `MaxCacheBytes`, `MaxSegments`, `SegmentTTL`, `EvictInterval`;
+  - LRU-ish; evicted segment → remote fallback;
+  - `Stats` содержит bytes/segments/evictions.
 
-Кэш можно ограничить набором prefix’ов (телефон не тянет все сегменты).
+Кэш можно ограничить prefix’ами: телефон не тянет все сегменты.
 
-## 5. Версионирование и false negatives
+## 5. Mobile SDK
 
-Bloom нельзя удалять. Старый фильтр может дать **false negative** для хеша,
-добавленного после версии.
+`mobile/` — **scaffold**, не production SDK:
 
-Правила:
+- `android/EdgeHashClient.kt` — HttpURLConnection, org.json, Ed25519 (API 33+),
+  SHA-256, Merkle, Bloom, cache/policy hooks;
+- `ios/EdgeHashClient.swift` — URLSession, CryptoKit Ed25519, Codable manifest,
+  SHA-256, Merkle, Bloom;
+- `protocol.md`, `TESTING.md`, `tests/notes.md`.
 
-- store immutable; обновление = новый manifest/сегменты (новая версия);
+Ни Android, ни iOS не собраны в этом репозитории. Перед релизом нужны
+unit-тесты, device-тесты, pinning ключа, Wi-Fi/charging/quota policy.
+
+## 6. Версионирование и false negatives
+
+- store immutable; обновление = новый manifest/сегменты;
 - клиент проверяет версию manifest;
-- для append-only набора можно использовать несколько поколений сегментов;
+- stale Bloom может дать **false negative** для добавленного позже хеша;
 - при сомнении — remote lookup;
-- удаление из Bloom невозможно: нужен counting Bloom/Cuckoo или новое
-  поколение сегментов.
+- удаление из Bloom невозможно: новое поколение или counting/Cuckoo.
 
-## 6. Оценки
+## 7. Оценки
 
 Для 1 млрд хешей:
 
@@ -132,22 +177,26 @@ Bloom нельзя удалять. Старый фильтр может дать
 | Один сегмент при 2B prefix | в среднем ~15k хешей |
 
 Для 10 млрд: Bloom 1% ~12 ГБ, точные хеши — единицы ТБ.
+zstd обычно даёт 10–40% на Bloom/хешах, но зависит от энтропии.
 
-## 7. Ограничения
+## 8. Ограничения
 
-- immutable только; удаление — новое поколение;
-- HMAC, не публичная подпись;
-- нет сжатия сегментов;
-- нет partial download по диапазону хешей (только prefix);
-- нет rate limiting/auth на HTTP;
-- телефон — только кэш, не источник истины;
-- stale Bloom → возможен false negative; версия обязательна.
+- immutable; удаление — новое поколение;
+- HMAC legacy остаётся для доверенного контура;
+- Ed25519 private key хранится на build-хосте; ротация ключей требует
+  нового manifest/version;
+- нет prefix-range download (только HTTP byte range);
+- mobile SDK — scaffold;
+- stale Bloom → false negative;
+- телефон — кэш, не источник истины;
+- CDN: сегменты immutable, manifest — small/no-cache; нужен purge/versioning
+  на стороне CDN.
 
-## 8. Что дальше
+## 9. Что дальше
 
-- Ed25519-подпись manifest для недоверенных клиентов;
-- сжатие сегментов (zstd);
-- range download `prefix_start..prefix_end`;
-- Bloom для отрицательных кэшей на сервере;
-- quota/rate limit;
-- интеграция с мобильным клиентом (Wi-Fi/charging policy).
+- Ed25519 key rotation/key id;
+- zstd dictionary для мелких сегментов;
+- prefix-range download;
+- CDN multi-region + signed URLs;
+- mobile CI (Gradle/SwiftPM) и device-тесты;
+- server-side negative cache.
