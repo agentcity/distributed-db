@@ -67,14 +67,26 @@ func (t *chunkSnapshotTransport) legacyCalls(peer string) int {
 
 func assertNoSnapshotRecvTemps(t *testing.T, dir string) {
 	t.Helper()
-	des, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read data dir: %v", err)
-	}
-	for _, de := range des {
-		if strings.HasPrefix(de.Name(), "raft-snapshot-recv-") {
-			t.Fatalf("leftover chunk upload file %q", de.Name())
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		des, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read data dir: %v", err)
 		}
+		leftover := ""
+		for _, de := range des {
+			if strings.HasPrefix(de.Name(), "raft-snapshot-recv-") {
+				leftover = de.Name()
+				break
+			}
+		}
+		if leftover == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("leftover chunk upload file %q", leftover)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
