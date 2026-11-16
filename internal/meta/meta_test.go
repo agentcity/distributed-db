@@ -509,3 +509,48 @@ func TestMetaConcurrentAccess(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestSetRangesBootstrap(t *testing.T) {
+	c := meta.New()
+	err := c.SetRanges([]meta.Range{
+		{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{"n1", "n2", "n3"}},
+		{ID: 2, Start: []byte("m"), End: nil, Replicas: []string{"n4", "n5", "n6"}},
+	})
+	if err != nil {
+		t.Fatalf("SetRanges: %v", err)
+	}
+	r, err := c.RangeForKey([]byte("a"))
+	if err != nil || r.ID != 1 {
+		t.Fatalf("RangeForKey(a) = %+v, %v", r, err)
+	}
+	r, err = c.RangeForKey([]byte("z"))
+	if err != nil || r.ID != 2 {
+		t.Fatalf("RangeForKey(z) = %+v, %v", r, err)
+	}
+	if got := c.AllocID(); got <= 2 {
+		t.Fatalf("AllocID after SetRanges = %d, want > 2", got)
+	}
+}
+
+func TestSetRangesRejectsGapsAndDuplicates(t *testing.T) {
+	cases := [][]meta.Range{
+		{{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{"n1"}}},
+		{
+			{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{"n1"}},
+			{ID: 2, Start: []byte("n"), End: nil, Replicas: []string{"n2"}},
+		},
+		{
+			{ID: 1, Start: nil, End: []byte("m"), Replicas: []string{"n1"}},
+			{ID: 1, Start: []byte("m"), End: nil, Replicas: []string{"n2"}},
+		},
+		{
+			{ID: 1, Start: nil, End: []byte("m")},
+			{ID: 2, Start: []byte("m"), End: nil, Replicas: []string{"n2"}},
+		},
+	}
+	for i, tc := range cases {
+		if err := meta.New().SetRanges(tc); err == nil {
+			t.Errorf("case %d: SetRanges accepted invalid map", i)
+		}
+	}
+}

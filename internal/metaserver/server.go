@@ -21,6 +21,7 @@ import (
 // Config configures the meta server.
 type Config struct {
 	Addr   string
+	Ranges []meta.Range
 	Logger *slog.Logger
 }
 
@@ -47,7 +48,13 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, cluster: meta.New()}, nil
+	cluster := meta.New()
+	if len(cfg.Ranges) > 0 {
+		if err := cluster.SetRanges(cfg.Ranges); err != nil {
+			return nil, err
+		}
+	}
+	return &Server{cfg: cfg, log: cfg.Logger, cluster: cluster}, nil
 }
 
 // Start binds Addr and serves MetaService in the background.
@@ -118,6 +125,33 @@ func (s *Server) Addr() string {
 // Cluster exposes the in-memory range/TSO state for tests and future admin
 // APIs. Callers must not mutate it concurrently with RPCs.
 func (s *Server) Cluster() *meta.Cluster { return s.cluster }
+
+// GetRange implements pbv2.MetaServiceServer.
+func (s *Server) GetRange(_ context.Context, req *pbv2.GetRangeRequest) (*pbv2.RangeInfo, error) {
+	r, err := s.cluster.RangeForKey(req.GetKey())
+	if err != nil {
+		return nil, err
+	}
+	return rangeInfo(r), nil
+}
+
+// ListRanges implements pbv2.MetaServiceServer.
+func (s *Server) ListRanges(context.Context, *pbv2.ListRangesRequest) (*pbv2.ListRangesResponse, error) {
+	rows := s.cluster.Snapshot()
+	out := make([]*pbv2.RangeInfo, 0, len(rows))
+	for i := range rows {
+		out = append(out, rangeInfo(&rows[i]))
+	}
+	return &pbv2.ListRangesResponse{Ranges: out}, nil
+}
+
+func rangeInfo(r *meta.Range) *pbv2.RangeInfo {
+	return &pbv2.RangeInfo{
+		Id: r.ID, Start: r.Start, End: r.End,
+		Replicas: append([]string(nil), r.Replicas...),
+		Leader:   r.Leader, Version: r.Version,
+	}
+}
 
 // AllocTS implements pbv2.MetaServiceServer.
 func (s *Server) AllocTS(_ context.Context, req *pbv2.AllocTSRequest) (*pbv2.AllocTSResponse, error) {

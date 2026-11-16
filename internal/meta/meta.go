@@ -62,6 +62,65 @@ func New() *Cluster {
 	return c
 }
 
+// SetRanges replaces the whole range map with a validated, sorted,
+// contiguous set. It is used by the metadata bootstrap and by tests.
+func (c *Cluster) SetRanges(ranges []Range) error {
+	if len(ranges) == 0 {
+		return fmt.Errorf("meta: SetRanges requires at least one range")
+	}
+	seen := make(map[uint64]struct{}, len(ranges))
+	out := make([]*Range, 0, len(ranges))
+	var maxID uint64
+	for i := range ranges {
+		r := ranges[i]
+		if r.ID == 0 {
+			return fmt.Errorf("meta: range %d has zero id", i)
+		}
+		if _, ok := seen[r.ID]; ok {
+			return fmt.Errorf("meta: duplicate range id %d", r.ID)
+		}
+		seen[r.ID] = struct{}{}
+		if r.Version == 0 {
+			r.Version = 1
+		}
+		if i == 0 {
+			if r.Start != nil && len(r.Start) != 0 {
+				return fmt.Errorf("meta: first range must start at -inf")
+			}
+			r.Start = nil
+		} else {
+			prev := ranges[i-1]
+			if r.Start == nil || len(r.Start) == 0 || bytes.Compare(r.Start, prev.End) != 0 {
+				return fmt.Errorf("meta: range %d is not adjacent to the previous range", r.ID)
+			}
+		}
+		if i == len(ranges)-1 {
+			if r.End != nil && len(r.End) != 0 {
+				return fmt.Errorf("meta: last range must end at +inf")
+			}
+			r.End = nil
+		} else if r.End == nil || len(r.End) == 0 || bytes.Compare(r.Start, r.End) >= 0 {
+			return fmt.Errorf("meta: range %d has invalid bounds", r.ID)
+		}
+		if len(r.Replicas) == 0 {
+			return fmt.Errorf("meta: range %d has no replicas", r.ID)
+		}
+		clone := Range{
+			ID: r.ID, Start: cloneBytes(r.Start), End: cloneBytes(r.End),
+			Replicas: cloneStrings(r.Replicas), Leader: r.Leader, Version: r.Version,
+		}
+		out = append(out, &clone)
+		if r.ID > maxID {
+			maxID = r.ID
+		}
+	}
+	c.mu.Lock()
+	c.ranges = out
+	c.mu.Unlock()
+	c.nextID.Store(maxID)
+	return nil
+}
+
 // RangeForKey returns the range that contains key. A nil key is the smallest
 // possible key, and nil range bounds mean -inf/+inf respectively.
 func (c *Cluster) RangeForKey(key []byte) (*Range, error) {
