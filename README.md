@@ -83,9 +83,9 @@ go test -race ./test -run TestV2SingleRangeCluster -v
 одного host доступны `SplitRange`/`MergeRanges` с реальным переносом MVCC-
 записей (`TestV2RangeHostSplitMerge`).
 
-Ограничение M2.3 MVP: split/merge выполняются на одном RangeHost; их нужно
-оркестрировать на всех репликах и обновлять meta после переноса. Это
-следующий шаг, а не production-сценарий. Транзакции
+Split теперь умеет распределённый режим: `KVService.SplitRange` реплицирует
+prepare, замораживает все реплики и создаёт новую Raft-группу на каждой;
+meta обновляется после успеха. Merge пока host-local, epoch/fencing — дальше. Транзакции
 поддерживают `CheckTxnStatus/ResolveLock`, а `Get` сам разрешает
 committed/rolled-back/expired locks.
 
