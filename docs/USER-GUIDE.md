@@ -204,7 +204,7 @@ go build -o bin/kvbackup ./cmd/kvbackup
 # Status доступен через gRPC; быстрый способ — SQL ниже.
 # Если используете grpcurl:
 grpcurl -plaintext -d '{"range_id":1}' 127.0.0.1:7001 \
-  db.v2.KVService/Status
+  dbv2.KVService/Status
 ```
 
 > `grpcurl` не обязателен; SQL/pgwire сами редиректят к лидеру.
@@ -449,7 +449,10 @@ openssl genpkey -algorithm ED25519 -out priv.pem
 openssl pkey -in priv.pem -pubout -out pub.pem
 
 # файл хешей: один SHA-256 hex на строку
+# Linux
 sha256sum /path/to/file | awk '{print $1}' > hashes.txt
+# macOS
+shasum -a 256 /path/to/file | awk '{print $1}' > hashes.txt
 ```
 
 ### 10.2 Build / serve / lookup
@@ -612,10 +615,10 @@ go build -o bin/sqlsrv ./cmd/sqlsrv
 go build -o bin/pgsrv ./cmd/pgsrv
 go build -o bin/kvbackup ./cmd/kvbackup
 
-# SQL HTTP
+# SQL HTTP (таблица users должна существовать)
 curl -s -X POST localhost:8080/v1/sql \
   -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT 1"}'
+  -d '{"sql":"SELECT COUNT(*) FROM users"}'
 
 # psql
 psql "host=127.0.0.1 port=5432 user=postgres dbname=postgres sslmode=disable"
