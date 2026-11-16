@@ -21,6 +21,6 @@ scope: {backend: true, console: false, mobile: false}
 ## Критерии
 
 - [x] Leader transfer (KVService.TransferLeader + TimeoutNow).
-- [ ] Add/Remove replica (не сделано).
+- [x] Add/Remove replica (через 0031).
 - [x] Leader rebalance loop (RebalanceLeaders/StartLeaderRebalance).
 - [x] E2E transfer/leader rebalance на 3 узлах.

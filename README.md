@@ -104,12 +104,15 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
   interceptor, `/metrics` и `/debug/slo`.
 - Stage 2.4: leader transfer и rebalance лидеров (без Add/Remove replica).
 - Stage 2.5: snapshot resume по `next_offset`.
+- Stage 2.6: Add/Remove replica (learner → voter), meta orchestration,
+  membership persist; single-server change, без joint consensus.
 - Замеры на M1 Pro/loopback: 3 узла sequential ~40 мс/транзакция,
   parallel ~28 мс/op (~350 tx/s), Get ~0.15–1 мс; Raft group commit
   ~7.8× throughput на конкурентных proposal’ах.
 
-Пока нет: Add/Remove replica и joint consensus (0028), per-chunk CRC,
-durable scheduler queue/leader lease, production TLS/auth, SLO p99 прогон.
+Пока нет: joint consensus/decommission, per-chunk CRC, durable scheduler
+queue/leader lease, production TLS/auth, SLO p99 прогон, расширенный SQL
+planner (AND/OR, >2 JOIN, parallel).
 
 ### SQL P0 поверх KV (experimental)
 

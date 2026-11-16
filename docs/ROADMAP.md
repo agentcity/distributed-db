@@ -220,7 +220,8 @@ Stage 2.2a: shared Pebble на узел. Stage 2.2b: потоковый state-ma
 snapshot и chunked InstallSnapshot. Stage 3.1: cross-range 2PC primary-first. Stage 3.2: SQL после split,
 planner/plan cache, extended pgwire, recovery, Jepsen partitions.
 Stage 2.3: auto-merge, backup/restore, gzip snapshot. Leader transfer/rebalance, snapshot resume и SQL/pgwire-метрики сделаны.
-Остались Add/Remove replica + joint consensus, per-chunk CRC, SLO p99.
+Add/Remove replica (learner→voter) сделан; остались joint consensus/decommission,
+per-chunk CRC, SLO p99, TLS/auth.
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.

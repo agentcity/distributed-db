@@ -23,12 +23,12 @@ Replica sets статические; leader transfer есть, Add/Remove replic
 
 ## Критерии
 
-- [ ] Add learner + catch-up.
-- [ ] Promote voter.
-- [ ] Remove voter.
-- [ ] Meta обновляет replicas только после успеха.
-- [ ] E2E 4 узла: add, remove, kill.
-- [ ] Joint consensus — нет (отдельно).
+- [x] Add learner + catch-up.
+- [x] Promote voter.
+- [x] Remove voter.
+- [x] Meta обновляет replicas только после успеха.
+- [x] E2E 4 узла: add, remove, kill.
+- [ ] Joint consensus — нет (single-server change, отдельная задача).
 
 ## Ограничения
 

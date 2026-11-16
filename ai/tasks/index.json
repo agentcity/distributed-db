@@ -164,7 +164,7 @@
   {
     "id": "0028",
     "title": "Stage 2 — rebalancing и leader transfer",
-    "status": "in_progress",
+    "status": "done",
     "file": "0028-rebalancing.md"
   },
   {
@@ -182,7 +182,7 @@
   {
     "id": "0031",
     "title": "Stage 2 — Add/Remove replica и membership",
-    "status": "in_progress",
+    "status": "done",
     "file": "0031-raft-membership.md"
   }
 ]
