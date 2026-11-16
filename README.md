@@ -10,7 +10,8 @@
 > membership, chunked snapshots, SQL P0. Это ещё **не production-СУБД**:
 > нет TLS/auth, PITR, joint consensus и подтверждённого SLO.
 > Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
-Путь к production: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
+Что реализовать до production: [docs/PRODUCTION-PLAN.md](docs/PRODUCTION-PLAN.md).
+Гейты и путь: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 Сравнение скорости с PostgreSQL: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd, mobile): [docs/EDGE-HASH-CACHE.md](docs/EDGE-HASH-CACHE.md).
 

@@ -167,6 +167,9 @@ DBaaS и не замена PostgreSQL.
 
 ## 8. Что делать дальше
 
+Детальный backlog с воротами G1–G8, порядком фаз и оценками:
+[PRODUCTION-PLAN.md](PRODUCTION-PLAN.md).
+
 ### P0 для v2 (до private alpha)
 
 1. Crash-consistency тест для `SyncWrites=false` + решение по durability.

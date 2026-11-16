@@ -6,6 +6,7 @@
   `cmd/kvbackup`, `cmd/metricsrv`), edge hash cache (`cmd/edgehash`) и
   mobile scaffold.
 - Полная оценка и применимость: [ASSESSMENT.md](ASSESSMENT.md).
+- Что реализовать до production: [PRODUCTION-PLAN.md](PRODUCTION-PLAN.md).
 
 ## 1. Короткий вердикт
 
