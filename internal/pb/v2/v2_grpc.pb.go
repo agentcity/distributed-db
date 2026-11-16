@@ -577,6 +577,7 @@ const (
 	MetaService_GetRange_FullMethodName   = "/dbv2.MetaService/GetRange"
 	MetaService_ListRanges_FullMethodName = "/dbv2.MetaService/ListRanges"
 	MetaService_Leader_FullMethodName     = "/dbv2.MetaService/Leader"
+	MetaService_SetRanges_FullMethodName  = "/dbv2.MetaService/SetRanges"
 )
 
 // MetaServiceClient is the client API for MetaService service.
@@ -589,6 +590,7 @@ type MetaServiceClient interface {
 	GetRange(ctx context.Context, in *GetRangeRequest, opts ...grpc.CallOption) (*RangeInfo, error)
 	ListRanges(ctx context.Context, in *ListRangesRequest, opts ...grpc.CallOption) (*ListRangesResponse, error)
 	Leader(ctx context.Context, in *LeaderRequest, opts ...grpc.CallOption) (*LeaderResponse, error)
+	SetRanges(ctx context.Context, in *SetRangesRequest, opts ...grpc.CallOption) (*SetRangesResponse, error)
 }
 
 type metaServiceClient struct {
@@ -639,6 +641,16 @@ func (c *metaServiceClient) Leader(ctx context.Context, in *LeaderRequest, opts 
 	return out, nil
 }
 
+func (c *metaServiceClient) SetRanges(ctx context.Context, in *SetRangesRequest, opts ...grpc.CallOption) (*SetRangesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetRangesResponse)
+	err := c.cc.Invoke(ctx, MetaService_SetRanges_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MetaServiceServer is the server API for MetaService service.
 // All implementations must embed UnimplementedMetaServiceServer
 // for forward compatibility.
@@ -649,6 +661,7 @@ type MetaServiceServer interface {
 	GetRange(context.Context, *GetRangeRequest) (*RangeInfo, error)
 	ListRanges(context.Context, *ListRangesRequest) (*ListRangesResponse, error)
 	Leader(context.Context, *LeaderRequest) (*LeaderResponse, error)
+	SetRanges(context.Context, *SetRangesRequest) (*SetRangesResponse, error)
 	mustEmbedUnimplementedMetaServiceServer()
 }
 
@@ -670,6 +683,9 @@ func (UnimplementedMetaServiceServer) ListRanges(context.Context, *ListRangesReq
 }
 func (UnimplementedMetaServiceServer) Leader(context.Context, *LeaderRequest) (*LeaderResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Leader not implemented")
+}
+func (UnimplementedMetaServiceServer) SetRanges(context.Context, *SetRangesRequest) (*SetRangesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetRanges not implemented")
 }
 func (UnimplementedMetaServiceServer) mustEmbedUnimplementedMetaServiceServer() {}
 func (UnimplementedMetaServiceServer) testEmbeddedByValue()                     {}
@@ -764,6 +780,24 @@ func _MetaService_Leader_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MetaService_SetRanges_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetRangesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MetaServiceServer).SetRanges(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MetaService_SetRanges_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MetaServiceServer).SetRanges(ctx, req.(*SetRangesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MetaService_ServiceDesc is the grpc.ServiceDesc for MetaService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -786,6 +820,10 @@ var MetaService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Leader",
 			Handler:    _MetaService_Leader_Handler,
+		},
+		{
+			MethodName: "SetRanges",
+			Handler:    _MetaService_SetRanges_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

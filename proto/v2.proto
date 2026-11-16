@@ -29,6 +29,7 @@ service MetaService {
   rpc GetRange(GetRangeRequest) returns (RangeInfo);
   rpc ListRanges(ListRangesRequest) returns (ListRangesResponse);
   rpc Leader(LeaderRequest) returns (LeaderResponse);
+  rpc SetRanges(SetRangesRequest) returns (SetRangesResponse);
 }
 
 message GetRequest {
@@ -123,7 +124,9 @@ message ResolveLockResponse {
   string error = 3;
 }
 
-message StatusRequest {}
+message StatusRequest {
+  uint64 range_id = 1;
+}
 message StatusResponse {
   string id = 1;
   string role = 2;
@@ -141,6 +144,7 @@ message RequestVoteRequest {
   string candidate_id = 2;
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
+  uint64 range_id = 5;
 }
 message RequestVoteResponse {
   uint64 term = 1;
@@ -161,6 +165,7 @@ message AppendEntriesRequest {
   uint64 prev_log_term = 4;
   repeated LogEntry entries = 5;
   uint64 leader_commit = 6;
+  uint64 range_id = 7;
 }
 message AppendEntriesResponse {
   uint64 term = 1;
@@ -178,11 +183,20 @@ message InstallSnapshotRequest {
   uint64 term = 1;
   string leader_id = 2;
   Snapshot snapshot = 3;
+  uint64 range_id = 4;
 }
 message InstallSnapshotResponse {
   uint64 term = 1;
   bool success = 2;
   uint64 last_index = 3;
+}
+
+message SetRangesRequest {
+  repeated RangeInfo ranges = 1;
+}
+message SetRangesResponse {
+  bool success = 1;
+  string error = 2;
 }
 
 message LeaderRequest {}

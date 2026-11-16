@@ -301,7 +301,7 @@ func (c *Client) discoverLeader(ctx context.Context, key []byte) (string, uint64
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
-		resp, err := cl.Status(probeCtx, &pbv2.StatusRequest{})
+		resp, err := cl.Status(probeCtx, &pbv2.StatusRequest{RangeId: rangeID})
 		cancel()
 		if err != nil {
 			lastErr = err
@@ -369,6 +369,10 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 			if hint != "" {
 				c.setLeader(rangeID, hint)
 			}
+			continue
+		}
+		if msg == "range frozen" {
+			lastErr = ErrConflict
 			continue
 		}
 		if msg != "" {

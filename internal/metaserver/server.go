@@ -332,9 +332,29 @@ func (s *Server) AllocTS(ctx context.Context, req *pbv2.AllocTSRequest) (*pbv2.A
 	return &pbv2.AllocTSResponse{Start: start, Count: int32(count)}, nil
 }
 
-// SetRanges applies a new range map through Raft. It is used by tests and the
-// future admin API.
-func (s *Server) SetRanges(ctx context.Context, ranges []meta.Range) error {
+// SetRanges implements the admin RPC. The range map is committed through Raft;
+// callers must update it only after the data movement has completed.
+func (s *Server) SetRanges(ctx context.Context, req *pbv2.SetRangesRequest) (*pbv2.SetRangesResponse, error) {
+	ranges := make([]meta.Range, 0, len(req.GetRanges()))
+	for _, r := range req.GetRanges() {
+		if r == nil {
+			return &pbv2.SetRangesResponse{Error: "nil range"}, nil
+		}
+		ranges = append(ranges, meta.Range{
+			ID: r.GetId(), Start: r.GetStart(), End: r.GetEnd(),
+			Replicas: append([]string(nil), r.GetReplicas()...),
+			Leader:   r.GetLeader(), Version: r.GetVersion(),
+		})
+	}
+	if err := s.ApplyRanges(ctx, ranges); err != nil {
+		return &pbv2.SetRangesResponse{Error: err.Error()}, nil
+	}
+	return &pbv2.SetRangesResponse{Success: true}, nil
+}
+
+// ApplyRanges applies a new range map through Raft. It is used by the admin
+// RPC and by split/merge orchestration.
+func (s *Server) ApplyRanges(ctx context.Context, ranges []meta.Range) error {
 	if !s.cfg.Replicated {
 		return s.cluster.SetRanges(ranges)
 	}
