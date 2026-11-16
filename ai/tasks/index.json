@@ -220,5 +220,11 @@
     "title": "Production plan и ворота G1–G8",
     "status": "done",
     "file": "0037-production-plan.md"
+  },
+  {
+    "id": "0038",
+    "title": "Sprint 1 — production gates",
+    "status": "in_progress",
+    "file": "0038-sprint-1-production-gates.md"
   }
 ]
