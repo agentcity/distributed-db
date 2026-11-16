@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"distributed-db/internal/sqlparser"
 
@@ -47,6 +49,11 @@ const (
 type Engine struct {
 	client Client
 
+	// instrumentation, when non-nil, receives one observation per Execute.
+	// It is stored behind an atomic pointer so SetMetrics may race safely
+	// with concurrent executions.
+	instrumentation atomic.Pointer[metricsHook]
+
 	// Plan cache: normalized SQL + schema version -> chosen plan.
 	planMu            sync.Mutex
 	plans             map[string]*Plan
@@ -60,13 +67,27 @@ func New(client Client) *Engine {
 	return &Engine{client: client, plans: make(map[string]*Plan)}
 }
 
-// Execute parses and executes exactly one SQL statement.
+// Execute parses and executes exactly one SQL statement. When a metrics hook
+// is installed, one observation records the total duration (parse included),
+// the error, and a bounded statement kind.
 func (e *Engine) Execute(ctx context.Context, sql string) (*Result, error) {
+	start := time.Now()
+	hook := e.instrumentation.Load()
+	kind := StatementOther
+
 	stmt, err := sqlparser.Parse(sql)
 	if err != nil {
+		if hook != nil {
+			hook.m.ObserveStatement(kind, time.Since(start), err)
+		}
 		return nil, err
 	}
-	return e.execute(ctx, stmt)
+	kind = StatementKind(stmt)
+	res, err := e.execute(ctx, stmt)
+	if hook != nil {
+		hook.m.ObserveStatement(kind, time.Since(start), err)
+	}
+	return res, err
 }
 
 func (e *Engine) execute(ctx context.Context, stmt sqlparser.Statement) (*Result, error) {

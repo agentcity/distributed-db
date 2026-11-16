@@ -5,20 +5,47 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"distributed-db/internal/metrics"
 	"distributed-db/internal/sqlengine"
 )
 
-// Handler serves POST /v1/sql and GET /health.
-type Handler struct {
-	engine *sqlengine.Engine
+// Config configures a Handler. Engine is required. Metrics, when non-nil, is
+// exposed as Prometheus text at /metrics; SLO, when non-nil, backs /debug/slo.
+type Config struct {
+	Engine  *sqlengine.Engine
+	Metrics *metrics.Registry
+	SLO     *metrics.SLO
 }
 
-// New returns an http.Handler backed by engine.
-func New(engine *sqlengine.Engine) *Handler { return &Handler{engine: engine} }
+// Handler serves POST /v1/sql, GET /health, GET /healthz, GET /metrics, and
+// GET /debug/slo.
+type Handler struct {
+	engine         *sqlengine.Engine
+	metricsHandler http.Handler
+}
+
+// New returns an http.Handler backed by engine without metrics endpoints
+// configured. /metrics still responds, but with no samples.
+func New(engine *sqlengine.Engine) *Handler {
+	return NewWithConfig(Config{Engine: engine})
+}
+
+// NewWithConfig returns an http.Handler backed by cfg.Engine that also
+// exposes the configured metrics registry and SLO.
+func NewWithConfig(cfg Config) *Handler {
+	return &Handler{
+		engine:         cfg.Engine,
+		metricsHandler: metrics.NewHTTPHandler(cfg.Metrics, cfg.SLO),
+	}
+}
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/metrics",
+		r.Method == http.MethodGet && r.URL.Path == "/debug/slo",
+		r.Method == http.MethodGet && r.URL.Path == "/healthz":
+		h.metricsHandler.ServeHTTP(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sql":

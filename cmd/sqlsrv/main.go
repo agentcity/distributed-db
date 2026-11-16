@@ -13,13 +13,14 @@ import (
 	"syscall"
 	"time"
 
+	"distributed-db/internal/metrics"
 	"distributed-db/internal/sqlengine"
 	"distributed-db/internal/sqlhttp"
 	"distributed-db/internal/v2client"
 )
 
 func main() {
-	httpAddr := flag.String("http-addr", ":8080", "SQL HTTP listen address")
+	httpAddr := flag.String("http-addr", ":8080", "SQL HTTP listen address (also serves /metrics, /debug/slo, and /healthz)")
 	metaAddr := flag.String("meta", "127.0.0.1:9090", "meta/TSO gRPC address")
 	nodes := flag.String("nodes", "", "comma-separated KV node gRPC addresses")
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
@@ -37,9 +38,16 @@ func main() {
 	defer client.Close()
 
 	engine := sqlengine.New(v2client.NewSQLClient(client))
+	reg := metrics.NewRegistry()
+	sqlMetrics := sqlengine.NewSQLMetrics(reg, metrics.SLOConfig{Prefix: "sql"})
+	engine.SetMetrics(sqlMetrics)
 	srv := &http.Server{
-		Addr:              *httpAddr,
-		Handler:           sqlhttp.New(engine),
+		Addr: *httpAddr,
+		Handler: sqlhttp.NewWithConfig(sqlhttp.Config{
+			Engine:  engine,
+			Metrics: reg,
+			SLO:     sqlMetrics.SLO,
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -52,7 +60,12 @@ func main() {
 		_ = srv.Shutdown(shutdown)
 	}()
 
-	log.Info("sqlsrv started", "http", *httpAddr, "meta", *metaAddr, "nodes", *nodes)
+	log.Info("sqlsrv started",
+		"http", *httpAddr,
+		"metrics", "/metrics",
+		"slo", "/debug/slo",
+		"meta", *metaAddr,
+		"nodes", *nodes)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fatal(err)
 	}

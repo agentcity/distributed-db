@@ -960,7 +960,7 @@ func (sess *connSession) ensureMeta(stmt *preparedStatement) ([]columnDesc, *wir
 		stmt.metaReady = true
 		return cols, nil
 	}
-	res, err := sess.executeStatement(stmt, dummyParams(stmt))
+	res, err := sess.executeStatement(stmt, dummyParams(stmt), false)
 	if err != nil {
 		return nil, asWireError(err)
 	}
@@ -1014,7 +1014,7 @@ func (sess *connSession) handleExecute(body []byte) error {
 	}
 	if !p.stmt.isSelect {
 		if p.result == nil {
-			res, err := sess.executeStatement(p.stmt, p.params)
+			res, err := sess.executeStatement(p.stmt, p.params, true)
 			if err != nil {
 				return sess.failErr(err)
 			}
@@ -1138,7 +1138,7 @@ func (sess *connSession) ensurePortalResult(p *portal) ([]columnDesc, *wireError
 	if p.result != nil {
 		return p.meta, nil
 	}
-	res, err := sess.executeStatement(p.stmt, p.params)
+	res, err := sess.executeStatement(p.stmt, p.params, true)
 	if err != nil {
 		return nil, asWireError(err)
 	}
@@ -1154,8 +1154,20 @@ func (sess *connSession) ensurePortalResult(p *portal) ([]columnDesc, *wireError
 
 // executeStatement renders the placeholders and runs the statement through the
 // engine. When a parameter type is unknown, several renderings may be tried;
-// failed attempts roll back inside the engine, so retrying is safe.
-func (sess *connSession) executeStatement(stmt *preparedStatement, params []boundParam) (*sqlengine.Result, error) {
+// failed attempts roll back inside the engine, so retrying is safe. observe
+// records one query SLO observation for the whole attempt sequence; metadata
+// probes pass false so Describe does not inflate query counts.
+func (sess *connSession) executeStatement(stmt *preparedStatement, params []boundParam, observe bool) (res *sqlengine.Result, err error) {
+	if observe {
+		done := sess.srv.trackQuery()
+		defer func() {
+			observed := err
+			if observed == nil && res == nil {
+				observed = errNilEngineResult
+			}
+			done(observed)
+		}()
+	}
 	if len(params) != len(stmt.specs) {
 		return nil, wireErrorf("08P01", "pgwire: parameter count mismatch")
 	}
@@ -1327,7 +1339,13 @@ func (sess *connSession) handleSimpleQuery(body []byte) error {
 	}
 
 	ast, parseErr := sqlparser.Parse(query)
+	done := sess.srv.trackQuery()
 	res, err := sess.srv.engine.Execute(sess.srv.ctx, query)
+	observed := err
+	if observed == nil && res == nil {
+		observed = errNilEngineResult
+	}
+	done(observed)
 	switch {
 	case err != nil:
 		if werr := writeError(sess.bw, sqlState(err), err.Error()); werr != nil {

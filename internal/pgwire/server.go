@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"distributed-db/internal/metrics"
 	"distributed-db/internal/sqlengine"
 )
 
@@ -33,13 +34,26 @@ const (
 var (
 	errBadMessage    = errors.New("pgwire: malformed message")
 	errCancelRequest = errors.New("pgwire: cancel request")
+	// errNilEngineResult is used only for SLO accounting when the engine
+	// reports success without a result; the protocol path keeps its own
+	// error handling.
+	errNilEngineResult = errors.New("pgwire: engine returned a nil result")
 )
+
+// pgwireMetrics is the optional instrumentation state installed by SetMetrics.
+type pgwireMetrics struct {
+	slo         *metrics.SLO
+	connections *metrics.Counter
+	active      *metrics.Gauge
+}
 
 // Server is a minimal PostgreSQL wire-protocol server backed by a SQL engine.
 // A Server is safe for concurrent use: one goroutine serves each connection.
 type Server struct {
 	engine *sqlengine.Engine
 	logger *slog.Logger
+
+	metrics atomic.Pointer[pgwireMetrics]
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -70,6 +84,59 @@ func New(engine *sqlengine.Engine, logger *slog.Logger) *Server {
 	}
 	s.nextPID.Store(int32(os.Getpid()))
 	return s
+}
+
+// SetMetrics enables pgwire instrumentation. reg, when non-nil, receives the
+// connection counters and active-connection gauge; slo, when non-nil, records
+// one observation per executed query. Either may be nil to disable that part.
+// Calling SetMetrics more than once with the same registry panics because the
+// metric series are registered again, so configure it once at startup.
+func (s *Server) SetMetrics(reg *metrics.Registry, slo *metrics.SLO) {
+	if reg == nil && slo == nil {
+		s.metrics.Store(nil)
+		return
+	}
+	st := &pgwireMetrics{slo: slo}
+	if reg != nil {
+		st.connections = reg.NewCounter(
+			"pgwire_connections_total",
+			"Total PostgreSQL connections that completed startup.",
+			nil,
+		)
+		st.active = reg.NewGauge(
+			"pgwire_connections_active",
+			"PostgreSQL connections currently open.",
+			nil,
+		)
+	}
+	s.metrics.Store(st)
+}
+
+// observeConnection counts a successfully started connection and returns a
+// function that decrements the active gauge when the connection ends.
+func (s *Server) observeConnection() func() {
+	st := s.metrics.Load()
+	if st == nil {
+		return func() {}
+	}
+	if st.connections != nil {
+		st.connections.Inc()
+	}
+	if st.active != nil {
+		st.active.Inc()
+		return st.active.Dec
+	}
+	return func() {}
+}
+
+// trackQuery starts one query SLO observation. The returned function is always
+// safe to call and records the terminal error with the measured latency.
+func (s *Server) trackQuery() func(error) {
+	st := s.metrics.Load()
+	if st == nil || st.slo == nil {
+		return func(error) {}
+	}
+	return st.slo.Begin()
 }
 
 // Start listens on addr (for example ":5432" or "127.0.0.1:0") and returns the
@@ -210,6 +277,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	s.logger.Debug("pgwire: client connected",
 		"remote", remote, "user", params["user"], "database", params["database"])
+	connDone := s.observeConnection()
+	defer connDone()
 
 	sess := newConnSession(s, bw)
 	for {

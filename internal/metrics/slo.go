@@ -26,7 +26,8 @@ type SLOConfig struct {
 }
 
 // SLO is a requests/errors/inflight/latency instrumentation set created by
-// NewSLO. It is safe for concurrent use and implements Recorder and Tracker.
+// NewSLO. It is safe for concurrent use and implements Recorder, Tracker, and
+// the per-statement hook shape used by the SQL engine (ObserveStatement).
 type SLO struct {
 	Requests *Counter
 	Errors   *Counter
@@ -64,6 +65,15 @@ func (s *SLO) ObserveRequest(latency time.Duration, err error) {
 		latency = 0
 	}
 	s.Latency.Observe(latency)
+}
+
+// ObserveStatement adapts SLO to per-statement instrumentation hooks (such as
+// sqlengine.Metrics) by folding every statement into the aggregate SLO. The
+// kind argument is ignored; callers that need a bounded per-kind breakdown
+// should use NewLabeledSLO or SQLMetrics.
+func (s *SLO) ObserveStatement(kind string, latency time.Duration, err error) {
+	_ = kind
+	s.ObserveRequest(latency, err)
 }
 
 // Begin marks a request as in flight and starts its timer. The returned
