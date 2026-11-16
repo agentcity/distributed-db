@@ -58,5 +58,11 @@
     "title": "Целевая архитектура M2/M3/M5 + AI control plane",
     "status": "in_progress",
     "file": "0010-target-architecture.md"
+  },
+  {
+    "id": "0011",
+    "title": "M2.1 — replicated meta и TSO через Raft",
+    "status": "done",
+    "file": "0011-m2-meta-raft.md"
   }
 ]
