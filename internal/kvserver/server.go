@@ -26,6 +26,12 @@ type Config struct {
 	DataDir  string
 	Peers    []string // other Raft members (their RaftAddr)
 
+	// Range metadata is descriptive for M2: this process hosts exactly one
+	// range. The client discovers the range through meta and routes by key.
+	RangeID    uint64
+	RangeStart []byte
+	RangeEnd   []byte
+
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
@@ -70,6 +76,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.RangeID == 0 {
+		cfg.RangeID = 1
 	}
 	if cfg.ElectionTimeoutMin <= 0 {
 		cfg.ElectionTimeoutMin = 300 * time.Millisecond

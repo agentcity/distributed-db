@@ -255,6 +255,9 @@ func (k *kvService) Status(_ context.Context, _ *pbv2.StatusRequest) (*pbv2.Stat
 		Leader:      st.Leader,
 		CommitIndex: st.CommitIndex,
 		LastApplied: st.LastApplied,
+		RangeId:     k.s.cfg.RangeID,
+		RangeStart:  k.s.cfg.RangeStart,
+		RangeEnd:    k.s.cfg.RangeEnd,
 	}, nil
 }
 
