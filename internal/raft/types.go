@@ -93,6 +93,66 @@ type StateMachine interface {
 	Apply(entry model.Entry) error
 }
 
+// Snapshot is a compact image of the state machine at Index. Term is the term
+// of the log entry at Index, which lets Raft compare the snapshot with a
+// follower's log during InstallSnapshot.
+type Snapshot struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
+
+// Snapshotter is the optional StateMachine capability used by Node.Snapshot.
+// index is the last log index reflected in data. A state machine that does not
+// implement Snapshotter makes Node.Snapshot return ErrSnapshotUnsupported.
+type Snapshotter interface {
+	Snapshot() (data []byte, index uint64, err error)
+}
+
+// SnapshotRestorer is the optional StateMachine capability used when a node
+// installs a snapshot (either received from a leader or reloaded from disk). A
+// state machine that does not implement it keeps its current state; Raft still
+// persists and truncates the log, but the caller is responsible for restoring
+// the data through some other channel.
+type SnapshotRestorer interface {
+	RestoreSnapshot(data []byte) error
+}
+
+// SnapshotStore is the optional LogStore capability used for local log
+// compaction. Stores that do not implement it keep working: Node.Snapshot then
+// compacts only the in-memory log and does not persist a snapshot. TruncatePrefix
+// removes all entries with Index <= index from the durable log. LoadSnapshot
+// returns the zero Snapshot and a nil error when no snapshot has been saved.
+type SnapshotStore interface {
+	SaveSnapshot(snapshot Snapshot) error
+	LoadSnapshot() (Snapshot, error)
+	TruncatePrefix(index uint64) error
+}
+
+// InstallSnapshotRequest is sent by a leader whose follower is missing a
+// compacted log prefix.
+type InstallSnapshotRequest struct {
+	Term     uint64
+	LeaderID string
+	Snapshot Snapshot
+}
+
+// InstallSnapshotResponse is the reply to an InstallSnapshotRequest. LastIndex
+// is the follower's last log index after a successful install.
+type InstallSnapshotResponse struct {
+	Term      uint64
+	Success   bool
+	LastIndex uint64
+}
+
+// SnapshotTransport is the optional Transport capability used to ship
+// snapshots. A Transport that does not implement it cannot be used to bring a
+// lagging follower up to date after log compaction; the leader keeps trying
+// AppendEntries instead.
+type SnapshotTransport interface {
+	InstallSnapshot(ctx context.Context, peer string, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+}
+
 // PersistentState is everything Raft must recover after a restart.
 type PersistentState struct {
 	Term     uint64
@@ -116,6 +176,9 @@ var (
 	ErrTimeout = errors.New("raft: proposal timed out")
 	// ErrStopped is returned when a node is used after Stop.
 	ErrStopped = errors.New("raft: stopped")
+	// ErrSnapshotUnsupported is returned when the configured StateMachine
+	// cannot produce snapshots.
+	ErrSnapshotUnsupported = errors.New("raft: snapshots unsupported by state machine")
 )
 
 // errLostQuorum classifies a proposal that was accepted while this node was
@@ -143,4 +206,12 @@ func cloneEntries(entries []model.Entry) []model.Entry {
 		out[i] = cloneEntry(e)
 	}
 	return out
+}
+
+func cloneSnapshot(s Snapshot) Snapshot {
+	c := s
+	if s.Data != nil {
+		c.Data = append([]byte(nil), s.Data...)
+	}
+	return c
 }

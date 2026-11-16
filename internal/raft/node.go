@@ -34,6 +34,7 @@ type Node struct {
 	term             uint64
 	votedFor         string
 	entries          []model.Entry
+	snapshot         Snapshot
 	commitIndex      uint64
 	lastApplied      uint64
 	leaderNoopIndex  uint64
@@ -46,6 +47,11 @@ type Node struct {
 	lastAck          map[string]time.Time
 	triggers         map[string]chan struct{}
 	pending          map[uint64]*proposal
+
+	// applyMu serialises state-machine mutations (Apply) against snapshot
+	// creation and installation, so a snapshot can never interleave with an
+	// entry application. It is acquired before mu.
+	applyMu sync.Mutex
 
 	applyCond *sync.Cond
 	stopCh    chan struct{}
@@ -89,9 +95,26 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 	if err != nil {
 		return nil, fmt.Errorf("raft: load persistent state: %w", err)
 	}
+	var snap Snapshot
+	if ss, ok := store.(SnapshotStore); ok {
+		snap, err = ss.LoadSnapshot()
+		if err != nil {
+			return nil, fmt.Errorf("raft: load snapshot: %w", err)
+		}
+	}
+	// Entries are contiguous after the snapshot (or from index 1 without one);
+	// a compacted store loads only the suffix it still holds.
+	firstIndex := snap.Index + 1
 	for i, e := range state.Entries {
-		if e.Index != uint64(i)+1 {
-			return nil, fmt.Errorf("raft: non-contiguous log: entry %d has index %d", i+1, e.Index)
+		if e.Index != firstIndex+uint64(i) {
+			return nil, fmt.Errorf("raft: non-contiguous log: entry %d has index %d, want %d", i+1, e.Index, firstIndex+uint64(i))
+		}
+	}
+	if snap.Index > 0 {
+		if r, ok := sm.(SnapshotRestorer); ok {
+			if err := r.RestoreSnapshot(append([]byte(nil), snap.Data...)); err != nil {
+				return nil, fmt.Errorf("raft: restore state machine from snapshot: %w", err)
+			}
 		}
 	}
 
@@ -100,22 +123,25 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	n := &Node{
-		cfg:        cfg,
-		store:      store,
-		sm:         sm,
-		tr:         tr,
-		logger:     logger,
-		term:       state.Term,
-		votedFor:   state.VotedFor,
-		entries:    cloneEntries(state.Entries),
-		role:       Follower,
-		votes:      make(map[string]bool),
-		nextIndex:  make(map[string]uint64),
-		matchIndex: make(map[string]uint64),
-		lastAck:    make(map[string]time.Time),
-		triggers:   make(map[string]chan struct{}),
-		pending:    make(map[uint64]*proposal),
-		stopCh:     make(chan struct{}),
+		cfg:         cfg,
+		store:       store,
+		sm:          sm,
+		tr:          tr,
+		logger:      logger,
+		term:        state.Term,
+		votedFor:    state.VotedFor,
+		entries:     cloneEntries(state.Entries),
+		snapshot:    cloneSnapshot(snap),
+		commitIndex: snap.Index,
+		lastApplied: snap.Index,
+		role:        Follower,
+		votes:       make(map[string]bool),
+		nextIndex:   make(map[string]uint64),
+		matchIndex:  make(map[string]uint64),
+		lastAck:     make(map[string]time.Time),
+		triggers:    make(map[string]chan struct{}),
+		pending:     make(map[uint64]*proposal),
+		stopCh:      make(chan struct{}),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	return n, nil
@@ -340,7 +366,7 @@ func (n *Node) Status() Status {
 		Term:        n.term,
 		Leader:      n.leaderID,
 		CommitIndex: n.commitIndex,
-		LastIndex:   uint64(len(n.entries)),
+		LastIndex:   n.lastIndexLocked(),
 		LastApplied: n.lastApplied,
 	}
 }
@@ -357,6 +383,208 @@ func (n *Node) IsLeader() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.role == Leader && !n.stopped
+}
+
+// Snapshot asks the state machine for a snapshot, persists it through the
+// optional SnapshotStore capability and truncates the local log prefix. The
+// returned snapshot is a copy owned by the caller.
+//
+// A StateMachine that does not implement Snapshotter makes this return
+// ErrSnapshotUnsupported. A LogStore that does not implement SnapshotStore
+// still compacts the in-memory log, but the snapshot is not durable, so a
+// restart replays the full log.
+func (n *Node) Snapshot() (Snapshot, error) {
+	snapshotter, ok := n.sm.(Snapshotter)
+	if !ok {
+		return Snapshot{}, ErrSnapshotUnsupported
+	}
+	data, index, err := snapshotter.Snapshot()
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("raft: state machine snapshot: %w", err)
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return Snapshot{}, ErrStopped
+	}
+	if index == 0 {
+		// Nothing has been applied yet, so there is no state to persist.
+		n.mu.Unlock()
+		return Snapshot{}, nil
+	}
+	if index > n.lastIndexLocked() {
+		n.mu.Unlock()
+		return Snapshot{}, fmt.Errorf("raft: snapshot index %d outside log [%d,%d]", index, n.snapshot.Index, n.lastIndexLocked())
+	}
+	if index <= n.snapshot.Index {
+		// Nothing new has been applied since the last snapshot.
+		snap := cloneSnapshot(n.snapshot)
+		n.mu.Unlock()
+		return snap, nil
+	}
+	term, ok := n.termAtLocked(index)
+	if !ok {
+		n.mu.Unlock()
+		return Snapshot{}, fmt.Errorf("raft: no log entry at snapshot index %d", index)
+	}
+	snap := Snapshot{Index: index, Term: term, Data: append([]byte(nil), data...)}
+
+	// Persist before the local log loses its prefix: a crash in between must
+	// leave a loadable state, never a truncated log without a snapshot.
+	if ss, ok := n.store.(SnapshotStore); ok {
+		if err := ss.SaveSnapshot(snap); err != nil {
+			n.mu.Unlock()
+			return Snapshot{}, fmt.Errorf("raft: persist snapshot: %w", err)
+		}
+		if err := ss.TruncatePrefix(index); err != nil {
+			n.mu.Unlock()
+			return Snapshot{}, fmt.Errorf("raft: truncate log prefix: %w", err)
+		}
+	}
+	drop := index - n.snapshot.Index
+	n.entries = n.entries[drop:]
+	n.snapshot = snap
+	n.mu.Unlock()
+	return cloneSnapshot(snap), nil
+}
+
+// RestoreSnapshot installs a snapshot received from a leader. The state
+// machine is restored (when it implements SnapshotRestorer), the durable and
+// in-memory logs are truncated to the snapshot, and commit/applied advance to
+// its index.
+func (n *Node) RestoreSnapshot(s Snapshot) error {
+	if s.Index == 0 {
+		return errors.New("raft: snapshot index must be positive")
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return ErrStopped
+	}
+	if s.Index <= n.snapshot.Index {
+		// Already at least as up to date; snapshots are idempotent.
+		n.mu.Unlock()
+		return nil
+	}
+	// Keep a matching suffix: entries after the snapshot are still valid when
+	// this node's log agrees with the leader at the snapshot index.
+	keepSuffix := false
+	if term, ok := n.termAtLocked(s.Index); ok && term == s.Term {
+		keepSuffix = true
+	}
+	n.mu.Unlock()
+
+	snap := cloneSnapshot(s)
+	if r, ok := n.sm.(SnapshotRestorer); ok {
+		if err := r.RestoreSnapshot(append([]byte(nil), snap.Data...)); err != nil {
+			return fmt.Errorf("raft: restore state machine: %w", err)
+		}
+	} else {
+		n.logger.Warn("raft: state machine cannot restore snapshots", "id", n.cfg.ID, "index", snap.Index)
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped {
+		return ErrStopped
+	}
+	if snap.Index <= n.snapshot.Index {
+		return nil
+	}
+	if ss, ok := n.store.(SnapshotStore); ok {
+		if err := ss.SaveSnapshot(snap); err != nil {
+			return fmt.Errorf("raft: persist installed snapshot: %w", err)
+		}
+		// Drop the divergent suffix first, then everything the snapshot
+		// covers, so a crash between the two steps still reloads safely.
+		if !keepSuffix {
+			if err := n.store.Truncate(snap.Index + 1); err != nil {
+				return fmt.Errorf("raft: truncate log after snapshot: %w", err)
+			}
+		}
+		if err := ss.TruncatePrefix(snap.Index); err != nil {
+			return fmt.Errorf("raft: truncate log prefix after snapshot: %w", err)
+		}
+	}
+	oldIndex := n.snapshot.Index
+	if keepSuffix {
+		n.entries = n.entries[snap.Index-oldIndex:]
+	} else {
+		n.entries = nil
+		n.failPendingFromLocked(snap.Index+1, ErrNotLeader)
+	}
+	n.snapshot = snap
+	if n.commitIndex < snap.Index {
+		n.commitIndex = snap.Index
+	}
+	if n.lastApplied < snap.Index {
+		n.lastApplied = snap.Index
+	}
+	n.applyCond.Broadcast()
+	return nil
+}
+
+// HandleInstallSnapshot implements the RPC receiver for InstallSnapshot. The
+// snapshot is persisted and the state machine restored before success is
+// reported.
+func (n *Node) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	if req == nil {
+		return nil, errors.New("raft: nil InstallSnapshotRequest")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return nil, ErrStopped
+	}
+	if req.Term < n.term {
+		term := n.term
+		n.mu.Unlock()
+		return &InstallSnapshotResponse{Term: term}, nil
+	}
+	if req.Term > n.term {
+		if err := n.adoptTermLocked(req.Term, req.LeaderID); err != nil {
+			n.mu.Unlock()
+			return nil, err
+		}
+	} else {
+		if n.role != Follower {
+			n.stepDownLocked(req.LeaderID)
+		} else {
+			n.leaderID = req.LeaderID
+		}
+		n.resetElectionDeadlineLocked()
+	}
+	upToDate := req.Snapshot.Index <= n.snapshot.Index || req.Snapshot.Index <= n.commitIndex
+	term := n.term
+	n.mu.Unlock()
+
+	if upToDate {
+		n.mu.Lock()
+		last := n.lastIndexLocked()
+		term = n.term
+		n.mu.Unlock()
+		return &InstallSnapshotResponse{Term: term, Success: true, LastIndex: last}, nil
+	}
+	if err := n.RestoreSnapshot(req.Snapshot); err != nil {
+		return nil, err
+	}
+	n.mu.Lock()
+	resp := &InstallSnapshotResponse{Term: n.term, Success: true, LastIndex: n.lastIndexLocked()}
+	n.mu.Unlock()
+	return resp, nil
 }
 
 // HandleRequestVote implements the RPC receiver. The term and vote are
@@ -437,15 +665,24 @@ func (n *Node) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 
 	prev := req.PrevLogIndex
 	last := n.lastIndexLocked()
+	if prev < n.snapshot.Index {
+		// This node compacted past the leader's prefix; it is already further
+		// ahead than the leader thinks. Report the snapshot index so the leader
+		// can advance nextIndex and resume with AppendEntries.
+		return &AppendEntriesResponse{Term: n.term, Success: true, MatchIndex: n.snapshot.Index}, nil
+	}
 	if prev > last {
 		return &AppendEntriesResponse{Term: n.term, Success: false, ConflictIndex: last + 1}, nil
 	}
-	if prev > 0 && n.entries[prev-1].Term != req.PrevLogTerm {
-		return &AppendEntriesResponse{
-			Term:          n.term,
-			Success:       false,
-			ConflictIndex: n.firstIndexOfTermLocked(n.entries[prev-1].Term),
-		}, nil
+	if prev > 0 {
+		prevTerm, ok := n.termAtLocked(prev)
+		if !ok || prevTerm != req.PrevLogTerm {
+			return &AppendEntriesResponse{
+				Term:          n.term,
+				Success:       false,
+				ConflictIndex: n.firstIndexOfTermLocked(prevTerm),
+			}, nil
+		}
 	}
 
 	// Reject malformed (non-contiguous) batches rather than corrupting the log.
@@ -467,7 +704,7 @@ func (n *Node) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 			appendFrom = i
 			break
 		}
-		if n.entries[e.Index-1].Term == e.Term {
+		if term, ok := n.termAtLocked(e.Index); ok && term == e.Term {
 			lastNew = e.Index
 			continue
 		}
@@ -481,7 +718,7 @@ func (n *Node) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 			if err := n.store.Truncate(truncAt); err != nil {
 				return nil, fmt.Errorf("raft: truncate conflicting suffix: %w", err)
 			}
-			n.entries = n.entries[:truncAt-1]
+			n.entries = n.entries[:truncAt-n.snapshot.Index-1]
 			// If this node was still tracking proposals that lived in the
 			// removed suffix, fail them instead of letting them hang.
 			n.failPendingFromLocked(truncAt, ErrNotLeader)
@@ -718,9 +955,10 @@ func (n *Node) replicateLoop(ctx context.Context, peer string, trigger <-chan st
 	}
 }
 
-// sendAppendEntries sends one AppendEntries batch. It returns true when an
-// immediate retry is useful (more entries to send or a conflict to back up
-// through).
+// sendAppendEntries sends one AppendEntries batch, or an InstallSnapshot when
+// the follower is missing a compacted prefix. It returns true when an immediate
+// retry is useful (more entries to send, a snapshot to install or a conflict to
+// back up through).
 func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term uint64) bool {
 	n.mu.Lock()
 	if n.stopped || n.role != Leader || n.term != term {
@@ -735,17 +973,23 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 	if next > last+1 {
 		next = last + 1
 	}
+	snapIndex := n.snapshot.Index
+	if snapIndex > 0 && next <= snapIndex {
+		// The entries the follower needs were compacted away.
+		n.mu.Unlock()
+		return n.sendInstallSnapshot(leaderCtx, peer, term)
+	}
 	prev := next - 1
 	var prevTerm uint64
 	if prev > 0 {
-		prevTerm = n.entries[prev-1].Term
+		prevTerm, _ = n.termAtLocked(prev)
 	}
 	req := &AppendEntriesRequest{
 		Term:         term,
 		LeaderID:     n.cfg.ID,
 		PrevLogIndex: prev,
 		PrevLogTerm:  prevTerm,
-		Entries:      cloneEntries(n.entries[next-1:]),
+		Entries:      cloneEntries(n.entries[next-n.snapshot.Index-1:]),
 		LeaderCommit: n.commitIndex,
 	}
 	n.mu.Unlock()
@@ -770,6 +1014,11 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 	}
 	if resp.Success {
 		match := prev + uint64(len(req.Entries))
+		// A compacted follower reports its snapshot index, which can be ahead
+		// of the batch the leader just sent.
+		if resp.MatchIndex > match {
+			match = resp.MatchIndex
+		}
 		if match > n.matchIndex[peer] {
 			n.matchIndex[peer] = match
 		}
@@ -798,6 +1047,61 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 	return newNext < oldNext
 }
 
+// sendInstallSnapshot ships the current snapshot to a follower whose nextIndex
+// falls inside the compacted prefix.
+func (n *Node) sendInstallSnapshot(leaderCtx context.Context, peer string, term uint64) bool {
+	n.mu.Lock()
+	if n.stopped || n.role != Leader || n.term != term {
+		n.mu.Unlock()
+		return false
+	}
+	snap := cloneSnapshot(n.snapshot)
+	if snap.Index == 0 {
+		n.mu.Unlock()
+		return false
+	}
+	tr, ok := n.tr.(SnapshotTransport)
+	if !ok {
+		n.mu.Unlock()
+		n.logger.Warn("raft: transport cannot install snapshots", "id", n.cfg.ID, "peer", peer)
+		return false
+	}
+	req := &InstallSnapshotRequest{Term: term, LeaderID: n.cfg.ID, Snapshot: snap}
+	n.mu.Unlock()
+
+	rpcCtx, cancel := context.WithTimeout(leaderCtx, n.appendTimeout())
+	defer cancel()
+	resp, err := tr.InstallSnapshot(rpcCtx, peer, req)
+	if err != nil || resp == nil {
+		return false
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped || n.role != Leader || n.term != term {
+		return false
+	}
+	if resp.Term > n.term {
+		if err := n.adoptTermLocked(resp.Term, ""); err != nil {
+			n.logger.Error("raft: adopt higher term failed", "id", n.cfg.ID, "error", err)
+		}
+		return false
+	}
+	if !resp.Success {
+		return false
+	}
+	if resp.LastIndex > n.matchIndex[peer] {
+		n.matchIndex[peer] = resp.LastIndex
+	}
+	if snap.Index > n.matchIndex[peer] {
+		n.matchIndex[peer] = snap.Index
+	}
+	n.nextIndex[peer] = n.matchIndex[peer] + 1
+	n.lastAck[peer] = time.Now()
+	n.maybeCommitLocked()
+	return n.nextIndex[peer] <= n.lastIndexLocked()
+}
+
 func (n *Node) applyLoop() {
 	for {
 		n.mu.Lock()
@@ -808,10 +1112,33 @@ func (n *Node) applyLoop() {
 			n.mu.Unlock()
 			return
 		}
+		n.mu.Unlock()
+
+		// Serialise with snapshot creation/installation. applyMu is taken
+		// before mu everywhere; it is never held while waiting on applyCond.
+		n.applyMu.Lock()
+		n.mu.Lock()
+		if n.stopped {
+			n.mu.Unlock()
+			n.applyMu.Unlock()
+			return
+		}
+		if n.lastApplied >= n.commitIndex {
+			n.mu.Unlock()
+			n.applyMu.Unlock()
+			continue
+		}
+		if n.lastApplied < n.snapshot.Index {
+			n.lastApplied = n.snapshot.Index
+			n.mu.Unlock()
+			n.applyMu.Unlock()
+			continue
+		}
 		index := n.lastApplied + 1
 		if index > n.lastIndexLocked() {
 			// Defensive: a commit index beyond the log would otherwise panic.
 			n.mu.Unlock()
+			n.applyMu.Unlock()
 			select {
 			case <-n.stopCh:
 				return
@@ -819,7 +1146,7 @@ func (n *Node) applyLoop() {
 			}
 			continue
 		}
-		entry := cloneEntry(n.entries[index-1])
+		entry := cloneEntry(n.entries[index-n.snapshot.Index-1])
 		n.mu.Unlock()
 
 		err := n.sm.Apply(entry)
@@ -835,6 +1162,7 @@ func (n *Node) applyLoop() {
 			close(p.done)
 		}
 		n.mu.Unlock()
+		n.applyMu.Unlock()
 	}
 }
 
@@ -847,14 +1175,33 @@ func (n *Node) majority() int {
 }
 
 func (n *Node) lastIndexLocked() uint64 {
-	return uint64(len(n.entries))
+	return n.snapshot.Index + uint64(len(n.entries))
+}
+
+func (n *Node) firstIndexLocked() uint64 {
+	return n.snapshot.Index + 1
+}
+
+// termAtLocked returns the term of the entry at index. Index 0 has term 0; the
+// compacted prefix is represented by the snapshot term.
+func (n *Node) termAtLocked(index uint64) (uint64, bool) {
+	if index == 0 {
+		return 0, true
+	}
+	if n.snapshot.Index > 0 && index == n.snapshot.Index {
+		return n.snapshot.Term, true
+	}
+	if index <= n.snapshot.Index || index > n.lastIndexLocked() {
+		return 0, false
+	}
+	return n.entries[index-n.snapshot.Index-1].Term, true
 }
 
 func (n *Node) lastLogTermLocked() uint64 {
-	if len(n.entries) == 0 {
-		return 0
+	if len(n.entries) > 0 {
+		return n.entries[len(n.entries)-1].Term
 	}
-	return n.entries[len(n.entries)-1].Term
+	return n.snapshot.Term
 }
 
 func (n *Node) firstIndexOfTermLocked(term uint64) uint64 {
@@ -862,7 +1209,13 @@ func (n *Node) firstIndexOfTermLocked(term uint64) uint64 {
 	for i > 0 && n.entries[i-1].Term == term {
 		i--
 	}
-	return uint64(i) + 1
+	if i == 0 {
+		if n.snapshot.Index > 0 && n.snapshot.Term == term {
+			return n.snapshot.Index
+		}
+		return n.snapshot.Index + 1
+	}
+	return n.snapshot.Index + uint64(i) + 1
 }
 
 func (n *Node) resetElectionDeadlineLocked() {
@@ -964,7 +1317,8 @@ func (n *Node) maybeCommitLocked() {
 		// Skip foreign-term entries and keep scanning: a lower entry from the
 		// current term may already have a majority even if a higher one does
 		// not. Only current-term entries are eligible for direct commit.
-		if n.entries[index-1].Term != n.term {
+		term, ok := n.termAtLocked(index)
+		if !ok || term != n.term {
 			continue
 		}
 		count := 1 // self
