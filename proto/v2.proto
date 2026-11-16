@@ -28,6 +28,7 @@ service MetaService {
   rpc AllocTS(AllocTSRequest) returns (AllocTSResponse);
   rpc GetRange(GetRangeRequest) returns (RangeInfo);
   rpc ListRanges(ListRangesRequest) returns (ListRangesResponse);
+  rpc Leader(LeaderRequest) returns (LeaderResponse);
 }
 
 message GetRequest {
@@ -182,6 +183,12 @@ message InstallSnapshotResponse {
   uint64 term = 1;
   bool success = 2;
   uint64 last_index = 3;
+}
+
+message LeaderRequest {}
+message LeaderResponse {
+  string leader = 1;
+  uint64 term = 2;
 }
 
 message GetRangeRequest { bytes key = 1; }

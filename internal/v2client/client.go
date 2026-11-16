@@ -39,9 +39,16 @@ const (
 
 // Client is a transactional v2 KV client. It is safe for concurrent use.
 type Client struct {
-	meta   pbv2.MetaServiceClient
-	metaCC *grpc.ClientConn
-	addrs  []string
+	meta      pbv2.MetaServiceClient
+	metaCC    *grpc.ClientConn
+	metaAddr  string
+	metaSeeds []string
+	addrs     []string
+
+	metaMu          sync.Mutex
+	metaConns       []*grpc.ClientConn
+	metaLeaderAddr  string
+	metaLeaderUntil time.Time
 
 	mu      sync.Mutex
 	clients map[string]pbv2.KVServiceClient
@@ -69,12 +76,15 @@ func New(metaAddr string, addrs []string) (*Client, error) {
 		return nil, fmt.Errorf("v2client: dial meta: %w", err)
 	}
 	return &Client{
-		meta:    pbv2.NewMetaServiceClient(cc),
-		metaCC:  cc,
-		addrs:   append([]string(nil), addrs...),
-		clients: make(map[string]pbv2.KVServiceClient),
-		conns:   make(map[string]*grpc.ClientConn),
-		leaders: make(map[uint64]leaderEntry),
+		meta:      pbv2.NewMetaServiceClient(cc),
+		metaCC:    cc,
+		metaAddr:  metaAddr,
+		metaSeeds: []string{metaAddr},
+		metaConns: []*grpc.ClientConn{cc},
+		addrs:     append([]string(nil), addrs...),
+		clients:   make(map[string]pbv2.KVServiceClient),
+		conns:     make(map[string]*grpc.ClientConn),
+		leaders:   make(map[uint64]leaderEntry),
 	}, nil
 }
 
@@ -87,17 +97,22 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	conns := c.conns
-	metaCC := c.metaCC
 	c.conns = nil
 	c.clients = nil
-	c.metaCC = nil
 	c.mu.Unlock()
+
+	c.metaMu.Lock()
+	metaConns := c.metaConns
+	c.metaConns = nil
+	c.metaCC = nil
+	c.metaMu.Unlock()
+
 	var errs []error
 	for _, cc := range conns {
 		errs = append(errs, cc.Close())
 	}
-	if metaCC != nil {
-		errs = append(errs, metaCC.Close())
+	for _, cc := range metaConns {
+		errs = append(errs, cc.Close())
 	}
 	return errors.Join(errs...)
 }
@@ -142,12 +157,114 @@ func (c *Client) invalidateLeader(rangeID uint64) {
 	c.mu.Unlock()
 }
 
+// tryMetaSeeds re-discovers the leader from the original meta seed addresses.
+// It is used when the cached leader is gone.
+func (c *Client) tryMetaSeeds(ctx context.Context) (pbv2.MetaServiceClient, bool) {
+	c.metaMu.Lock()
+	seeds := append([]string(nil), c.metaSeeds...)
+	c.metaMu.Unlock()
+	for _, addr := range seeds {
+		cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			continue
+		}
+		mc := pbv2.NewMetaServiceClient(cc)
+		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+		resp, err := mc.Leader(probeCtx, &pbv2.LeaderRequest{})
+		cancel()
+		if err != nil {
+			_ = cc.Close()
+			continue
+		}
+		target, targetCC, targetMC := addr, cc, mc
+		if leader := resp.GetLeader(); leader != "" && leader != addr {
+			lcc, err := grpc.NewClient(leader, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				_ = cc.Close()
+				continue
+			}
+			target, targetCC, targetMC = leader, lcc, pbv2.NewMetaServiceClient(lcc)
+		}
+		c.metaMu.Lock()
+		c.meta = targetMC
+		c.metaCC = targetCC
+		c.metaAddr = target
+		c.metaConns = append(c.metaConns, targetCC)
+		c.metaLeaderAddr = target
+		c.metaLeaderUntil = time.Now().Add(leaderTTL)
+		c.metaMu.Unlock()
+		if target != addr {
+			_ = cc.Close()
+		}
+		return targetMC, true
+	}
+	return nil, false
+}
+
+// metaClient returns a client connected to the current meta leader. A follower
+// answers Leader with the current leader, so callers can start from any meta
+// node and get redirected without a separate discovery service.
+func (c *Client) metaClient(ctx context.Context) (pbv2.MetaServiceClient, error) {
+	c.metaMu.Lock()
+	mc := c.meta
+	addr := c.metaAddr
+	cached := c.metaLeaderAddr
+	until := c.metaLeaderUntil
+	c.metaMu.Unlock()
+	if cached != "" && cached == addr && time.Now().Before(until) {
+		return mc, nil
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	resp, err := mc.Leader(probeCtx, &pbv2.LeaderRequest{})
+	cancel()
+	if err != nil {
+		if seeded, ok := c.tryMetaSeeds(ctx); ok {
+			return seeded, nil
+		}
+		return mc, nil
+	}
+	leader := resp.GetLeader()
+	if leader == "" || leader == addr {
+		c.metaMu.Lock()
+		c.metaLeaderAddr = addr
+		c.metaLeaderUntil = time.Now().Add(leaderTTL)
+		c.metaMu.Unlock()
+		return mc, nil
+	}
+	cc, err := grpc.NewClient(leader, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return mc, nil
+	}
+	next := pbv2.NewMetaServiceClient(cc)
+	c.metaMu.Lock()
+	c.meta = next
+	c.metaCC = cc
+	c.metaAddr = leader
+	c.metaConns = append(c.metaConns, cc)
+	c.metaLeaderAddr = leader
+	c.metaLeaderUntil = time.Now().Add(leaderTTL)
+	c.metaMu.Unlock()
+	return next, nil
+}
+
+func (c *Client) invalidateMetaLeader() {
+	c.metaMu.Lock()
+	c.metaLeaderAddr = ""
+	c.metaLeaderUntil = time.Time{}
+	c.metaMu.Unlock()
+}
+
 // rangeFor asks the meta service which range owns key. A meta failure is not
 // fatal: the client falls back to probing every configured node.
 func (c *Client) rangeFor(ctx context.Context, key []byte) (*pbv2.RangeInfo, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	r, err := c.meta.GetRange(probeCtx, &pbv2.GetRangeRequest{Key: key})
+	mc, err := c.metaClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r, err := mc.GetRange(probeCtx, &pbv2.GetRangeRequest{Key: key})
 	if err != nil {
 		return nil, err
 	}
@@ -267,11 +384,27 @@ func (c *Client) retry(ctx context.Context, key []byte, call callFunc) error {
 
 // AllocTS reserves one timestamp from the meta service.
 func (c *Client) AllocTS(ctx context.Context) (uint64, error) {
-	resp, err := c.meta.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 1})
-	if err != nil {
-		return 0, err
+	var lastErr error
+	deadline := time.Now().Add(defaultTimeout)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		mc, err := c.metaClient(ctx)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := mc.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 1})
+		if err == nil {
+			return resp.GetStart(), nil
+		}
+		lastErr = err
+		c.invalidateMetaLeader()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	return resp.GetStart(), nil
+	return 0, fmt.Errorf("v2client: alloc ts: %w", lastErr)
 }
 
 // KV is one row returned by Txn.Scan.
