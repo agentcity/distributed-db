@@ -7,8 +7,10 @@
 > **v1** (`cmd/db`) — учебно-демонстрационный координатор + hash-шардинг.
 > **v2** (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`) — experimental alpha:
 > Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, dynamic
-> membership, chunked snapshots, SQL P0. Это ещё **не production-СУБД**:
-> нет TLS/auth, PITR, joint consensus и подтверждённого SLO.
+> membership, chunked snapshots, SQL P0. Production-профиль теперь
+> `-durability=sync` (fsync state machine); `fast` — opt-in. Это ещё
+> **не production-СУБД**: gRPC/meta TLS не интегрирован, PITR и joint
+> consensus только в ADR, SLO p99/1 ТБ не подтверждены.
 > Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 Что реализовать до production: [docs/PRODUCTION-PLAN.md](docs/PRODUCTION-PLAN.md).
 Гейты и путь: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
@@ -143,7 +145,7 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 - Stage 2.5: snapshot resume по `next_offset`.
 - Stage 2.6: Add/Remove replica (learner → voter), meta orchestration,
   membership persist; single-server change, без joint consensus.
-- Замеры на M1 Pro/loopback: 3 узла single txn ~11.6 мс (~86 tx/s),
+- Замеры на M1 Pro/loopback в **fast**-профиле: 3 узла single txn ~11.6 мс (~86 tx/s),
   parallel ~1.8 мс/op (~5.5k tx/s), batch 256 ~0.15 мс/txn
   (~6.6–6.9k tx/s); PostgreSQL 13 рядом — ~6.8k tx/s на 10 клиентах.
   Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
