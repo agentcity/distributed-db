@@ -31,7 +31,7 @@ scope: {backend: true, console: false, mobile: false}
 ## Результат
 
 - 3-node sequential: ~33 мс → ~11.6 мс.
-- 3-node parallel: ~24 мс/op → ~1.8 мс/op (~5.5k tx/s).
+- 3-node parallel: ~24 мс/op → ~1.2–2.1 мс/op (~480–820 tx/s; старая запись 5.5k была ошибкой единиц).
 - PostgreSQL 13 на том же железе: ~0.68 мс/1 469 tps (1 клиент),
   ~1.47 мс/6 835 tps (10 клиентов).
 - Разрыв: ~1.2× на 10 клиентах, ~17× на одном.
