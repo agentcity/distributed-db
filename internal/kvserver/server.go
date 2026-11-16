@@ -65,6 +65,13 @@ type Config struct {
 	// Metrics, when non-nil, records every unary KV/Raft RPC duration and
 	// error through one SLO tracker.
 	Metrics *metrics.SLO
+
+	// SyncStateMachine forces a Pebble fsync on every state-machine batch.
+	// The default (false) relies on the durable Raft log: committed entries
+	// are replayed on restart, so a second fsync per transaction is redundant.
+	// Set true only when the state machine must survive independently of the
+	// Raft log (for example, a custom log store that truncates aggressively).
+	SyncStateMachine bool
 }
 
 // Server is one v2 KV node: a RangeHost owning one or more independently
@@ -143,7 +150,7 @@ func New(cfg Config) (*Server, error) {
 		// State-machine durability comes from the Raft log: entries are
 		// replayed after a crash. Syncing every Pebble batch would double the
 		// per-commit fsync cost. Snapshot creation still fsyncs its files.
-		SyncWrites: false,
+		SyncWrites: cfg.SyncStateMachine,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kvserver: open shared storage: %w", err)
