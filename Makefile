@@ -1,8 +1,10 @@
 SHELL := /bin/bash
 GO ?= go
 BINARY := bin/db
+CHAOS_ROUNDS ?= 3
+CHAOS_TIMEOUT ?= 1200
 
-.PHONY: all build test test-short vet fmt proto compose-up compose-down smoke run-coordinator run-node1 run-node2 run-node3 dev clean
+.PHONY: all build test test-short vet fmt proto compose-up compose-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean
 
 all: build
 
@@ -37,6 +39,13 @@ compose-down:
 
 smoke:
 	./scripts/smoke.sh
+
+# Nightly chaos/soak suite (Jepsen partitions + v2 snapshot/split tests).
+# Override CHAOS_ROUNDS=1 for a local smoke run.
+chaos-nightly:
+	GO="$(GO)" GOFLAGS="$(GOFLAGS)" \
+		CHAOS_ROUNDS="$(CHAOS_ROUNDS)" CHAOS_TIMEOUT="$(CHAOS_TIMEOUT)" \
+		./scripts/nightly-chaos.sh
 
 # --- local 3-node cluster + coordinator (separate terminals) -----------------
 run-coordinator:

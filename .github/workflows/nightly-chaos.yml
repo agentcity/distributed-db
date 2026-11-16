@@ -1,0 +1,68 @@
+name: nightly-chaos
+
+on:
+  schedule:
+    # Daily at 02:30 UTC.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Chaos rounds (use 1 for a smoke run)"
+        required: false
+        default: "3"
+      timeout:
+        description: "Per-round timeout in seconds"
+        required: false
+        default: "1500"
+
+# Least privilege: checkout needs read-only repository contents. The artifact
+# upload uses the workflow runtime token, not GITHUB_TOKEN scopes.
+permissions:
+  contents: read
+
+# Never run two nightly chaos jobs at once (scheduled run + manual dispatch).
+concurrency:
+  group: nightly-chaos
+  cancel-in-progress: false
+
+jobs:
+  chaos:
+    name: chaos (${{ github.event.inputs.rounds || '3' }} rounds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Run nightly chaos rounds
+        env:
+          CHAOS_ROUNDS: ${{ github.event.inputs.rounds || '3' }}
+          CHAOS_TIMEOUT: ${{ github.event.inputs.timeout || '1500' }}
+          # Gather all three rounds even if one fails, then fail the job.
+          CHAOS_CONTINUE_ON_FAILURE: "1"
+          GOFLAGS: "-mod=readonly"
+        run: ./scripts/nightly-chaos.sh
+
+      # Keep logs and the CSV/Markdown summary even when a round fails or the
+      # job times out in a step.
+      - name: Upload chaos artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/chaos/
+          if-no-files-found: warn
+          retention-days: 14
