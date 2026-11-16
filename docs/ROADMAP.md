@@ -236,6 +236,14 @@ GROUP BY, INNER JOIN и минимальный pgwire сделаны. Остал
 (JOIN order/cost), extended protocol, LEFT/RIGHT JOIN. SQL на 3 узлах
 с kill лидера проверен.
 
+## Production readiness
+
+Продуктовая оценка, применимость и гейты до production:
+[PRODUCT-READINESS.md](PRODUCT-READINESS.md).
+
+Коротко: Stage 1–3 закрыты как MVP, но production-блокеры — joint consensus,
+PITR, TLS/auth, rolling upgrade, SLO p99 и multi-AZ placement.
+
 ## Целевая архитектура
 
 См. [ARCHITECTURE-TARGET.md](ARCHITECTURE-TARGET.md) и

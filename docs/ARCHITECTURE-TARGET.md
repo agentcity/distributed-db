@@ -1,5 +1,7 @@
 # Целевая архитектура: M2 / M3 / M5 + AI control plane
 
+> Продуктовая оценка и production-гейты: [PRODUCT-READINESS.md](PRODUCT-READINESS.md).
+
 > Схема: [target-architecture.png](diagrams/target-architecture.png)
 > Это проект архитектуры, а не описание уже реализованного. Текущее состояние —
 > `docs/ROADMAP.md`.

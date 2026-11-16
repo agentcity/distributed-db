@@ -4,9 +4,12 @@
 (по одной на шард), координатор как единая точка входа для клиентов,
 персистентный лог и WAL состояния.
 
-> Это учебно-демонстрационный проект, а не production-СУБД. Ограничения честно
-> перечислены в конце; для реальной эксплуатации нужны снапшоты, динамическая
-> карта шардов и нормальная TLS-инфраструктура.
+> **v1** (`cmd/db`) — учебно-демонстрационный координатор + hash-шардинг.
+> **v2** (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`) — experimental alpha:
+> Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, dynamic
+> membership, chunked snapshots, SQL P0. Это ещё **не production-СУБД**:
+> нет TLS/auth, PITR, joint consensus и подтверждённого SLO.
+> Продуктовая оценка и путь к production: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 
 ## Что внутри
 
@@ -33,6 +36,21 @@
   (delete — tombstone-команда). Follower отвечает `503` + `X-Leader`,
   координатор повторяет запрос у лидера. Прямой записи в локальный KV в обход
   Raft нет.
+
+## Production-статус и применимость
+
+Сейчас проект пригоден для **внутренних прототипов, dev/test, учебных задач и
+private single-tenant metadata store**, но не для публичного DBaaS, регулируемых
+данных и больших OLAP-нагрузок.
+
+Что уже есть: Raft group commit, Multi-Raft, MVCC/Percolator, cross-range 2PC,
+split/merge, replicated meta/TSO, learner→voter membership, leader transfer,
+chunked/resumable snapshots, backup/restore, SQL после split, extended pgwire,
+SLO-метрики и Jepsen partitions.
+
+Что блокирует production: joint consensus/decommission, PITR и restore-учения,
+TLS/auth/audit/encryption, rolling upgrade, SLO p99-прогон, multi-AZ placement.
+Полный разбор: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 
 ## Куда развивается проект (v2)
 
