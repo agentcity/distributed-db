@@ -1,12 +1,12 @@
 # ADR 0004: SQL-слой поверх транзакционного KV
 
 - Статус: accepted (P0 реализован частично)
-- Дата: 2026-11-16
+- Дата: 2026-11-17
 - Контекст: M5, зависит от M3 (2PC, TSO, smart client)
 - Связанные документы: `docs/ROADMAP.md`, `docs/CONTRACTS-V2.md`,
   `docs/adr/0002-mvcc-percolator.md`
 
-## Статус реализации (2026-11-16)
+## Статус реализации (2026-11-17)
 
 Реализовано в P0:
 
@@ -14,16 +14,19 @@
   UPDATE, DELETE; projection, WHERE, LIMIT, aggregates, GROUP BY, INNER JOIN;
 - каталог/строки/индексы в KV, order-preserving PK;
 - executor на KV-транзакциях, secondary indexes, multi-row UPDATE/DELETE;
-- HTTP `POST /v1/sql`, минимальный pgwire (`cmd/pgsrv`, psql simple query);
+- HTTP `POST /v1/sql`, pgwire simple + extended (Parse/Bind/Execute),
+  TLS/password auth (`cmd/pgsrv`);
+- cost-based planner, index selection, plan cache;
+- cross-range SQL через 2PC, SQL после split;
 - e2e на реальном KV, включая 3 узла и kill лидера.
 
 Не реализовано (следующие фазы):
 
-- cost-based planner / JOIN order / statistics;
-- extended query protocol, JDBC/pgx, TLS/auth, pg_catalog;
-- LEFT/RIGHT JOIN, >2 таблиц, CTE/оконные функции;
-- DECIMAL/NULL/JSON, внешние ключи, blocking DDL;
-- cross-range SQL-транзакции через 2PC.
+- гистограммы/полноценный CBO и JOIN order;
+- JDBC/pgx, pg_catalog;
+- AND/OR, LEFT/RIGHT JOIN, >2 таблиц, CTE/оконные функции;
+- DECIMAL/NULL/JSON, внешние ключи, online DDL;
+- parallel/distributed join.
 
 ## Контекст
 
