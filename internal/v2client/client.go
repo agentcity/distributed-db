@@ -280,6 +280,39 @@ type KV struct {
 	Value []byte
 }
 
+// CheckTxnStatus inspects the lock on key and reports committed/rolled-back/
+// live/expired status. startTS may be zero when the caller wants the lock's
+// own timestamp.
+func (c *Client) CheckTxnStatus(ctx context.Context, key []byte, startTS uint64) (*pbv2.CheckTxnStatusResponse, error) {
+	var out *pbv2.CheckTxnStatusResponse
+	if err := c.retry(ctx, key, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		resp, err := cl.CheckTxnStatus(ctx, &pbv2.CheckTxnStatusRequest{Key: key, StartTs: startTS})
+		if err != nil {
+			return "", "", err
+		}
+		out = resp
+		return resp.GetLeader(), resp.GetError(), nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ResolveLock commits (commitTS > 0) or rolls back (commitTS == 0) a
+// transaction's keys.
+func (c *Client) ResolveLock(ctx context.Context, keys [][]byte, startTS, commitTS uint64) error {
+	if len(keys) == 0 {
+		return errors.New("v2client: ResolveLock requires keys")
+	}
+	return c.retry(ctx, keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		resp, err := cl.ResolveLock(ctx, &pbv2.ResolveLockRequest{Keys: keys, StartTs: startTS, CommitTs: commitTS})
+		if err != nil {
+			return "", "", err
+		}
+		return resp.GetLeader(), resp.GetError(), nil
+	})
+}
+
 // Txn is a single optimistic transaction. It is not safe for concurrent use.
 type Txn struct {
 	c       *Client

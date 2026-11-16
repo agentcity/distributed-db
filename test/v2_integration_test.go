@@ -762,4 +762,29 @@ func TestV2LockResolution(t *testing.T) {
 	if st, err := client.CheckTxnStatus(ctx, &pbv2.CheckTxnStatusRequest{Key: []byte("rb"), StartTs: start2}); err != nil || !st.GetRolledBack() {
 		t.Fatalf("rolled back status: %v %+v", err, st)
 	}
+
+	// The transactional client exposes the same lock API for SQL/operators.
+	vc, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("v2 client: %v", err)
+	}
+	t.Cleanup(func() { _ = vc.Close() })
+	start3, commit3 := ts()
+	if _, err := client.Prewrite(ctx, &pbv2.PrewriteRequest{
+		StartTs: start3, Primary: []byte("vc"),
+		Mutations: []*pbv2.Mutation{{Key: []byte("vc"), Value: []byte("ok")}},
+	}); err != nil {
+		t.Fatalf("prewrite vc: %v", err)
+	}
+	st, err = vc.CheckTxnStatus(ctx, []byte("vc"), start3)
+	if err != nil || st.GetCommitted() || st.GetRolledBack() {
+		t.Fatalf("client status: %v %+v", err, st)
+	}
+	if err := vc.ResolveLock(ctx, [][]byte{[]byte("vc")}, start3, commit3); err != nil {
+		t.Fatalf("client resolve: %v", err)
+	}
+	gr, err = client.Get(ctx, &pbv2.GetRequest{Key: []byte("vc"), Ts: commit3})
+	if err != nil || !gr.GetFound() || string(gr.GetValue()) != "ok" {
+		t.Fatalf("client resolve get: %v %+v", err, gr)
+	}
 }
