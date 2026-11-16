@@ -27,6 +27,7 @@ const (
 	KVService_CheckTxnStatus_FullMethodName = "/dbv2.KVService/CheckTxnStatus"
 	KVService_ResolveLock_FullMethodName    = "/dbv2.KVService/ResolveLock"
 	KVService_SplitRange_FullMethodName     = "/dbv2.KVService/SplitRange"
+	KVService_MergeRanges_FullMethodName    = "/dbv2.KVService/MergeRanges"
 	KVService_Status_FullMethodName         = "/dbv2.KVService/Status"
 )
 
@@ -44,6 +45,7 @@ type KVServiceClient interface {
 	CheckTxnStatus(ctx context.Context, in *CheckTxnStatusRequest, opts ...grpc.CallOption) (*CheckTxnStatusResponse, error)
 	ResolveLock(ctx context.Context, in *ResolveLockRequest, opts ...grpc.CallOption) (*ResolveLockResponse, error)
 	SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error)
+	MergeRanges(ctx context.Context, in *MergeRangesRequest, opts ...grpc.CallOption) (*MergeRangesResponse, error)
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
@@ -135,6 +137,16 @@ func (c *kVServiceClient) SplitRange(ctx context.Context, in *SplitRangeRequest,
 	return out, nil
 }
 
+func (c *kVServiceClient) MergeRanges(ctx context.Context, in *MergeRangesRequest, opts ...grpc.CallOption) (*MergeRangesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MergeRangesResponse)
+	err := c.cc.Invoke(ctx, KVService_MergeRanges_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *kVServiceClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StatusResponse)
@@ -159,6 +171,7 @@ type KVServiceServer interface {
 	CheckTxnStatus(context.Context, *CheckTxnStatusRequest) (*CheckTxnStatusResponse, error)
 	ResolveLock(context.Context, *ResolveLockRequest) (*ResolveLockResponse, error)
 	SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error)
+	MergeRanges(context.Context, *MergeRangesRequest) (*MergeRangesResponse, error)
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedKVServiceServer()
 }
@@ -193,6 +206,9 @@ func (UnimplementedKVServiceServer) ResolveLock(context.Context, *ResolveLockReq
 }
 func (UnimplementedKVServiceServer) SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SplitRange not implemented")
+}
+func (UnimplementedKVServiceServer) MergeRanges(context.Context, *MergeRangesRequest) (*MergeRangesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method MergeRanges not implemented")
 }
 func (UnimplementedKVServiceServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Status not implemented")
@@ -362,6 +378,24 @@ func _KVService_SplitRange_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_MergeRanges_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MergeRangesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).MergeRanges(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_MergeRanges_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).MergeRanges(ctx, req.(*MergeRangesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _KVService_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StatusRequest)
 	if err := dec(in); err != nil {
@@ -418,6 +452,10 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SplitRange",
 			Handler:    _KVService_SplitRange_Handler,
+		},
+		{
+			MethodName: "MergeRanges",
+			Handler:    _KVService_MergeRanges_Handler,
 		},
 		{
 			MethodName: "Status",

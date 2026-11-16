@@ -112,11 +112,15 @@ func (s *Server) MergeRanges(ctx context.Context, leftID, rightID uint64) ([]Ran
 	if !left.node.IsLeader() {
 		return nil, fmt.Errorf("kvserver: merge: left range %d is not leader", leftID)
 	}
-	if !bytes.Equal(left.cfg.End, right.cfg.Start) {
-		return nil, fmt.Errorf("kvserver: merge: ranges %d and %d are not adjacent", leftID, rightID)
-	}
+	return s.mergeLocalLocked(left, right)
+}
 
-	right.frozen.Store(true)
+// mergeLocalLocked moves right's records into left and stops right. Caller
+// holds s.mu.
+func (s *Server) mergeLocalLocked(left, right *rangeGroup) ([]RangeConfig, error) {
+	if !bytes.Equal(left.cfg.End, right.cfg.Start) {
+		return nil, fmt.Errorf("kvserver: merge: ranges %d and %d are not adjacent", left.cfg.ID, right.cfg.ID)
+	}
 	records, err := right.store.ExportRange(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("kvserver: merge: export right: %w", err)
@@ -129,7 +133,7 @@ func (s *Server) MergeRanges(ctx context.Context, leftID, rightID uint64) ([]Ran
 		return nil, fmt.Errorf("kvserver: merge: stop right: %w", err)
 	}
 	s.hostMu.Lock()
-	delete(s.groups, rightID)
+	delete(s.groups, right.cfg.ID)
 	s.hostMu.Unlock()
 	s.rebuildRangeOrder()
 	return s.Ranges(), nil

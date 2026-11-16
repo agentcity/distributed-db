@@ -34,8 +34,10 @@ type stateMachine struct {
 	engine      storage.Engine
 	lastApplied atomic.Uint64
 
-	splitMu  sync.RWMutex
-	splitKey []byte
+	splitMu    sync.RWMutex
+	splitKey   []byte
+	mergeLeft  uint64
+	mergeRight uint64
 }
 
 func (m *stateMachine) Apply(entry model.Entry) error {
@@ -77,6 +79,18 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		m.splitKey = append([]byte(nil), cmd.SplitKey...)
 		m.splitMu.Unlock()
 		return nil
+	case model.CommandMergePrepare:
+		var cmd struct {
+			Left  uint64 `json:"left"`
+			Right uint64 `json:"right"`
+		}
+		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
+			return fmt.Errorf("kvserver: decode merge prepare: %w", err)
+		}
+		m.splitMu.Lock()
+		m.mergeLeft, m.mergeRight = cmd.Left, cmd.Right
+		m.splitMu.Unlock()
+		return nil
 	default:
 		return fmt.Errorf("kvserver: unknown command type %q", entry.Type)
 	}
@@ -91,6 +105,18 @@ func (m *stateMachine) splitPrepared() []byte {
 func (m *stateMachine) clearSplit() {
 	m.splitMu.Lock()
 	m.splitKey = nil
+	m.splitMu.Unlock()
+}
+
+func (m *stateMachine) mergePrepared() (uint64, uint64) {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	return m.mergeLeft, m.mergeRight
+}
+
+func (m *stateMachine) clearMerge() {
+	m.splitMu.Lock()
+	m.mergeLeft, m.mergeRight = 0, 0
 	m.splitMu.Unlock()
 }
 
@@ -451,6 +477,69 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 	}
 	g.sm.clearSplit()
 	return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
+}
+
+// MergeRanges is the admin RPC for a replicated merge. The leaders of both
+// groups replicate a prepare command; every replica then moves the right half
+// into the left group and stops the right Raft group.
+func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesRequest) (*pbv2.MergeRangesResponse, error) {
+	left, err := k.s.groupForID(req.GetLeftRangeId())
+	if err != nil {
+		return &pbv2.MergeRangesResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	right, err := k.s.groupForID(req.GetRightRangeId())
+	if err != nil {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+	}
+	if left == right {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "same range"}, nil
+	}
+	payload, err := json.Marshal(struct {
+		Left  uint64 `json:"left"`
+		Right uint64 `json:"right"`
+	}{Left: left.cfg.ID, Right: right.cfg.ID})
+	if err != nil {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "encode"}, nil
+	}
+	if left.node.IsLeader() {
+		if _, err := left.node.Propose(ctx, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
+			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+		}
+	}
+	if right.node.IsLeader() {
+		if _, err := right.node.Propose(ctx, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
+			return &pbv2.MergeRangesResponse{Leader: right.node.Leader(), Error: opError(err)}, nil
+		}
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ll, lr := left.sm.mergePrepared()
+		rl, rr := right.sm.mergePrepared()
+		if ll == left.cfg.ID && lr == right.cfg.ID && rl == left.cfg.ID && rr == right.cfg.ID {
+			break
+		}
+		if time.Now().After(deadline) {
+			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "merge prepare timeout"}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "canceled"}, nil
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	k.s.mu.Lock()
+	defer k.s.mu.Unlock()
+	if _, ok := k.s.groups[right.cfg.ID]; !ok {
+		left.sm.clearMerge()
+		return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
+	}
+	if _, err := k.s.mergeLocalLocked(left, right); err != nil {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+	}
+	left.sm.clearMerge()
+	return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
 }
 
 func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {

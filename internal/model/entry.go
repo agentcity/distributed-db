@@ -26,6 +26,8 @@ const (
 	// CommandSplitPrepare freezes a range and records the split key on every
 	// replica before the coordinator creates the new group.
 	CommandSplitPrepare CommandType = "split_prepare"
+	// CommandMergePrepare freezes two adjacent ranges before data movement.
+	CommandMergePrepare CommandType = "merge_prepare"
 )
 
 // Entry is a single replicated log entry. Index is 1-based. Value is nil for
