@@ -15,6 +15,7 @@ import (
 
 	"distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
+	"distributed-db/internal/storage"
 
 	"google.golang.org/grpc"
 )
@@ -25,9 +26,13 @@ type Config struct {
 	RaftAddr string // gRPC listen address for KVService and RaftService
 	DataDir  string
 
-	// Ranges configures the ranges hosted by this process. Each entry gets its
-	// own Pebble engine, Raft log and state machine under
-	// <DataDir>/db/range-<id> and <DataDir>/raft/range-<id>.
+	// Ranges configures the ranges hosted by this process. Every range shares
+	// one Pebble engine at <DataDir>/db/shared; each range still gets its own
+	// Raft log under <DataDir>/raft/range-<id>.
+	//
+	// The shared-engine layout is new. A pre-existing <DataDir>/db/range-<id>
+	// directory from the older per-range layout is not migrated or read; it
+	// can be deleted by the operator.
 	//
 	// When Ranges is empty, one range is built from the legacy RangeID,
 	// RangeStart, RangeEnd and Peers fields (RangeID defaults to 1).
@@ -52,10 +57,16 @@ type Config struct {
 }
 
 // Server is one v2 KV node: a RangeHost owning one or more independently
-// replicated ranges plus the shared gRPC listener/server.
+// replicated ranges plus the shared gRPC listener/server. All hosted ranges
+// share one Pebble engine; each range sees its own keyspace through a
+// storage.Prefix wrapper.
 type Server struct {
 	cfg Config
 	log *slog.Logger
+
+	// engine is the one Pebble engine shared by every group. It is opened in
+	// New and closed in Stop after all groups have stopped.
+	engine storage.Engine
 
 	groups    map[uint64]*rangeGroup
 	groupIDs  []uint64 // range order (ascending start key)
@@ -114,20 +125,33 @@ func New(cfg Config) (*Server, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("kvserver: create data dir: %w", err)
 	}
+	shared, err := storage.Open(sharedEngineDir(cfg.DataDir), storage.Options{
+		CacheSize:    cfg.CacheSize,
+		MemTableSize: cfg.MemTableSize,
+		Compression:  "snappy",
+		SyncWrites:   true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: open shared storage: %w", err)
+	}
 
 	s := &Server{
 		cfg:       cfg,
 		log:       cfg.Logger.With("node", cfg.ID),
+		engine:    shared,
 		groups:    make(map[uint64]*rangeGroup, len(ranges)),
 		groupIDs:  make([]uint64, 0, len(ranges)),
 		defaultID: ranges[0].ID,
 	}
 	for _, rc := range ranges {
-		g, err := newRangeGroup(cfg, rc)
+		g, err := newRangeGroup(cfg, shared, rc)
 		if err != nil {
 			var errs []error
 			for _, id := range s.groupIDs {
 				errs = append(errs, s.groups[id].stop())
+			}
+			if cerr := shared.Close(); cerr != nil {
+				errs = append(errs, fmt.Errorf("kvserver: close shared storage: %w", cerr))
 			}
 			return nil, errors.Join(append([]error{err}, errs...)...)
 		}
@@ -209,6 +233,8 @@ func (s *Server) stop(ctx context.Context) error {
 	cancel := s.resolverCancel
 	grpcSrv := s.grpcSrv
 	lis := s.lis
+	engine := s.engine
+	s.engine = nil
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -236,9 +262,29 @@ func (s *Server) stop(ctx context.Context) error {
 	}
 
 	var errs []error
+	// Snapshot the group set under hostMu. No split/merge can add a group
+	// after stopped was set above, but taking hostMu keeps this consistent
+	// with readers such as Groups and groupForID.
+	s.hostMu.RLock()
+	groups := make([]*rangeGroup, 0, len(s.groupIDs))
 	for _, id := range s.groupIDs {
-		if err := s.groups[id].stop(); err != nil {
+		if g := s.groups[id]; g != nil {
+			groups = append(groups, g)
+		}
+	}
+	s.hostMu.RUnlock()
+	for _, g := range groups {
+		if err := g.stop(); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	// The groups only use prefix wrappers, so the real engine must be closed
+	// here, after every group has stopped. Close is idempotent and the engine
+	// is detached from the Server above, so a concurrent second Stop cannot
+	// close it twice.
+	if engine != nil {
+		if err := engine.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("kvserver: close shared storage: %w", err))
 		}
 	}
 	s.log.Info("kvserver stopped")

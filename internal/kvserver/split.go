@@ -47,7 +47,7 @@ func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte
 func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, snapshotOld bool) ([]RangeConfig, error) {
 	rangeID := g.cfg.ID
 	oldEnd := cloneBytes(g.cfg.End)
-	newGroup, err := newRangeGroup(s.cfg, RangeConfig{
+	newGroup, err := newRangeGroup(s.cfg, s.engine, RangeConfig{
 		ID: newID, Start: cloneBytes(splitKey), End: oldEnd,
 		Peers: cloneStrings(g.cfg.Peers), Epoch: g.cfg.Epoch + 1,
 	})
