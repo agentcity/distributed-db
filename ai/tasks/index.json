@@ -64,5 +64,11 @@
     "title": "M2.1 — replicated meta и TSO через Raft",
     "status": "done",
     "file": "0011-m2-meta-raft.md"
+  },
+  {
+    "id": "0012",
+    "title": "M2.2/M2.3 — RangeHost и split/merge",
+    "status": "done",
+    "file": "0012-m2-rangehost-split.md"
   }
 ]
