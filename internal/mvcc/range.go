@@ -3,6 +3,16 @@ package mvcc
 import (
 	"bytes"
 	"fmt"
+
+	"distributed-db/internal/storage"
+)
+
+// StreamRange batch sizing. A non-positive batchSize selects the default and
+// an oversized one is clamped, so a caller cannot accidentally ask for an
+// unbounded in-memory batch.
+const (
+	defaultStreamBatchSize = 1024
+	maxStreamBatchSize     = 65536
 )
 
 // Record is one raw MVCC engine record: its fully encoded key (column family,
@@ -14,6 +24,89 @@ type Record struct {
 	Value []byte
 }
 
+// StreamRange iterates raw MVCC records whose user key is in [start, end),
+// calling fn with bounded batches. A nil start means the beginning and a nil
+// end means the end of the user key space.
+//
+// Every record is delivered exactly once in ascending raw key order, so records
+// from the data, lock and write column families (including rollback write
+// records) are all included; records in unknown column families are ignored.
+// The batches are capped at batchSize records (or the default if batchSize <=
+// 0, and at most 65536), and fn is never called with an empty batch. An empty
+// or inverted range calls fn zero times.
+//
+// Each batch is freshly allocated and every key and value in it is a deep copy,
+// so mutating a batch never affects the store or records from another batch.
+// The callback owns a batch only for the duration of the call; after fn returns,
+// its backing storage may be reused.
+//
+// A Pebble snapshot is opened before the first record is read, so concurrent
+// writes made while fn runs are not visible to the stream: the iteration sees
+// the store as of the call. StreamRange holds an iterator and a snapshot but
+// never materialises the whole range.
+//
+// If fn returns an error, StreamRange stops immediately and returns that error
+// unchanged. The iterator and snapshot are always closed before it returns.
+func (s *Store) StreamRange(start, end []byte, batchSize int, fn func([]Record) error) error {
+	if fn == nil {
+		return fmt.Errorf("mvcc: StreamRange callback is nil")
+	}
+	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
+		return nil
+	}
+	batchSize = normalizeStreamBatchSize(batchSize)
+
+	snap, err := s.engine.Snapshot()
+	if err != nil {
+		return fmt.Errorf("mvcc: StreamRange snapshot: %w", err)
+	}
+
+	batch := make([]Record, 0, batchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := fn(batch); err != nil {
+			return err
+		}
+		// Allocate a new slice for the next batch: the callback owns the one
+		// it just received only for the duration of the call.
+		batch = make([]Record, 0, batchSize)
+		return nil
+	}
+
+	err = scanRangeWith(snap.NewIter, start, end, func(key, value []byte) error {
+		batch = append(batch, Record{
+			Key:   append([]byte(nil), key...),
+			Value: append([]byte(nil), value...),
+		})
+		if len(batch) >= batchSize {
+			return flush()
+		}
+		return nil
+	})
+	if err == nil {
+		err = flush()
+	}
+	if closeErr := snap.Close(); closeErr != nil && err == nil {
+		err = fmt.Errorf("mvcc: StreamRange close snapshot: %w", closeErr)
+	}
+	return err
+}
+
+// normalizeStreamBatchSize maps a caller-supplied batch size onto the supported
+// range: non-positive values use the default, oversized values are clamped.
+func normalizeStreamBatchSize(batchSize int) int {
+	switch {
+	case batchSize <= 0:
+		return defaultStreamBatchSize
+	case batchSize > maxStreamBatchSize:
+		return maxStreamBatchSize
+	default:
+		return batchSize
+	}
+}
+
 // ExportRange returns a deep copy of every raw MVCC record whose user key lies
 // in [start, end). A nil start means the beginning and a nil end means the end
 // of the user key space.
@@ -21,13 +114,14 @@ type Record struct {
 // All column families MVCC knows (data, lock and write) are included; records
 // in unknown column families are safely ignored. The returned records are in
 // ascending raw key order.
+//
+// ExportRange is a convenience wrapper around StreamRange that collects the
+// batches into one slice. Callers exporting a large range should use
+// StreamRange to avoid holding every record in memory at once.
 func (s *Store) ExportRange(start, end []byte) ([]Record, error) {
 	records := make([]Record, 0)
-	err := s.scanRange(start, end, func(key, value []byte) error {
-		records = append(records, Record{
-			Key:   append([]byte(nil), key...),
-			Value: append([]byte(nil), value...),
-		})
+	err := s.StreamRange(start, end, 0, func(batch []Record) error {
+		records = append(records, batch...)
 		return nil
 	})
 	if err != nil {
@@ -96,34 +190,44 @@ func (s *Store) DeleteRange(start, end []byte) error {
 	return batch.Close()
 }
 
+// iterFactory opens an iterator over [start, end). It abstracts over an engine
+// and a snapshot so range scans share one implementation.
+type iterFactory func(start, end []byte) (storage.Iterator, error)
+
 // scanRange calls fn for every raw record in a known column family whose
 // decoded user key lies in [start, end). Column families are visited in their
 // natural order (data, lock, write), which is also raw key order.
 func (s *Store) scanRange(start, end []byte, fn func(key, value []byte) error) error {
+	return scanRangeWith(s.engine.NewIter, start, end, fn)
+}
+
+// scanRangeWith is scanRange over an arbitrary iterator source, such as a
+// snapshot.
+func scanRangeWith(newIter iterFactory, start, end []byte, fn func(key, value []byte) error) error {
 	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
 		return nil
 	}
 	for _, cf := range [...]byte{dataCF, lockCF, writeCF} {
-		if err := s.scanCF(cf, start, end, fn); err != nil {
+		if err := scanCFWith(newIter, cf, start, end, fn); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// scanCF scans one column family. The lower bound can be tightened to
+// scanCFWith scans one column family. The lower bound can be tightened to
 // cf|start, but the upper bound deliberately extends to the end of the column
 // family: data and write keys append the version after the user key, so a
 // shorter user key's versions can sort after a longer key that has the shorter
 // one as a prefix. (For example, "a" at a high version sorts after "a\x00" at a
 // low version.) Filtering by the decoded user key is therefore required, and a
 // cf|end upper bound could silently drop records that belong to the range.
-func (s *Store) scanCF(cf byte, start, end []byte, fn func(key, value []byte) error) error {
+func scanCFWith(newIter iterFactory, cf byte, start, end []byte, fn func(key, value []byte) error) error {
 	lower := []byte{cf}
 	if start != nil {
 		lower = append(lower, start...)
 	}
-	iter, err := s.engine.NewIter(lower, []byte{cf + 1})
+	iter, err := newIter(lower, []byte{cf + 1})
 	if err != nil {
 		return err
 	}

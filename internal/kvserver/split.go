@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+
+	"distributed-db/internal/mvcc"
 )
 
 // SplitRange creates a new Raft group for [splitKey, old.End) on this server
@@ -45,11 +47,6 @@ func (s *Server) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte
 func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, snapshotOld bool) ([]RangeConfig, error) {
 	rangeID := g.cfg.ID
 	oldEnd := cloneBytes(g.cfg.End)
-	records, err := g.store.ExportRange(splitKey, oldEnd)
-	if err != nil {
-		return nil, fmt.Errorf("kvserver: split range %d: export: %w", rangeID, err)
-	}
-
 	newGroup, err := newRangeGroup(s.cfg, RangeConfig{
 		ID: newID, Start: cloneBytes(splitKey), End: oldEnd,
 		Peers: cloneStrings(g.cfg.Peers), Epoch: g.cfg.Epoch + 1,
@@ -60,9 +57,11 @@ func (s *Server) splitLocalLocked(g *rangeGroup, splitKey []byte, newID uint64, 
 	cleanup := func() {
 		_ = newGroup.stop()
 	}
-	if err := newGroup.store.ImportRecords(records); err != nil {
+	if err := g.store.StreamRange(splitKey, oldEnd, 1024, func(batch []mvcc.Record) error {
+		return newGroup.store.ImportRecords(batch)
+	}); err != nil {
 		cleanup()
-		return nil, fmt.Errorf("kvserver: split range %d: import: %w", rangeID, err)
+		return nil, fmt.Errorf("kvserver: split range %d: stream copy: %w", rangeID, err)
 	}
 	if err := newGroup.start(context.Background()); err != nil {
 		cleanup()
@@ -123,12 +122,10 @@ func (s *Server) mergeLocalLocked(left, right *rangeGroup) ([]RangeConfig, error
 	if !bytes.Equal(left.cfg.End, right.cfg.Start) {
 		return nil, fmt.Errorf("kvserver: merge: ranges %d and %d are not adjacent", left.cfg.ID, right.cfg.ID)
 	}
-	records, err := right.store.ExportRange(nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("kvserver: merge: export right: %w", err)
-	}
-	if err := left.store.ImportRecords(records); err != nil {
-		return nil, fmt.Errorf("kvserver: merge: import left: %w", err)
+	if err := right.store.StreamRange(nil, nil, 1024, func(batch []mvcc.Record) error {
+		return left.store.ImportRecords(batch)
+	}); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: stream copy right: %w", err)
 	}
 	left.cfg.End = cloneBytes(right.cfg.End)
 	left.cfg.Epoch++
