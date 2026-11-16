@@ -4,7 +4,8 @@
 - HEAD: `8c173bf`
 - Железо: Apple M1 Pro, macOS, loopback.
 - PostgreSQL: 13-alpine в Docker, один узел, `synchronous_commit=on`.
-- Наш кластер: 1 meta + 3 KV, loopback, `SyncWrites=true`.
+- Наш кластер: 1 meta + 3 KV, loopback, `SyncWrites=false` (durability —
+  Raft-лог; см. `Config.SyncStateMachine`).
 
 ## Методика
 
@@ -23,12 +24,16 @@ UPDATE bench SET v = v + 1 WHERE id = :id;
 
 ## Результаты
 
+Историческая таблица (до отказа от второго fsync и до batch):
+
 | Сценарий | distributed-db | PostgreSQL 13 | Разрыв |
 |---|---:|---:|---:|
 | 1 клиент, latency | ~23 мс | ~0.68 мс | ~34× медленнее |
 | 1 клиент, throughput | ~43 tx/s | ~1 469 tx/s | ~34× |
 | 10 клиентов, latency/op | ~16 мс | ~1.47 мс | ~11× медленнее |
 | 10 клиентов, throughput | ~625 tx/s | ~6 835 tx/s | ~11× |
+
+Актуальные замеры — ниже.
 
 До оптимизаций было: 3-node sequential ~33 мс, parallel ~24 мс/op (~420 tx/s).
 После atomic 1PC + parallel cross-range: sequential ~23 мс, parallel ~16 мс/op
@@ -44,10 +49,14 @@ Raft-лог): **sequential ~11.6 мс, parallel ~1.8 мс/op (~5.5k tx/s)**.
 | batch 256 txns | ~0.15 мс/txn / ~6 600–6 900 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~1.0× |
 
 Batch-режим (`CommitBatch`, 256 транзакций в одном batch, серверный
-batch-entry 64 × 500 µs) выводит throughput на уровень PostgreSQL 13 на этом
-же железе. Это **не** atomic batch: каждая транзакция имеет свой commit point.
+batch-entry 64 × 500 µs, 256 in-flight) выводит throughput на уровень
+PostgreSQL 13 на этом же железе. Это **не** atomic batch: каждая транзакция
+имеет свой commit point. Размер/окно — компромисс latency/throughput и
+настраиваются в `internal/kvserver/batch.go`.
 
-На одном клиенте всё ещё платим за Raft-консенсус и один fsync.
+На одном клиенте всё ещё платим за Raft-консенсус и один fsync. Цифра
+~11.6 мс — путь без batch; `CommitBatch`/batch-window добавляет ~0.5–1 мс
+одиночному запросу.
 
 ## Почему мы медленнее
 
@@ -88,6 +97,14 @@ commit. Сравнение честно только в классе «расп�
 4. Снизить TSO/meta-задержки: lease, локальные батчи, fewer RPC.
 5. Parallel SQL execution и distributed join.
 6. Нагрузочный стенд 3/5/7 узлов, YCSB/TPC-C, 1 ТБ soak.
+
+## Ограничения методики
+
+- loopback, а не реальная сеть; нет packet loss/partitions;
+- маленький набор ключей, без compaction на ТБ;
+- нет p99, только средние ns/op;
+- PostgreSQL запущен как один узел, без Patroni/Citus;
+- batch throughput — не latency одного клиента.
 
 ## Вывод
 
