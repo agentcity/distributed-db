@@ -385,6 +385,13 @@ func (c *Client) ResolveLock(ctx context.Context, keys [][]byte, startTS, commit
 	})
 }
 
+// rangeBatch groups mutations that route to one range for cross-range 2PC.
+type rangeBatch struct {
+	id   uint64
+	keys [][]byte
+	muts []*pbv2.Mutation
+}
+
 // Txn is a single optimistic transaction. It is not safe for concurrent use.
 type Txn struct {
 	c       *Client
@@ -500,23 +507,27 @@ func (t *Txn) Commit(ctx context.Context) error {
 		mutations = append(mutations, t.writes[k])
 	}
 
-	// M2 supports a single range per transaction. Verify before writing.
-	ri, err := t.c.rangeFor(ctx, primary)
-	if err != nil {
-		return err
-	}
-	for _, k := range keys {
-		other, err := t.c.rangeFor(ctx, []byte(k))
+	// Group mutations by range. A single-range transaction uses 1PC; a
+	// cross-range transaction uses primary-first 2PC: prewrite every range,
+	// then commit the primary's range first so a reader can resolve secondary
+	// locks by inspecting the primary.
+	batches := make([]*rangeBatch, 0, 2)
+	byRange := make(map[uint64]*rangeBatch)
+	for i, k := range keys {
+		ri, err := t.c.rangeFor(ctx, []byte(k))
 		if err != nil {
 			return err
 		}
-		if other.GetId() != ri.GetId() {
-			return fmt.Errorf("v2client: cross-range transaction %d != %d", ri.GetId(), other.GetId())
+		b := byRange[ri.GetId()]
+		if b == nil {
+			b = &rangeBatch{id: ri.GetId()}
+			byRange[ri.GetId()] = b
+			batches = append(batches, b)
 		}
+		b.keys = append(b.keys, []byte(k))
+		b.muts = append(b.muts, mutations[i])
 	}
 
-	// The whole transaction is in one range: apply prewrite+commit in one
-	// Raft entry (1PC). commitTS is allocated before the single round.
 	commitTS, err := t.c.AllocTS(ctx)
 	if err != nil {
 		return err
@@ -527,24 +538,115 @@ func (t *Txn) Commit(ctx context.Context) error {
 			return err
 		}
 	}
-	var commitMsg string
-	if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
-		resp, err := cl.CommitSingle(ctx, &pbv2.CommitSingleRequest{
-			StartTs: t.startTS, CommitTs: commitTS, Primary: primary, Mutations: mutations,
-		})
+
+	if len(batches) == 1 {
+		var commitMsg string
+		if err := t.c.retry(ctx, primary, func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+			resp, err := cl.CommitSingle(ctx, &pbv2.CommitSingleRequest{
+				StartTs: t.startTS, CommitTs: commitTS, Primary: primary, Mutations: mutations,
+			})
+			if err != nil {
+				return "", "", err
+			}
+			commitMsg = resp.GetError()
+			return resp.GetLeader(), resp.GetError(), nil
+		}); err != nil {
+			return err
+		}
+		if commitMsg != "" {
+			return fmt.Errorf("v2client: commit: %s", commitMsg)
+		}
+		t.done = true
+		return nil
+	}
+
+	// Put the primary's range first for both prewrite and commit.
+	primaryRange, err := t.c.rangeFor(ctx, primary)
+	if err != nil {
+		return err
+	}
+	ordered := make([]*rangeBatch, 0, len(batches))
+	for _, b := range batches {
+		if b.id == primaryRange.GetId() {
+			ordered = append(ordered, b)
+		}
+	}
+	for _, b := range batches {
+		if b.id != primaryRange.GetId() {
+			ordered = append(ordered, b)
+		}
+	}
+
+	prewritten := make([]*rangeBatch, 0, len(ordered))
+	for _, b := range ordered {
+		var msg string
+		if err := t.c.retry(ctx, b.keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+			resp, err := cl.Prewrite(ctx, &pbv2.PrewriteRequest{
+				StartTs: t.startTS, Primary: primary, Mutations: b.muts,
+			})
+			if err != nil {
+				return "", "", err
+			}
+			msg = resp.GetError()
+			return resp.GetLeader(), resp.GetError(), nil
+		}); err != nil {
+			t.rollbackBatches(ctx, prewritten)
+			return err
+		}
+		if msg != "" {
+			t.rollbackBatches(ctx, prewritten)
+			return fmt.Errorf("v2client: prewrite range %d: %s", b.id, msg)
+		}
+		prewritten = append(prewritten, b)
+	}
+
+	for _, b := range ordered {
+		var msg string
+		if err := t.c.retry(ctx, b.keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+			resp, err := cl.Commit(ctx, &pbv2.CommitRequest{
+				StartTs: t.startTS, CommitTs: commitTS, Keys: b.keys,
+			})
+			if err != nil {
+				return "", "", err
+			}
+			msg = resp.GetError()
+			return resp.GetLeader(), resp.GetError(), nil
+		}); err != nil {
+			return err
+		}
+		if msg != "" {
+			return fmt.Errorf("v2client: commit range %d: %s", b.id, msg)
+		}
+	}
+	t.done = true
+	return nil
+}
+
+// rollbackKeys rolls back one range's keys with the transaction's startTS.
+func (c *Client) rollbackKeys(ctx context.Context, keys [][]byte, startTS uint64) error {
+	var msg string
+	if err := c.retry(ctx, keys[0], func(ctx context.Context, cl pbv2.KVServiceClient) (string, string, error) {
+		resp, err := cl.Rollback(ctx, &pbv2.RollbackRequest{StartTs: startTS, Keys: keys})
 		if err != nil {
 			return "", "", err
 		}
-		commitMsg = resp.GetError()
+		msg = resp.GetError()
 		return resp.GetLeader(), resp.GetError(), nil
 	}); err != nil {
 		return err
 	}
-	if commitMsg != "" {
-		return fmt.Errorf("v2client: commit: %s", commitMsg)
+	if msg != "" {
+		return fmt.Errorf("v2client: rollback: %s", msg)
 	}
-	t.done = true
 	return nil
+}
+
+// rollbackBatches is a best-effort cleanup after a failed cross-range
+// prewrite. A rollback failure leaves the lock for the background resolver.
+func (t *Txn) rollbackBatches(ctx context.Context, batches []*rangeBatch) {
+	for _, b := range batches {
+		_ = t.c.rollbackKeys(ctx, b.keys, t.startTS)
+	}
 }
 
 // Rollback aborts the transaction. It is idempotent.
