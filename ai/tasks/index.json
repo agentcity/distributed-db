@@ -262,5 +262,11 @@
     "title": "Один Pebble batch/fsync на Raft-батч",
     "status": "done",
     "file": "0044-sync-batch-fsync.md"
+  },
+  {
+    "id": "0045",
+    "title": "Документация только в актуальном состоянии",
+    "status": "done",
+    "file": "0045-docs-current.md"
   }
 ]
