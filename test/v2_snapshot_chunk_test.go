@@ -2,8 +2,12 @@ package test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"testing"
 	"time"
 
@@ -36,16 +40,34 @@ func followerSnapshotHasKV(t *testing.T, node *raft.Node, key, value []byte) boo
 	if snap.Index == 0 {
 		return false
 	}
-	for _, line := range bytes.Split(snap.Data, []byte{'\n'}) {
+	body := snap.Data
+	if i := bytes.IndexByte(body, '\n'); i >= 0 {
+		var header struct {
+			Comp string `json:"comp"`
+		}
+		if err := json.Unmarshal(body[:i], &header); err != nil {
+			t.Fatalf("decode snapshot header: %v", err)
+		}
+		body = body[i+1:]
+		if header.Comp == "gzip" {
+			zr, err := gzip.NewReader(bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("snapshot gzip: %v", err)
+			}
+			defer zr.Close()
+			body, err = io.ReadAll(zr)
+			if err != nil {
+				t.Fatalf("snapshot gzip body: %v", err)
+			}
+		}
+	}
+	for _, line := range bytes.Split(body, []byte{'\n'}) {
 		if len(line) == 0 {
 			continue
 		}
 		var entry snapshotStreamEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			t.Fatalf("decode follower snapshot record: %v", err)
-		}
-		if entry.End {
-			continue
 		}
 		if entry.End {
 			continue
@@ -149,8 +171,13 @@ func TestV2SnapshotChunkedCatchUp(t *testing.T) {
 	}
 	put := func(key string, size int) kvWrite {
 		t.Helper()
-		value := bytes.Repeat([]byte("chunked-snapshot-value-"), size/len("chunked-snapshot-value-")+1)
-		value = value[:size]
+		value := make([]byte, size)
+		var seed [8]byte
+		for off, ctr := 0, uint64(0); off < size; ctr++ {
+			binary.LittleEndian.PutUint64(seed[:], ctr)
+			sum := sha256.Sum256(seed[:])
+			off += copy(value[off:], sum[:])
+		}
 		r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
 		if err != nil {
 			t.Fatalf("ts: %v", err)
