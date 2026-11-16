@@ -67,30 +67,32 @@ func waitRangeLeader(t *testing.T, srv *Server, rangeID uint64) {
 	t.Fatalf("range %d did not elect a leader", rangeID)
 }
 
-func putStatsKeys(t *testing.T, client pbv2.KVServiceClient, n int) {
+func putStatsKV(t *testing.T, client pbv2.KVServiceClient, key, value string, startTS uint64) {
 	t.Helper()
 	ctx := context.Background()
+	commitTS := startTS + 1
+	pr, err := client.Prewrite(ctx, &pbv2.PrewriteRequest{
+		StartTs: startTS,
+		Primary: []byte(key),
+		Mutations: []*pbv2.Mutation{{
+			Key: []byte(key), Value: []byte(value),
+		}},
+	})
+	if err != nil || !pr.GetSuccess() {
+		t.Fatalf("prewrite %q: %v %+v", key, err, pr)
+	}
+	cr, err := client.Commit(ctx, &pbv2.CommitRequest{
+		StartTs: startTS, CommitTs: commitTS, Keys: [][]byte{[]byte(key)},
+	})
+	if err != nil || !cr.GetSuccess() {
+		t.Fatalf("commit %q: %v %+v", key, err, cr)
+	}
+}
+
+func putStatsKeys(t *testing.T, client pbv2.KVServiceClient, n int) {
+	t.Helper()
 	for i := 0; i < n; i++ {
-		key := fmt.Sprintf("key-%02d", i)
-		value := strings.Repeat("v", 32)
-		startTS := uint64(1000 + i*10)
-		commitTS := startTS + 1
-		pr, err := client.Prewrite(ctx, &pbv2.PrewriteRequest{
-			StartTs: startTS,
-			Primary: []byte(key),
-			Mutations: []*pbv2.Mutation{{
-				Key: []byte(key), Value: []byte(value),
-			}},
-		})
-		if err != nil || !pr.GetSuccess() {
-			t.Fatalf("prewrite %q: %v %+v", key, err, pr)
-		}
-		cr, err := client.Commit(ctx, &pbv2.CommitRequest{
-			StartTs: startTS, CommitTs: commitTS, Keys: [][]byte{[]byte(key)},
-		})
-		if err != nil || !cr.GetSuccess() {
-			t.Fatalf("commit %q: %v %+v", key, err, cr)
-		}
+		putStatsKV(t, client, fmt.Sprintf("key-%02d", i), strings.Repeat("v", 32), uint64(1000+i*10))
 	}
 }
 
@@ -300,5 +302,29 @@ func TestV2RangeHostRangeStatsSplitKeyPolicy(t *testing.T) {
 	got := medianSplitKey([][]byte{[]byte("a"), []byte("b"), []byte("c")}, start, end)
 	if bytes.Compare(got, start) <= 0 || bytes.Compare(got, end) >= 0 {
 		t.Fatalf("medianSplitKey = %q, want strictly inside [a, z)", got)
+	}
+}
+
+func TestV2RangeHostRangeStatsPrefixKeys(t *testing.T) {
+	_, _, client := newStatsServer(t, []byte("a"), []byte("z"))
+	// "a" equals the inclusive start and "a\x00" has "a" as a prefix. Raw MVCC
+	// write keys are userKey||version, so these interleave in raw order; the
+	// stats scan must still deduplicate and order them as user keys.
+	for i, key := range []string{"a", "a\x00", "b"} {
+		putStatsKV(t, client, key, "v", uint64(2000+i*10))
+	}
+
+	stats, err := client.RangeStats(context.Background(), &pbv2.RangeStatsRequest{RangeId: 1})
+	if err != nil {
+		t.Fatalf("RangeStats: %v", err)
+	}
+	if !stats.GetSuccess() {
+		t.Fatalf("RangeStats = %+v, want success", stats)
+	}
+	if stats.GetKeyCount() != 3 {
+		t.Fatalf("key_count = %d, want 3 distinct user keys", stats.GetKeyCount())
+	}
+	if got := string(stats.GetSplitKey()); got != "a\x00" {
+		t.Fatalf("split_key = %q, want %q (median user key)", got, "a\x00")
 	}
 }
