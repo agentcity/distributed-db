@@ -528,6 +528,30 @@ Backup:
 `ranges/status/split/merge` не требуют `-nodes`; `backup` требует, потому что
 читает данные.
 
+### 8.9 TLS для gRPC
+
+TLS/mTLS для KV/meta/Raft включается флагами; без них — plaintext (dev).
+
+Клиент `kvctl`:
+
+```bash
+./bin/kvctl   -tls-ca ca.pem   -tls-cert client.pem -tls-key client.key   -tls-server-name kv-node   -meta 127.0.0.1:9090   -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003   get user:1
+```
+
+Сервер `kv2` (meta или node):
+
+```bash
+./bin/kv2 -mode=node ...   -tls-cert node.crt -tls-key node.key   -tls-client-ca ca.pem   -tls-ca ca.pem -tls-server-name kv-node
+```
+
+- `-tls-cert/-tls-key` — identity узла; для mTLS сертификат должен иметь
+  `ServerAuth` и `ClientAuth` EKU (он же используется для peer dials).
+- `-tls-client-ca` — включает требование клиентского сертификата.
+- `-tls-ca`/`-tls-server-name` — проверка серверов при исходящих dials.
+- `sqlsrv`/`pgsrv`/`kvctl` поддерживают `-tls-ca`, `-tls-cert`, `-tls-key`,
+  `-tls-server-name` для cluster gRPC.
+- `kvbackup` пока ходит plaintext — известный gap.
+
 ## 8a. Сырой KV v2 из Go (advanced)
 
 Если нужен доступ из кода, используйте `internal/v2client`. Программа должна
