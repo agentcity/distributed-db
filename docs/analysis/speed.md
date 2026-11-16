@@ -9,7 +9,7 @@
 > [PERFORMANCE.md](../PERFORMANCE.md).
 
 - Дата: 2026-11-17
-- HEAD: `b588e24`
+- Снимок кода: `b588e24`
 - Железо: Apple M1 Pro (10 CPU), macOS, loopback, Go 1.23.5
 - Fast-профиль: [speed_bench_test.go](../../test/speed_bench_test.go#L119), 1 meta + 3 KV в процессе
 - Production-профиль: `sync` по умолчанию ([cmd/kv2/main.go:34](../../cmd/kv2/main.go#L34))

@@ -1,7 +1,7 @@
 # Продуктовая оценка и путь к production
 
 - Дата: 2026-11-16
-- Состояние кода: HEAD `13c03c2`
+- Состояние кода: Sprint 2 (2026-11-17)
 - Область: v1 (`cmd/db`), v2 (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`,
   `cmd/kvbackup`, `cmd/metricsrv`), edge hash cache (`cmd/edgehash`) и
   mobile scaffold.

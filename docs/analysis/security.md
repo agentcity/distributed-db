@@ -1,7 +1,7 @@
 # Безопасность: честный разбор (Sprint 2)
 
 - Дата: 2026-11-17
-- HEAD: `b588e24`
+- Снимок кода: `b588e24`
 - Область: `cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`, `internal/{kvserver,metaserver,v2client,pgwire,grpctls,edgehttp,backup}`, `cmd/edgehash`, `mobile/`
 - Метод: чтение кода и конфигов; эксплойты не запускались, это не пентест
 

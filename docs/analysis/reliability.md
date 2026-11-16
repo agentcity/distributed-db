@@ -1,6 +1,6 @@
 # Sprint 2 — надёжность и корректность: аудит и классификация отказов
 
-- Дата: 2026-11-17, HEAD `b588e24`
+- Дата: 2026-11-17; снимок кода `b588e24` + post-fix примечания
 - Область: только анализ. Код и существующие документы не менялись.
 - Прочитано: `internal/raft` (membership, snapshot, leader transfer, node),
   `internal/mvcc` (2PC, recovery, GC), `internal/kvserver`, `internal/metaserver`,

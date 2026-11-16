@@ -1,7 +1,7 @@
 # Sprint 2 report — аудит и админ-плоскость
 
 - Дата: 2026-11-17
-- HEAD: `843e670` (TLS) + docs
+- Состояние: Sprint 2 + sync batch fix (2026-11-17)
 - Аудит: [docs/analysis/README.md](analysis/README.md)
 
 ## 1. Что сделано

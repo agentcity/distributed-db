@@ -1,7 +1,7 @@
 # Performance: distributed-db vs PostgreSQL
 
 - Дата: 2026-11-16
-- HEAD: `8c173bf`
+- HEAD: Sprint 2 (sync batch fix, 2026-11-17)
 - Железо: Apple M1 Pro, macOS, loopback.
 - PostgreSQL: 13-alpine в Docker, один узел, `synchronous_commit=on`.
 - Наш кластер: 1 meta + 3 KV, loopback, **fast profile**
