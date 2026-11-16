@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"distributed-db/internal/metrics"
 	"distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
 	"distributed-db/internal/storage"
@@ -54,6 +55,10 @@ type Config struct {
 	CacheSize    int64
 	MemTableSize int64
 	Logger       *slog.Logger
+
+	// Metrics, when non-nil, records every unary KV/Raft RPC duration and
+	// error through one SLO tracker.
+	Metrics *metrics.SLO
 }
 
 // Server is one v2 KV node: a RangeHost owning one or more independently
@@ -159,13 +164,24 @@ func New(cfg Config) (*Server, error) {
 		s.groupIDs = append(s.groupIDs, rc.ID)
 	}
 
-	s.grpcSrv = grpc.NewServer(
-		grpc.MaxRecvMsgSize(16<<20),
-		grpc.MaxSendMsgSize(16<<20),
-	)
+	opts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(16 << 20),
+		grpc.MaxSendMsgSize(16 << 20),
+	}
+	if s.cfg.Metrics != nil {
+		opts = append(opts, grpc.ChainUnaryInterceptor(s.metricsInterceptor))
+	}
+	s.grpcSrv = grpc.NewServer(opts...)
 	pbv2.RegisterKVServiceServer(s.grpcSrv, &kvService{s: s})
 	pbv2.RegisterRaftServiceServer(s.grpcSrv, &raftService{s: s})
 	return s, nil
+}
+
+func (s *Server) metricsInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	done := s.cfg.Metrics.Begin()
+	resp, err := handler(ctx, req)
+	done(err)
+	return resp, err
 }
 
 // Start binds the listener once, serves gRPC and then starts every Raft group.
