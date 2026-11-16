@@ -9,11 +9,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"distributed-db/internal/meta"
 	pbv2 "distributed-db/internal/pb/v2"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // fakeKV is a KVService replica stub: it records the scheduling requests it
@@ -21,11 +24,16 @@ import (
 type fakeKV struct {
 	pbv2.UnimplementedKVServiceServer
 
-	mu       sync.Mutex
-	splits   []*pbv2.SplitRangeRequest
-	merges   []*pbv2.MergeRangesRequest
-	splitErr string
-	mergeErr string
+	mu           sync.Mutex
+	addr         string
+	splits       []*pbv2.SplitRangeRequest
+	merges       []*pbv2.MergeRangesRequest
+	stats        []*pbv2.RangeStatsRequest
+	statsByRange map[uint64]*pbv2.RangeStatsResponse
+	splitErr     string
+	mergeErr     string
+	statsErr     string
+	statsLeader  string
 }
 
 func (f *fakeKV) SplitRange(_ context.Context, req *pbv2.SplitRangeRequest) (*pbv2.SplitRangeResponse, error) {
@@ -36,6 +44,34 @@ func (f *fakeKV) SplitRange(_ context.Context, req *pbv2.SplitRangeRequest) (*pb
 		return &pbv2.SplitRangeResponse{Error: f.splitErr}, nil
 	}
 	return &pbv2.SplitRangeResponse{Success: true}, nil
+}
+
+func (f *fakeKV) RangeStats(_ context.Context, req *pbv2.RangeStatsRequest) (*pbv2.RangeStatsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stats = append(f.stats, req)
+	if f.statsErr != "" {
+		return &pbv2.RangeStatsResponse{Leader: f.statsLeader, Error: f.statsErr}, nil
+	}
+	if resp := f.statsByRange[req.GetRangeId()]; resp != nil {
+		return resp, nil
+	}
+	return &pbv2.RangeStatsResponse{Success: true, Leader: f.addr}, nil
+}
+
+func (f *fakeKV) setRangeStats(rangeID uint64, resp *pbv2.RangeStatsResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statsByRange == nil {
+		f.statsByRange = make(map[uint64]*pbv2.RangeStatsResponse)
+	}
+	f.statsByRange[rangeID] = resp
+}
+
+func (f *fakeKV) statsRequests() []*pbv2.RangeStatsRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*pbv2.RangeStatsRequest(nil), f.stats...)
 }
 
 func (f *fakeKV) MergeRanges(_ context.Context, req *pbv2.MergeRangesRequest) (*pbv2.MergeRangesResponse, error) {
@@ -63,16 +99,23 @@ func (f *fakeKV) mergeRequests() []*pbv2.MergeRangesRequest {
 // startFakeKV serves a fake replica on a loopback port and returns its address.
 func startFakeKV(t *testing.T, splitErr, mergeErr string) (string, *fakeKV) {
 	t.Helper()
+	return startFakeKVWithStats(t, splitErr, mergeErr, "")
+}
+
+// startFakeKVWithStats also configures the fake's RangeStats behavior.
+func startFakeKVWithStats(t *testing.T, splitErr, mergeErr, statsErr string) (string, *fakeKV) {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	fake := &fakeKV{splitErr: splitErr, mergeErr: mergeErr}
+	addr := lis.Addr().String()
+	fake := &fakeKV{splitErr: splitErr, mergeErr: mergeErr, statsErr: statsErr, addr: addr}
 	srv := grpc.NewServer()
 	pbv2.RegisterKVServiceServer(srv, fake)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
-	return lis.Addr().String(), fake
+	return addr, fake
 }
 
 func newSchedulerServer(t *testing.T, ranges []meta.Range) *Server {
@@ -474,5 +517,209 @@ func TestSplitRangeUnreachableReplicaReportsFailure(t *testing.T) {
 	}
 	if rows := snapshotByID(t, s); len(rows) != 1 || rows[1].Version != 1 {
 		t.Fatalf("range map changed after unreachable replica: %+v", rows)
+	}
+}
+
+// fakeRangeStats builds a RangeStats response for the scheduler tests.
+func fakeRangeStats(addr string, size, keys uint64, splitKey string, start, end []byte) *pbv2.RangeStatsResponse {
+	return &pbv2.RangeStatsResponse{
+		Success: true, Leader: addr, SizeBytes: size, KeyCount: keys,
+		SplitKey: []byte(splitKey), Start: start, End: end,
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitOverThreshold(t *testing.T) {
+	addr, fake := startFakeKV(t, "", "")
+	fake.setRangeStats(1, fakeRangeStats(addr, 4<<20, 1000, "m", nil, nil))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Leader: addr, Version: 3},
+	})
+
+	n, err := s.AutoSplit(context.Background(), 1<<20)
+	if err != nil {
+		t.Fatalf("AutoSplit: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("AutoSplit splits = %d, want 1", n)
+	}
+
+	rows := snapshotByID(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("range map after auto-split = %+v, want 2 ranges", rows)
+	}
+	left, right := rows[1], rows[2]
+	if !bytes.Equal(left.End, []byte("m")) || left.Version != 4 {
+		t.Fatalf("left range = %+v, want end m at version 4", left)
+	}
+	if !bytes.Equal(right.Start, []byte("m")) || right.End != nil || right.Version != 4 {
+		t.Fatalf("right range = %+v, want [m, +inf) at version 4", right)
+	}
+
+	statsReqs := fake.statsRequests()
+	if len(statsReqs) != 1 {
+		t.Fatalf("RangeStats requests = %d, want 1", len(statsReqs))
+	}
+	if statsReqs[0].GetRangeId() != 1 || statsReqs[0].GetEpoch() != 3 {
+		t.Fatalf("RangeStats request = %+v, want range 1 epoch 3", statsReqs[0])
+	}
+	splitReqs := fake.splitRequests()
+	if len(splitReqs) != 1 {
+		t.Fatalf("SplitRange requests = %d, want 1", len(splitReqs))
+	}
+	if got := splitReqs[0]; got.GetRangeId() != 1 || got.GetNewRangeId() != 2 ||
+		got.GetEpoch() != 3 || !bytes.Equal(got.GetSplitKey(), []byte("m")) {
+		t.Fatalf("split request = %+v, want {range 1, new 2, epoch 3, key m}", got)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitSkipsBelowThreshold(t *testing.T) {
+	addr, fake := startFakeKV(t, "", "")
+	fake.setRangeStats(1, fakeRangeStats(addr, 1<<20-1, 1000, "m", nil, nil))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Leader: addr, Version: 1},
+	})
+
+	n, err := s.AutoSplit(context.Background(), 1<<20)
+	if err != nil {
+		t.Fatalf("AutoSplit: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("AutoSplit splits = %d, want 0 below threshold", n)
+	}
+	if got := len(fake.splitRequests()); got != 0 {
+		t.Fatalf("SplitRange calls = %d, want 0", got)
+	}
+	if rows := snapshotByID(t, s); len(rows) != 1 || rows[1].Version != 1 {
+		t.Fatalf("range map changed below threshold: %+v", rows)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitSkipsEmptySplitKey(t *testing.T) {
+	addr, fake := startFakeKV(t, "", "")
+	fake.setRangeStats(1, fakeRangeStats(addr, 8<<20, 1000, "", nil, nil))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Leader: addr, Version: 1},
+	})
+
+	n, err := s.AutoSplit(context.Background(), 1<<20)
+	if err != nil {
+		t.Fatalf("AutoSplit: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("AutoSplit splits = %d, want 0 without a split key", n)
+	}
+	if got := len(fake.splitRequests()); got != 0 {
+		t.Fatalf("SplitRange calls = %d, want 0", got)
+	}
+	if rows := snapshotByID(t, s); len(rows) != 1 {
+		t.Fatalf("range map changed without a split key: %+v", rows)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitRequiresLeader(t *testing.T) {
+	s := &Server{
+		cfg:     Config{Replicated: true},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cluster: meta.New(),
+	}
+	n, err := s.AutoSplit(context.Background(), 1<<20)
+	if err == nil {
+		t.Fatalf("AutoSplit on a non-leader succeeded with %d splits, want error", n)
+	}
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Fatalf("AutoSplit error code = %v (%v), want Unavailable", code, err)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitFailedReplicaLeavesMapUnchanged(t *testing.T) {
+	healthy, healthyFake := startFakeKV(t, "", "")
+	stale, staleFake := startFakeKVWithStats(t, "stale split failure", "", "stale epoch")
+	staleFake.setRangeStats(1, fakeRangeStats(stale, 0, 0, "", nil, nil))
+	healthyFake.setRangeStats(1, fakeRangeStats(healthy, 8<<20, 1000, "m", nil, nil))
+
+	replicas := []string{stale, healthy}
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: replicas, Leader: healthy, Version: 7},
+	})
+
+	n, err := s.AutoSplit(context.Background(), 1<<20)
+	if err == nil {
+		t.Fatalf("AutoSplit succeeded despite a failing replica (splits=%d)", n)
+	}
+	if n != 0 {
+		t.Fatalf("AutoSplit splits = %d, want 0 when a replica fails", n)
+	}
+	if !strings.Contains(err.Error(), stale) {
+		t.Fatalf("AutoSplit error = %q, want failing replica %s", err, stale)
+	}
+	// The healthy replica was asked to split; the failure happened during the
+	// fan-out, so the meta map must still describe the original range.
+	if got := len(healthyFake.splitRequests()); got == 0 {
+		t.Fatal("healthy replica was not asked to split")
+	}
+	if got := len(staleFake.splitRequests()); got == 0 {
+		t.Fatal("stale replica was not asked to split; fan-out should include it")
+	}
+	rows := snapshotByID(t, s)
+	if len(rows) != 1 {
+		t.Fatalf("range map changed after failed fan-out: %+v", rows)
+	}
+	if got := rows[1]; got.Version != 7 || got.End != nil {
+		t.Fatalf("range 1 changed after failed fan-out: %+v", got)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitSkipsUnavailableStats(t *testing.T) {
+	addr, fake := startFakeKVWithStats(t, "", "", "stats unavailable")
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Leader: addr, Version: 1},
+	})
+
+	n, err := s.AutoSplit(context.Background(), 1<<20)
+	if err == nil {
+		t.Fatalf("AutoSplit succeeded without stats (splits=%d)", n)
+	}
+	if n != 0 {
+		t.Fatalf("AutoSplit splits = %d, want 0", n)
+	}
+	if got := len(fake.splitRequests()); got != 0 {
+		t.Fatalf("SplitRange calls = %d, want 0 without stats", got)
+	}
+	if rows := snapshotByID(t, s); len(rows) != 1 {
+		t.Fatalf("range map changed without stats: %+v", rows)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplitLoopStops(t *testing.T) {
+	addr, fake := startFakeKV(t, "", "")
+	fake.setRangeStats(1, fakeRangeStats(addr, 8<<20, 1000, "m", nil, nil))
+
+	s := newSchedulerServer(t, []meta.Range{
+		{ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Leader: addr, Version: 1},
+	})
+	if err := s.StartAutoSplit(context.Background(), 10*time.Millisecond, 1<<20); err != nil {
+		t.Fatalf("StartAutoSplit: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(snapshotByID(t, s)) == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rows := snapshotByID(t, s); len(rows) != 2 {
+		t.Fatalf("auto-split loop did not split the range: %+v", rows)
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := s.StartAutoSplit(context.Background(), 10*time.Millisecond, 1<<20); err == nil {
+		t.Fatal("StartAutoSplit after Stop succeeded, want error")
 	}
 }

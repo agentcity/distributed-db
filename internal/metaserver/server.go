@@ -63,9 +63,18 @@ type Server struct {
 	started bool
 	stopped bool
 
+	// autoSplit tracks the optional background auto-split loop. Access is
+	// guarded by mu and Stop cancels it.
+	autoSplit *autoSplitLoop
+
 	// tsMu serializes TSO reservations so two proposals cannot reserve the
 	// same timestamp on one leader.
 	tsMu sync.Mutex
+}
+
+// autoSplitLoop is the cancel handle for one StartAutoSplit goroutine.
+type autoSplitLoop struct {
+	cancel context.CancelFunc
 }
 
 // New creates a meta server. Start binds the listener and, in replicated mode,
@@ -194,12 +203,17 @@ func (s *Server) Stop() error {
 		return nil
 	}
 	s.stopped = true
+	autoSplit := s.autoSplit
+	s.autoSplit = nil
 	grpcSrv := s.grpc
 	lis := s.lis
 	node := s.raft
 	tr := s.transport
 	s.mu.Unlock()
 
+	if autoSplit != nil {
+		autoSplit.cancel()
+	}
 	if node != nil {
 		node.Stop()
 	}

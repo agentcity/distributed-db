@@ -3,6 +3,7 @@ package metaserver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -20,6 +21,11 @@ import (
 const (
 	schedulerRPCTimeout = 30 * time.Second
 	schedulerAttempts   = 3
+
+	// schedulerStatsTimeout is shorter than schedulerRPCTimeout because stats
+	// are advisory: an unreachable replica must not stall a whole auto-split
+	// pass for the full mutation timeout.
+	schedulerStatsTimeout = 5 * time.Second
 )
 
 // schedulerMu serializes split/merge orchestration in this process. The
@@ -55,7 +61,17 @@ func (s *Server) SplitRange(ctx context.Context, req *pbv2.MetaSplitRangeRequest
 	}
 	schedulerMu.Lock()
 	defer schedulerMu.Unlock()
+	return s.splitRangeLocked(ctx, req)
+}
 
+// splitRangeLocked is SplitRange without the process-wide scheduler lock. The
+// caller must hold schedulerMu. It is shared by the public SplitRange RPC and
+// AutoSplit so one auto-split pass cannot interleave with another scheduling
+// operation.
+func (s *Server) splitRangeLocked(ctx context.Context, req *pbv2.MetaSplitRangeRequest) (*pbv2.MetaSplitRangeResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
@@ -234,6 +250,239 @@ func (s *Server) MergeRanges(ctx context.Context, req *pbv2.MetaMergeRangesReque
 			"version", left.Version+1, "replicas", len(left.Replicas))
 	}
 	return &pbv2.MetaMergeRangesResponse{Success: true}, nil
+}
+
+// AutoSplit performs one size-based auto-split pass and returns the number of
+// ranges that were split. The caller must be the meta leader.
+//
+// The range map is snapshotted once. For each range the scheduler asks its
+// replicas for RangeStats (preferring the descriptor's leader hint), and, when
+// size_bytes >= maxRangeBytes and the reported split_key is strictly inside the
+// range, invokes the existing SplitRange path at that key. The split itself
+// re-reads a fresh range map, fans out to every replica with bounded retries,
+// and only then applies the meta range map, so a stale or failed replica leaves
+// the map unchanged.
+//
+// Ranges below the threshold, ranges with too few keys to produce a split key,
+// and ranges whose stats cannot be obtained are skipped; their failures are
+// returned alongside the successful split count. A pass does not revisit the
+// newly created right-hand ranges; the next pass (or a caller loop) does.
+func (s *Server) AutoSplit(ctx context.Context, maxRangeBytes uint64) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maxRangeBytes == 0 {
+		return 0, errors.New("auto-split: maxRangeBytes must be positive")
+	}
+
+	schedulerMu.Lock()
+	defer schedulerMu.Unlock()
+
+	if err := s.requireLeader(ctx); err != nil {
+		return 0, err
+	}
+
+	rows := s.cluster.Snapshot()
+	splits := 0
+	var errs []error
+	for i := range rows {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		r := rows[i]
+
+		stats, err := s.queryRangeStats(ctx, r)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("auto-split range %d: stats: %w", r.ID, err))
+			continue
+		}
+		if stats.GetSizeBytes() < maxRangeBytes {
+			continue
+		}
+		splitKey := stats.GetSplitKey()
+		if len(splitKey) == 0 {
+			// Over threshold but the leader could not find a safe median (for
+			// example, too few user keys). Leave it for a later pass.
+			continue
+		}
+		if !strictlyInside(splitKey, r.Start, r.End) {
+			errs = append(errs, fmt.Errorf(
+				"auto-split range %d: split key %q is not strictly inside [%q, %q)",
+				r.ID, splitKey, r.Start, r.End))
+			continue
+		}
+
+		resp, err := s.splitRangeLocked(ctx, &pbv2.MetaSplitRangeRequest{
+			RangeId:  r.ID,
+			SplitKey: splitKey,
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("auto-split range %d at %q: %w", r.ID, splitKey, err))
+			continue
+		}
+		if !resp.GetSuccess() {
+			msg := resp.GetError()
+			if msg == "" {
+				msg = "unspecified failure"
+			}
+			errs = append(errs, fmt.Errorf("auto-split range %d at %q: %s", r.ID, splitKey, msg))
+			continue
+		}
+		splits++
+		if s.log != nil {
+			s.log.Info("auto-split range", "range", r.ID, "split_key", fmt.Sprintf("%q", splitKey),
+				"size_bytes", stats.GetSizeBytes(), "key_count", stats.GetKeyCount(),
+				"max_bytes", maxRangeBytes)
+		}
+	}
+	return splits, errors.Join(errs...)
+}
+
+// StartAutoSplit starts a background loop that runs one AutoSplit pass every
+// interval. It is leader-only: on a replicated meta group only the current
+// leader performs a pass, followers silently skip their turn, and an election
+// naturally moves the work to the new leader. The loop stops when ctx is
+// canceled or Server.Stop is called; only one loop may run per Server.
+//
+// The first pass runs after one interval, not immediately.
+func (s *Server) StartAutoSplit(ctx context.Context, interval time.Duration, maxRangeBytes uint64) error {
+	if interval <= 0 {
+		return errors.New("auto-split: interval must be positive")
+	}
+	if maxRangeBytes == 0 {
+		return errors.New("auto-split: maxRangeBytes must be positive")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return errors.New("metaserver: stopped")
+	}
+	if s.autoSplit != nil {
+		s.mu.Unlock()
+		return errors.New("metaserver: auto-split already running")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	loop := &autoSplitLoop{cancel: cancel}
+	s.autoSplit = loop
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			if s.autoSplit == loop {
+				s.autoSplit = nil
+			}
+			s.mu.Unlock()
+		}()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.requireLeader(runCtx); err != nil {
+					// Followers are not supposed to schedule; the leader owns
+					// the pass. A transient read-barrier failure is retried on
+					// the next tick.
+					continue
+				}
+				splits, err := s.AutoSplit(runCtx, maxRangeBytes)
+				if s.log == nil {
+					continue
+				}
+				if err != nil {
+					s.log.Warn("auto-split pass finished with errors", "splits", splits, "error", err)
+				} else if splits > 0 {
+					s.log.Info("auto-split pass", "splits", splits)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+// queryRangeStats asks the range's replicas for stats until one answers with
+// success. The descriptor's leader hint is tried first; a non-leader response's
+// leader hint is promoted for the next attempt. Each round is bounded by
+// schedulerStatsTimeout and at most schedulerAttempts rounds are made.
+func (s *Server) queryRangeStats(ctx context.Context, r meta.Range) (*pbv2.RangeStatsResponse, error) {
+	order := replicasStartingWith(r.Leader, r.Replicas)
+	var lastErr error
+	for attempt := 0; attempt < schedulerAttempts; attempt++ {
+		for _, addr := range order {
+			resp, err := callRangeStats(ctx, addr, r)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if resp.GetSuccess() {
+				if !bytes.Equal(resp.GetStart(), r.Start) || !bytes.Equal(resp.GetEnd(), r.End) {
+					lastErr = fmt.Errorf("%s: stale range bounds [%q, %q), want [%q, %q)",
+						addr, resp.GetStart(), resp.GetEnd(), r.Start, r.End)
+					continue
+				}
+				return resp, nil
+			}
+			order = replicasStartingWith(resp.GetLeader(), order)
+			msg := resp.GetError()
+			if msg == "" {
+				msg = "unspecified failure"
+			}
+			lastErr = fmt.Errorf("%s: %s", addr, msg)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("range has no replicas")
+	}
+	return nil, lastErr
+}
+
+// callRangeStats performs one RangeStats RPC against one replica.
+func callRangeStats(ctx context.Context, addr string, r meta.Range) (*pbv2.RangeStatsResponse, error) {
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer cc.Close()
+
+	callCtx, cancel := context.WithTimeout(ctx, schedulerStatsTimeout)
+	defer cancel()
+	resp, err := pbv2.NewKVServiceClient(cc).RangeStats(callCtx, &pbv2.RangeStatsRequest{
+		RangeId: r.ID,
+		Epoch:   r.Version,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", addr, err)
+	}
+	return resp, nil
+}
+
+// replicasStartingWith returns replicas ordered with hint first (when it is one
+// of them). It preserves the relative order of the remaining replicas and never
+// adds an address that is not part of the placement.
+func replicasStartingWith(hint string, replicas []string) []string {
+	out := append([]string(nil), replicas...)
+	if hint == "" {
+		return out
+	}
+	for i, addr := range out {
+		if addr != hint {
+			continue
+		}
+		if i == 0 {
+			return out
+		}
+		copy(out[1:i+1], out[0:i])
+		out[0] = hint
+		return out
+	}
+	return out
 }
 
 // indexRanges maps range IDs to descriptors and returns the largest ID in the

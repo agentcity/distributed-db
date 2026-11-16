@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -160,5 +161,114 @@ func TestV2MetaSchedulerSplitMerge(t *testing.T) {
 	rows, err := sched.ListRanges(ctx, &pbv2.ListRangesRequest{})
 	if err != nil || len(rows.GetRanges()) != 1 {
 		t.Fatalf("ranges after merge: %v %+v", err, rows)
+	}
+}
+
+func TestV2MetaSchedulerAutoSplit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	metaAddr := v2FreeAddr(t)
+	addr := v2FreeAddr(t)
+
+	ms, err := metaserver.New(metaserver.Config{
+		Addr: metaAddr,
+		Ranges: []meta.Range{{
+			ID: 1, Start: nil, End: nil, Replicas: []string{addr}, Version: 1,
+		}},
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("meta start: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Stop() })
+
+	srv, err := kvserver.New(kvserver.Config{
+		ID: addr, RaftAddr: addr, DataDir: t.TempDir(),
+		Ranges:             []kvserver.RangeConfig{{ID: 1, Start: nil, End: nil}},
+		ElectionTimeoutMin: 80 * time.Millisecond,
+		ElectionTimeoutMax: 160 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		CacheSize:          8 << 20, MemTableSize: 4 << 20,
+		Logger: v2Logger(),
+	})
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Stop(sctx)
+	})
+	if !waitGroupLeader(t, srv, 1) {
+		t.Fatal("range 1 did not become leader")
+	}
+
+	client, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		key := []byte(fmt.Sprintf("key-%02d", i))
+		txn, err := client.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin %s: %v", key, err)
+		}
+		txn.Set(key, []byte("value"))
+		if err := txn.Commit(ctx); err != nil {
+			t.Fatalf("commit %s: %v", key, err)
+		}
+	}
+
+	// A 1-byte threshold forces a split; the scheduler must use the median key
+	// reported by RangeStats and update the range map itself.
+	splits, err := ms.AutoSplit(ctx, 1)
+	if err != nil {
+		t.Fatalf("AutoSplit: %v", err)
+	}
+	if splits != 1 {
+		t.Fatalf("AutoSplit splits = %d, want 1", splits)
+	}
+	rows := ms.Cluster().Snapshot()
+	if len(rows) != 2 {
+		t.Fatalf("ranges after auto-split = %+v, want 2", rows)
+	}
+	if len(rows[0].End) == 0 {
+		t.Fatalf("left range end = %q, want a split boundary", rows[0].End)
+	}
+	if string(rows[1].Start) != string(rows[0].End) {
+		t.Fatalf("right range start = %q, want %q", rows[1].Start, rows[0].End)
+	}
+	if rows[0].Version != 2 || rows[1].Version != 2 {
+		t.Fatalf("range versions = %d/%d, want 2/2", rows[0].Version, rows[1].Version)
+	}
+
+	// Data on both sides of the new boundary remains readable through a fresh
+	// client, which reloads the updated range map.
+	reader, err := v2client.New(metaAddr, []string{addr})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	for i := 0; i < n; i++ {
+		key := []byte(fmt.Sprintf("key-%02d", i))
+		txn, err := reader.Begin(ctx)
+		if err != nil {
+			t.Fatalf("read begin %s: %v", key, err)
+		}
+		got, err := txn.Get(ctx, key)
+		if err != nil || string(got) != "value" {
+			t.Fatalf("get %s = %q, %v; want value", key, got, err)
+		}
 	}
 }

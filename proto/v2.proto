@@ -16,6 +16,7 @@ service KVService {
   rpc ResolveLock(ResolveLockRequest) returns (ResolveLockResponse);
   rpc SplitRange(SplitRangeRequest) returns (SplitRangeResponse);
   rpc MergeRanges(MergeRangesRequest) returns (MergeRangesResponse);
+  rpc RangeStats(RangeStatsRequest) returns (RangeStatsResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
 }
 
@@ -163,6 +164,23 @@ message MergeRangesResponse {
   bool success = 1;
   string error = 2;
   string leader = 3;
+}
+
+// RangeStats reports approximate size/key statistics for one hosted range.
+// The meta scheduler uses size_bytes and split_key to trigger an auto-split.
+message RangeStatsRequest {
+  uint64 range_id = 1;
+  uint64 epoch = 2; // optional; 0 disables the epoch check
+}
+message RangeStatsResponse {
+  bool success = 1;
+  string leader = 2;
+  string error = 3;
+  uint64 size_bytes = 4;
+  uint64 key_count = 5;
+  bytes split_key = 6; // empty when the range has too few keys to split
+  bytes start = 7;
+  bytes end = 8;
 }
 
 message StatusRequest {

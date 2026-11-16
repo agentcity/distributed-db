@@ -811,6 +811,13 @@ func proposeWhileLeader(ctx context.Context, g *rangeGroup, entry model.Entry) e
 }
 
 func checkEpoch(ctx context.Context, g *rangeGroup) error {
+	return checkEpochHeader(ctx, g.cfg.Epoch)
+}
+
+// checkEpochHeader validates the optional x-range-epoch metadata against the
+// supplied range epoch. Callers that already snapshotted the epoch use this
+// form so the check does not read a concurrently-mutated group descriptor.
+func checkEpochHeader(ctx context.Context, current uint64) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil
@@ -823,8 +830,8 @@ func checkEpoch(ctx context.Context, g *rangeGroup) error {
 	if err != nil {
 		return fmt.Errorf("%w: bad header", ErrStaleEpoch)
 	}
-	if epoch != 0 && epoch != g.cfg.Epoch {
-		return fmt.Errorf("%w: have %d, request %d", ErrStaleEpoch, g.cfg.Epoch, epoch)
+	if epoch != 0 && epoch != current {
+		return fmt.Errorf("%w: have %d, request %d", ErrStaleEpoch, current, epoch)
 	}
 	return nil
 }
