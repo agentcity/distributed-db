@@ -35,7 +35,8 @@ Percolator-транзакция может оставить lock после па
 - [x] E2E: prewrite → CheckTxnStatus → ResolveLock commit → Get.
 - [x] E2E: rollback path.
 - [x] Клиентские методы CheckTxnStatus/ResolveLock и retry на live lock.
-- [ ] Фоновый GC locks и stress/Jepsen-проверка.
+- [x] Фоновый resolver просроченных locks.
+- [ ] Stress/Jepsen-проверка.
 
 ## Ссылки
 

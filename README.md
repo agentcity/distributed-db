@@ -88,8 +88,9 @@ prepare, замораживает все реплики и создаёт нов
 meta обновляется после успеха. Распределённый merge также работает:
 prepare в обеих группах, перенос right→left на каждой реплике. Остались
 epoch/fencing и persist range map RangeHost. Транзакции
-поддерживают `CheckTxnStatus/ResolveLock`, а `Get` сам разрешает
-committed/rolled-back/expired locks.
+поддерживают `CheckTxnStatus/ResolveLock`, `Get` разрешает
+committed/rolled-back locks, а фоновый resolver на лидере range
+откатывает expired locks через Raft.
 
 Пока нет: Multi-Raft host внутри одного процесса, split/merge с переносом
 данных и SQL-слой. Snapshot catch-up, restart из snapshot и gRPC-бенчмарк

@@ -215,8 +215,8 @@ meta SetRanges после успеха. Распределённый merge то�
 
 В M3/0008 сделано: `CheckTxnStatus`, `ResolveLock`, expired-lock rollback
 по TSO/TTL, RPC и авто-разрешение в `Get`; e2e commit/rollback paths.
-Клиентские методы CheckTxnStatus/ResolveLock добавлены. Осталось: фоновый
-GC locks, stress/Jepsen.
+Клиентские методы и фоновый resolver просроченных locks добавлены.
+Осталось: MVCC GC safe point, stress/Jepsen.
 
 В M5/0009 сделан SQL P0: parser, каталог, row encoding, executor на KV,
 HTTP `POST /v1/sql`, secondary indexes (`CREATE INDEX`, WHERE по indexed-
