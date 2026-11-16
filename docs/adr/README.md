@@ -6,6 +6,8 @@
 | [0002](0002-mvcc-percolator.md) | MVCC и Percolator-style 2PC | accepted |
 | [0003](0003-multiraft-ranges.md) | range-based Multi-Raft и metadata service | accepted |
 | [0004](0004-sql-layer.md) | SQL-слой поверх транзакционного KV | proposed |
+| [0005](0005-membership-safety.md) | Joint consensus, config в snapshot, decommission | proposed |
+| [0006](0006-pitr.md) | PITR: base snapshot + continuous Raft log archive | proposed |
 
 Правило: решение, которое меняет архитектуру, контракт пакета или формат
 данных, сначала фиксируется здесь, затем реализуется. ADR не переписывается
