@@ -98,6 +98,30 @@ type Transport interface {
 	AppendEntries(ctx context.Context, peer string, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
 }
 
+// TimeoutNowRequest asks a follower to start an election immediately. It is
+// sent by a leader that is transferring leadership; Term is the leader's term
+// and LeaderID identifies the sender.
+type TimeoutNowRequest struct {
+	Term     uint64
+	LeaderID string
+}
+
+// TimeoutNowResponse is the reply to a TimeoutNowRequest. Term is the
+// follower's term at validation time; Success reports whether the follower
+// accepted the request and started an election.
+type TimeoutNowResponse struct {
+	Term    uint64
+	Success bool
+}
+
+// TimeoutNowTransport is the optional Transport capability used by
+// Node.TransferLeadership. A transport that does not implement it makes
+// TransferLeadership return ErrLeaderTransferUnsupported instead of moving
+// leadership; normal Raft replication and elections are unaffected.
+type TimeoutNowTransport interface {
+	TimeoutNow(ctx context.Context, peer string, req *TimeoutNowRequest) (*TimeoutNowResponse, error)
+}
+
 // StateMachine consumes committed log entries in index order.
 type StateMachine interface {
 	Apply(entry model.Entry) error
@@ -244,12 +268,15 @@ type InstallSnapshotChunkRequest struct {
 // InstallSnapshotChunkResponse is the reply to one chunk. Term is the
 // follower's current term, Success reports whether the chunk was accepted,
 // LastIndex is set when the final chunk completed the install and Error
-// describes a rejected chunk.
+// describes a rejected chunk. NextOffset is the number of payload bytes
+// accepted so far, i.e. the offset the receiver expects next; it is reported
+// for snapshot resume but does not change the current send path.
 type InstallSnapshotChunkResponse struct {
-	Term      uint64
-	Success   bool
-	LastIndex uint64
-	Error     string
+	Term       uint64
+	Success    bool
+	LastIndex  uint64
+	Error      string
+	NextOffset int64
 }
 
 // SnapshotChunkTransport is the optional Transport capability used to stream
@@ -304,6 +331,18 @@ var (
 	// is used with a StateMachine or LogStore that lacks the corresponding
 	// optional capability.
 	ErrSnapshotStreamUnsupported = errors.New("raft: snapshot streaming unsupported")
+	// ErrUnknownTarget is returned when a leadership transfer names a node
+	// that is not one of this leader's peers.
+	ErrUnknownTarget = errors.New("raft: unknown leadership transfer target")
+	// ErrTargetNotCaughtUp is returned when a leadership transfer target has
+	// not replicated the leader's log within the bounded catch-up wait.
+	ErrTargetNotCaughtUp = errors.New("raft: leadership transfer target not caught up")
+	// ErrLeaderTransferUnsupported is returned when the configured Transport
+	// cannot deliver TimeoutNow messages.
+	ErrLeaderTransferUnsupported = errors.New("raft: leadership transfer unsupported by transport")
+	// ErrStaleTimeoutNow is returned when a TimeoutNow request carries a term
+	// or leader that no longer matches this follower's state.
+	ErrStaleTimeoutNow = errors.New("raft: stale TimeoutNow request")
 )
 
 // errLostQuorum classifies a proposal that was accepted while this node was

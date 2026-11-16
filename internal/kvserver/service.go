@@ -593,6 +593,57 @@ func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.St
 	}, nil
 }
 
+// TransferLeader moves leadership of one hosted range to target. The request
+// must reach the current leader; epoch is optional (0 disables the check) and
+// the x-range-epoch request header, when present, is validated as well. On
+// success the response carries target as the leader hint; on failure it
+// carries the current leader hint and a descriptive error.
+func (k *kvService) TransferLeader(ctx context.Context, req *pbv2.TransferLeaderRequest) (*pbv2.TransferLeaderResponse, error) {
+	g, err := k.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return &pbv2.TransferLeaderResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	if err := checkEpoch(ctx, g); err != nil {
+		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
+	}
+	if req.GetEpoch() != 0 && req.GetEpoch() != g.cfg.Epoch {
+		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: opError(ErrStaleEpoch)}, nil
+	}
+	if req.GetTarget() == "" {
+		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: "empty transfer target"}, nil
+	}
+	if err := g.node.TransferLeadership(ctx, req.GetTarget()); err != nil {
+		return &pbv2.TransferLeaderResponse{Leader: g.node.Leader(), Error: transferError(err)}, nil
+	}
+	return &pbv2.TransferLeaderResponse{Success: true, Leader: req.GetTarget()}, nil
+}
+
+// transferError renders a leadership-transfer failure. The categories match
+// opError, but transfer-specific errors are reported explicitly so callers can
+// distinguish "not caught up" from an internal failure.
+func transferError(err error) string {
+	switch {
+	case errors.Is(err, raft.ErrUnknownTarget):
+		return "unknown transfer target"
+	case errors.Is(err, raft.ErrTargetNotCaughtUp):
+		return "target not caught up"
+	case errors.Is(err, raft.ErrLeaderTransferUnsupported):
+		return "leader transfer unsupported"
+	case errors.Is(err, raft.ErrStaleTimeoutNow):
+		return "stale term"
+	case errors.Is(err, raft.ErrNotLeader):
+		return "not leader"
+	case errors.Is(err, raft.ErrStopped):
+		return "stopped"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return opError(err)
+	}
+}
+
 type raftService struct {
 	pbv2.UnimplementedRaftServiceServer
 	s *Server
@@ -713,11 +764,34 @@ func (r *raftService) InstallSnapshotChunk(ctx context.Context, req *pbv2.Instal
 		return nil, err
 	}
 	return &pbv2.InstallSnapshotChunkResponse{
-		Term:      resp.Term,
-		Success:   resp.Success,
-		LastIndex: resp.LastIndex,
-		Error:     resp.Error,
+		Term:       resp.Term,
+		Success:    resp.Success,
+		LastIndex:  resp.LastIndex,
+		Error:      resp.Error,
+		NextOffset: resp.NextOffset,
 	}, nil
+}
+
+// TimeoutNow routes a leadership-transfer trigger to the Raft node hosting
+// range_id. Protocol rejections (stale term, wrong role, lagging log) are
+// returned in the response with success=false; transport-level failures such
+// as an unknown range or a stopped node are returned as gRPC errors.
+func (r *raftService) TimeoutNow(ctx context.Context, req *pbv2.TimeoutNowRequest) (*pbv2.TimeoutNowResponse, error) {
+	if req == nil {
+		return nil, errors.New("kvserver: nil TimeoutNow")
+	}
+	g, err := r.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.node.HandleTimeoutNow(ctx, &raft.TimeoutNowRequest{
+		Term:     req.GetTerm(),
+		LeaderID: req.GetLeaderId(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pbv2.TimeoutNowResponse{Term: resp.Term, Success: resp.Success}, nil
 }
 
 func opError(err error) string {

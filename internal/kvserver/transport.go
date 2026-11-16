@@ -165,10 +165,32 @@ func (t *peerTransport) InstallSnapshotChunk(ctx context.Context, peer string, r
 		return nil, err
 	}
 	return &raft.InstallSnapshotChunkResponse{
-		Term:      resp.GetTerm(),
-		Success:   resp.GetSuccess(),
-		LastIndex: resp.GetLastIndex(),
-		Error:     resp.GetError(),
+		Term:       resp.GetTerm(),
+		Success:    resp.GetSuccess(),
+		LastIndex:  resp.GetLastIndex(),
+		Error:      resp.GetError(),
+		NextOffset: resp.GetNextOffset(),
+	}, nil
+}
+
+// TimeoutNow implements raft.TimeoutNowTransport. It is invoked by
+// Node.TransferLeadership when this node transfers a range's leadership.
+func (t *peerTransport) TimeoutNow(ctx context.Context, peer string, req *raft.TimeoutNowRequest) (*raft.TimeoutNowResponse, error) {
+	c, err := t.client(peer)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.TimeoutNow(ctx, &pbv2.TimeoutNowRequest{
+		RangeId:  t.rangeID,
+		Term:     req.Term,
+		LeaderId: req.LeaderID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raft.TimeoutNowResponse{
+		Term:    resp.GetTerm(),
+		Success: resp.GetSuccess(),
 	}, nil
 }
 
@@ -193,3 +215,4 @@ func (t *peerTransport) Close() {
 var _ raft.Transport = (*peerTransport)(nil)
 var _ raft.SnapshotTransport = (*peerTransport)(nil)
 var _ raft.SnapshotChunkTransport = (*peerTransport)(nil)
+var _ raft.TimeoutNowTransport = (*peerTransport)(nil)

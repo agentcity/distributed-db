@@ -31,6 +31,7 @@ const (
 	KVService_MergeRanges_FullMethodName    = "/dbv2.KVService/MergeRanges"
 	KVService_RangeStats_FullMethodName     = "/dbv2.KVService/RangeStats"
 	KVService_Status_FullMethodName         = "/dbv2.KVService/Status"
+	KVService_TransferLeader_FullMethodName = "/dbv2.KVService/TransferLeader"
 )
 
 // KVServiceClient is the client API for KVService service.
@@ -51,6 +52,9 @@ type KVServiceClient interface {
 	MergeRanges(ctx context.Context, in *MergeRangesRequest, opts ...grpc.CallOption) (*MergeRangesResponse, error)
 	RangeStats(ctx context.Context, in *RangeStatsRequest, opts ...grpc.CallOption) (*RangeStatsResponse, error)
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	// TransferLeader moves leadership of one range to target. The request is
+	// served by the current leader; epoch is optional (0 disables the check).
+	TransferLeader(ctx context.Context, in *TransferLeaderRequest, opts ...grpc.CallOption) (*TransferLeaderResponse, error)
 }
 
 type kVServiceClient struct {
@@ -181,6 +185,16 @@ func (c *kVServiceClient) Status(ctx context.Context, in *StatusRequest, opts ..
 	return out, nil
 }
 
+func (c *kVServiceClient) TransferLeader(ctx context.Context, in *TransferLeaderRequest, opts ...grpc.CallOption) (*TransferLeaderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TransferLeaderResponse)
+	err := c.cc.Invoke(ctx, KVService_TransferLeader_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVServiceServer is the server API for KVService service.
 // All implementations must embed UnimplementedKVServiceServer
 // for forward compatibility.
@@ -199,6 +213,9 @@ type KVServiceServer interface {
 	MergeRanges(context.Context, *MergeRangesRequest) (*MergeRangesResponse, error)
 	RangeStats(context.Context, *RangeStatsRequest) (*RangeStatsResponse, error)
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
+	// TransferLeader moves leadership of one range to target. The request is
+	// served by the current leader; epoch is optional (0 disables the check).
+	TransferLeader(context.Context, *TransferLeaderRequest) (*TransferLeaderResponse, error)
 	mustEmbedUnimplementedKVServiceServer()
 }
 
@@ -244,6 +261,9 @@ func (UnimplementedKVServiceServer) RangeStats(context.Context, *RangeStatsReque
 }
 func (UnimplementedKVServiceServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Status not implemented")
+}
+func (UnimplementedKVServiceServer) TransferLeader(context.Context, *TransferLeaderRequest) (*TransferLeaderResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TransferLeader not implemented")
 }
 func (UnimplementedKVServiceServer) mustEmbedUnimplementedKVServiceServer() {}
 func (UnimplementedKVServiceServer) testEmbeddedByValue()                   {}
@@ -482,6 +502,24 @@ func _KVService_Status_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_TransferLeader_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TransferLeaderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).TransferLeader(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_TransferLeader_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).TransferLeader(ctx, req.(*TransferLeaderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KVService_ServiceDesc is the grpc.ServiceDesc for KVService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -537,6 +575,10 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Status",
 			Handler:    _KVService_Status_Handler,
 		},
+		{
+			MethodName: "TransferLeader",
+			Handler:    _KVService_TransferLeader_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "v2.proto",
@@ -547,6 +589,7 @@ const (
 	RaftService_AppendEntries_FullMethodName        = "/dbv2.RaftService/AppendEntries"
 	RaftService_InstallSnapshot_FullMethodName      = "/dbv2.RaftService/InstallSnapshot"
 	RaftService_InstallSnapshotChunk_FullMethodName = "/dbv2.RaftService/InstallSnapshotChunk"
+	RaftService_TimeoutNow_FullMethodName           = "/dbv2.RaftService/TimeoutNow"
 )
 
 // RaftServiceClient is the client API for RaftService service.
@@ -571,6 +614,10 @@ type RaftServiceClient interface {
 	// as an unknown range, a stopped node or a cancelled RPC are reported as
 	// gRPC status errors instead of a response.
 	InstallSnapshotChunk(ctx context.Context, in *InstallSnapshotChunkRequest, opts ...grpc.CallOption) (*InstallSnapshotChunkResponse, error)
+	// TimeoutNow asks a follower to start an election immediately. It is sent
+	// by a leader that is transferring leadership to that follower; term must
+	// match the follower's current term or the request is rejected.
+	TimeoutNow(ctx context.Context, in *TimeoutNowRequest, opts ...grpc.CallOption) (*TimeoutNowResponse, error)
 }
 
 type raftServiceClient struct {
@@ -621,6 +668,16 @@ func (c *raftServiceClient) InstallSnapshotChunk(ctx context.Context, in *Instal
 	return out, nil
 }
 
+func (c *raftServiceClient) TimeoutNow(ctx context.Context, in *TimeoutNowRequest, opts ...grpc.CallOption) (*TimeoutNowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TimeoutNowResponse)
+	err := c.cc.Invoke(ctx, RaftService_TimeoutNow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServiceServer is the server API for RaftService service.
 // All implementations must embed UnimplementedRaftServiceServer
 // for forward compatibility.
@@ -643,6 +700,10 @@ type RaftServiceServer interface {
 	// as an unknown range, a stopped node or a cancelled RPC are reported as
 	// gRPC status errors instead of a response.
 	InstallSnapshotChunk(context.Context, *InstallSnapshotChunkRequest) (*InstallSnapshotChunkResponse, error)
+	// TimeoutNow asks a follower to start an election immediately. It is sent
+	// by a leader that is transferring leadership to that follower; term must
+	// match the follower's current term or the request is rejected.
+	TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -664,6 +725,9 @@ func (UnimplementedRaftServiceServer) InstallSnapshot(context.Context, *InstallS
 }
 func (UnimplementedRaftServiceServer) InstallSnapshotChunk(context.Context, *InstallSnapshotChunkRequest) (*InstallSnapshotChunkResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method InstallSnapshotChunk not implemented")
+}
+func (UnimplementedRaftServiceServer) TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TimeoutNow not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 func (UnimplementedRaftServiceServer) testEmbeddedByValue()                     {}
@@ -758,6 +822,24 @@ func _RaftService_InstallSnapshotChunk_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_TimeoutNow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TimeoutNowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).TimeoutNow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_TimeoutNow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).TimeoutNow(ctx, req.(*TimeoutNowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -780,6 +862,10 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InstallSnapshotChunk",
 			Handler:    _RaftService_InstallSnapshotChunk_Handler,
+		},
+		{
+			MethodName: "TimeoutNow",
+			Handler:    _RaftService_TimeoutNow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

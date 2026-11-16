@@ -34,6 +34,32 @@ type fakeKV struct {
 	mergeErr     string
 	statsErr     string
 	statsLeader  string
+	transfers    []*pbv2.TransferLeaderRequest
+	transferErr  string
+	state        *fakeLeaderState
+}
+
+// fakeLeaderState is shared by the fake replicas of new leader-rebalance tests
+// so Status and TransferLeader observe the same current leader per range.
+type fakeLeaderState struct {
+	mu      sync.Mutex
+	leaders map[uint64]string
+}
+
+func newFakeLeaderState() *fakeLeaderState {
+	return &fakeLeaderState{leaders: make(map[uint64]string)}
+}
+
+func (s *fakeLeaderState) setLeader(rangeID uint64, leader string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leaders[rangeID] = leader
+}
+
+func (s *fakeLeaderState) leaderFor(rangeID uint64) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leaders[rangeID]
 }
 
 func (f *fakeKV) SplitRange(_ context.Context, req *pbv2.SplitRangeRequest) (*pbv2.SplitRangeResponse, error) {
@@ -96,6 +122,50 @@ func (f *fakeKV) mergeRequests() []*pbv2.MergeRangesRequest {
 	return append([]*pbv2.MergeRangesRequest(nil), f.merges...)
 }
 
+// TransferLeader records the request and updates the shared leader map on
+// success. transferErr simulates a replica that rejects the handover.
+func (f *fakeKV) TransferLeader(_ context.Context, req *pbv2.TransferLeaderRequest) (*pbv2.TransferLeaderResponse, error) {
+	f.mu.Lock()
+	f.transfers = append(f.transfers, req)
+	errMsg := f.transferErr
+	state := f.state
+	current := f.addr
+	f.mu.Unlock()
+
+	if errMsg != "" {
+		return &pbv2.TransferLeaderResponse{Leader: current, Error: errMsg}, nil
+	}
+	if state != nil {
+		state.setLeader(req.GetRangeId(), req.GetTarget())
+	}
+	return &pbv2.TransferLeaderResponse{Success: true, Leader: req.GetTarget()}, nil
+}
+
+// Status reports this fake as leader when the shared leader map says so.
+func (f *fakeKV) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {
+	f.mu.Lock()
+	state := f.state
+	f.mu.Unlock()
+
+	leader := f.addr
+	if state != nil {
+		if current := state.leaderFor(req.GetRangeId()); current != "" {
+			leader = current
+		}
+	}
+	role := "follower"
+	if leader == f.addr {
+		role = "leader"
+	}
+	return &pbv2.StatusResponse{Id: f.addr, Role: role, Leader: leader, RangeId: req.GetRangeId()}, nil
+}
+
+func (f *fakeKV) transferRequests() []*pbv2.TransferLeaderRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*pbv2.TransferLeaderRequest(nil), f.transfers...)
+}
+
 // startFakeKV serves a fake replica on a loopback port and returns its address.
 func startFakeKV(t *testing.T, splitErr, mergeErr string) (string, *fakeKV) {
 	t.Helper()
@@ -105,12 +175,24 @@ func startFakeKV(t *testing.T, splitErr, mergeErr string) (string, *fakeKV) {
 // startFakeKVWithStats also configures the fake's RangeStats behavior.
 func startFakeKVWithStats(t *testing.T, splitErr, mergeErr, statsErr string) (string, *fakeKV) {
 	t.Helper()
+	return startFakeKVServer(t, &fakeKV{splitErr: splitErr, mergeErr: mergeErr, statsErr: statsErr})
+}
+
+// startFakeKVWithState starts a fake replica that shares leadership state with
+// its siblings, so Status and TransferLeader behave like a real replica set.
+func startFakeKVWithState(t *testing.T, state *fakeLeaderState) (string, *fakeKV) {
+	t.Helper()
+	return startFakeKVServer(t, &fakeKV{state: state})
+}
+
+func startFakeKVServer(t *testing.T, fake *fakeKV) (string, *fakeKV) {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := lis.Addr().String()
-	fake := &fakeKV{splitErr: splitErr, mergeErr: mergeErr, statsErr: statsErr, addr: addr}
+	fake.addr = addr
 	srv := grpc.NewServer()
 	pbv2.RegisterKVServiceServer(srv, fake)
 	go func() { _ = srv.Serve(lis) }()

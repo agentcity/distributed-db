@@ -215,7 +215,8 @@ func newTestClusterWithTimeouts(t *testing.T, size int, electionMin, electionMax
 			t.Fatalf("NewFileStore(%s): %v", id, err)
 		}
 		sm := newTestSM()
-		node, err := raft.New(c.configFor(id, peersExcept(ids, id), dir), store, sm, c.net.Transport(id))
+		tr := &testTransferTransport{Transport: c.net.Transport(id), cluster: c, id: id}
+		node, err := raft.New(c.configFor(id, peersExcept(ids, id), dir), store, sm, tr)
 		if err != nil {
 			t.Fatalf("raft.New(%s): %v", id, err)
 		}

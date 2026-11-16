@@ -18,6 +18,9 @@ service KVService {
   rpc MergeRanges(MergeRangesRequest) returns (MergeRangesResponse);
   rpc RangeStats(RangeStatsRequest) returns (RangeStatsResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  // TransferLeader moves leadership of one range to target. The request is
+  // served by the current leader; epoch is optional (0 disables the check).
+  rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
 }
 
 // RaftService is the Raft peer transport.
@@ -38,6 +41,10 @@ service RaftService {
   // as an unknown range, a stopped node or a cancelled RPC are reported as
   // gRPC status errors instead of a response.
   rpc InstallSnapshotChunk(InstallSnapshotChunkRequest) returns (InstallSnapshotChunkResponse);
+  // TimeoutNow asks a follower to start an election immediately. It is sent
+  // by a leader that is transferring leadership to that follower; term must
+  // match the follower's current term or the request is rejected.
+  rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
 }
 
 // MetaService owns the timestamp oracle for v2 transactions.
@@ -212,6 +219,36 @@ message StatusResponse {
   uint64 epoch = 10;
 }
 
+// TransferLeaderRequest asks the serving leader of range_id to hand
+// leadership to target, which must be another replica of the range. epoch is
+// optional; 0 skips the range-epoch check.
+message TransferLeaderRequest {
+  uint64 range_id = 1;
+  string target = 2;
+  uint64 epoch = 3;
+}
+message TransferLeaderResponse {
+  bool success = 1;
+  // leader is the best-known leader hint after the attempt: target when the
+  // transfer was accepted, otherwise the current leader (possibly empty).
+  string leader = 2;
+  string error = 3;
+}
+
+// TimeoutNowRequest is sent by a leader that is transferring leadership. term
+// is the leader's term; the follower accepts only when it matches its own.
+message TimeoutNowRequest {
+  uint64 range_id = 1;
+  uint64 term = 2;
+  string leader_id = 3;
+}
+message TimeoutNowResponse {
+  // term is the follower's term at validation time. A stale request is
+  // rejected with success=false and the follower's current term.
+  uint64 term = 1;
+  bool success = 2;
+}
+
 message RequestVoteRequest {
   uint64 term = 1;
   string candidate_id = 2;
@@ -290,6 +327,10 @@ message InstallSnapshotChunkResponse {
   bool success = 2;
   uint64 last_index = 3;
   string error = 4;
+  // next_offset is the total number of payload bytes accepted so far, i.e.
+  // the offset the receiver expects next. It lets a resumed upload continue
+  // instead of restarting at zero; this increment only reports it.
+  int64 next_offset = 5;
 }
 
 message SetRangesRequest {

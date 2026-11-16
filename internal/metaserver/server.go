@@ -71,6 +71,10 @@ type Server struct {
 	// Access is guarded by mu and Stop cancels and waits for it.
 	lifecycle *lifecycleLoop
 
+	// rebalance tracks the optional leader-rebalancing loop. Access is guarded
+	// by mu and Stop cancels and waits for it.
+	rebalance *rebalanceLoop
+
 	// tsMu serializes TSO reservations so two proposals cannot reserve the
 	// same timestamp on one leader.
 	tsMu sync.Mutex
@@ -83,6 +87,13 @@ type autoSplitLoop struct {
 
 // lifecycleLoop is the cancel/join handle for one StartLifecycle goroutine.
 type lifecycleLoop struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// rebalanceLoop is the cancel/join handle for one StartLeaderRebalance
+// goroutine.
+type rebalanceLoop struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -217,6 +228,8 @@ func (s *Server) Stop() error {
 	s.autoSplit = nil
 	lifecycle := s.lifecycle
 	s.lifecycle = nil
+	rebalance := s.rebalance
+	s.rebalance = nil
 	grpcSrv := s.grpc
 	lis := s.lis
 	node := s.raft
@@ -229,6 +242,10 @@ func (s *Server) Stop() error {
 	if lifecycle != nil {
 		lifecycle.cancel()
 		<-lifecycle.done
+	}
+	if rebalance != nil {
+		rebalance.cancel()
+		<-rebalance.done
 	}
 	if node != nil {
 		node.Stop()
