@@ -74,6 +74,9 @@ func waitForLeaderNode(t *testing.T, members []*testClusterNode) *testClusterNod
 }
 
 func TestThreeNodeClusterFailover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
 	// Reserve all addresses first: peers must be known before any node starts.
 	ports := freePorts(t, 6)
 	addrs := make([]string, 3)
