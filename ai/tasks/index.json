@@ -226,5 +226,11 @@
     "title": "Sprint 1 — production gates",
     "status": "done",
     "file": "0038-sprint-1-production-gates.md"
+  },
+  {
+    "id": "0039",
+    "title": "Практическое руководство по запуску и работе",
+    "status": "done",
+    "file": "0039-user-guide.md"
   }
 ]
