@@ -27,9 +27,17 @@ scope: {backend: true, console: false, mobile: false}
 
 ## Критерии
 
-- [ ] Bloom false-positive rate в допуске, false-negative = 0.
-- [ ] Merkle-proof проверяется.
-- [ ] Подпись manifest.
-- [ ] Кэш: отрицательный локально, положительный через сервер.
-- [ ] HTTP/CLI e2e.
-- [ ] Тесты.
+- [x] Bloom false-positive rate в допуске, false-negative = 0.
+- [x] Merkle-proof проверяется.
+- [x] Подпись manifest.
+- [x] Кэш: отрицательный локально, положительный через сервер.
+- [x] HTTP/CLI e2e.
+- [x] Тесты.
+
+## Реализовано
+
+- `internal/edgeset`: immutable segments, Bloom, Merkle, HMAC manifest.
+- `internal/edgehttp`: manifest/segment/lookup/health.
+- `internal/edgecache`: sync + local Bloom-negative + remote proof.
+- `cmd/edgehash`: build/serve/lookup/sync.
+- E2E: present lookup с proof verified, absent локально.
