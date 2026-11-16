@@ -6,17 +6,19 @@
 
 > **v1** (`cmd/db`) — учебно-демонстрационный координатор + hash-шардинг.
 > **v2** (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`) — experimental alpha:
-> Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, dynamic
-> membership, chunked snapshots, SQL P0. Production-профиль теперь
-> `-durability=sync` (fsync state machine); `fast` — opt-in. Это ещё
-> **не production-СУБД**: gRPC TLS/mTLS есть опционально (plaintext default),
-> PITR и joint consensus только в ADR, SLO p99/1 ТБ не подтверждены.
+> Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, **membership
+> MVP** (single-server, без joint consensus), chunked snapshots, SQL P0.
+> Production-профиль — `-durability=sync` (fsync state machine); `fast` —
+> opt-in. Это ещё **не production-СУБД**: gRPC TLS/mTLS есть опционально
+> (plaintext default), pgwire TLS/password auth есть, но RBAC/audit/at-rest
+> нет; PITR и joint consensus только в ADR; SLO p99/1 ТБ не подтверждены.
 > Практическое руководство (терминал, curl, SQL, psql): [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
 Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 Что реализовать до production: [docs/PRODUCTION-PLAN.md](docs/PRODUCTION-PLAN.md).
 Гейты и путь: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 Сравнение скорости с PostgreSQL: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd, mobile): [docs/EDGE-HASH-CACHE.md](docs/EDGE-HASH-CACHE.md).
+Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd; mobile — scaffold):
+[docs/EDGE-HASH-CACHE.md](docs/EDGE-HASH-CACHE.md).
 
 ## Что внутри
 
