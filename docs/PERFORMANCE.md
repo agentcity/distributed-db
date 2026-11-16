@@ -32,15 +32,25 @@ UPDATE bench SET v = v + 1 WHERE id = :id;
 
 До оптимизаций было: 3-node sequential ~33 мс, parallel ~24 мс/op (~420 tx/s).
 После atomic 1PC + parallel cross-range: sequential ~23 мс, parallel ~16 мс/op
-(~625 tx/s). То есть **~30% лучше по latency и ~1.5× по throughput**, но
-PostgreSQL всё ещё быстрее.
+(~625 tx/s). После отказа от отдельного fsync state machine (durability —
+Raft-лог): **sequential ~11.6 мс, parallel ~1.8 мс/op (~5.5k tx/s)**.
+
+Итоговая таблица (5s benchmark, 2 прогона):
+
+| Сценарий | distributed-db | PostgreSQL 13 | Разрыв |
+|---|---:|---:|---:|
+| 1 клиент | ~11.6 мс / ~86 tx/s | ~0.68 мс / ~1 469 tx/s | ~17× |
+| 10 клиентов | ~1.8 мс/op / ~5 500 tx/s | ~1.47 мс/op / ~6 835 tx/s | ~1.2× |
+
+На 10 клиентах мы почти догнали PostgreSQL по throughput; на одном клиенте
+всё ещё платим за Raft-консенсус и один fsync.
 
 ## Почему мы медленнее
 
-1. **Raft-консенсус**: минимум один RTT до кворума + fsync Raft-лога +
-   fsync state machine. PostgreSQL на одном узле не платит за консенсус.
-2. **Два fsync на транзакцию**: Raft log и Pebble state machine. Atomic 1PC
-   убрал второй fsync state machine, но не fsync Raft-лога.
+1. **Raft-консенсус**: минимум один RTT до кворума + fsync Raft-лога.
+   PostgreSQL на одном узле не платит за консенсус.
+2. **Один fsync на транзакцию** после отказа от Pebble SyncWrites; durability
+   state machine обеспечивается реплеем Raft-лога. Snapshot fsync'ится.
 3. **gRPC/RPC overhead**: TSO (батчится), CommitSingle, range lookup.
 4. **Apply loop / group commit window**: 1 мс batching window добавляет
    latency одиночному клиенту.
@@ -75,8 +85,9 @@ commit. Сравнение честно только в классе «расп�
 
 ## Вывод
 
-**Мы не обогнали PostgreSQL по скорости.** Мы сократили разрыв с ~2× до
-~11× на 10 клиентах, но на одном клиенте он всё ещё ~34×.
+**На 10 клиентах мы почти догнали PostgreSQL** (~1.2× разрыв), но на одном
+клиенте всё ещё ~17×. Это ожидаемо: один Raft-commit платит за консенсус,
+PostgreSQL — нет.
 
 Правильная цель — не «быстрее PostgreSQL на одном узле», а
 **«лучше PostgreSQL+Patroni/Citus на шардированной записи и автоматическом
