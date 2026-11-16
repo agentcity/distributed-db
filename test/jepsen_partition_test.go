@@ -775,10 +775,16 @@ func TestJepsenPartitionMinorityFollower(t *testing.T) {
 	c.assertIsolated(victim)
 	t.Logf("jepsen: isolated follower %d (%s); leader %d stays with quorum", victim, c.clientAddrs[victim], leader)
 
-	// The isolated follower must not accept writes: it can never reach the
-	// majority needed to commit one.
+	// The isolated replica must not accept writes: it can never reach the
+	// majority needed to commit one. Give it one election window to lose the
+	// lease in case it was promoted between picking the follower and closing
+	// the links; an isolated replica may not remain leader.
+	leaderDeadline := time.Now().Add(2 * time.Second)
+	for jepIsLeader(c.roleOf(victim, 1)) && time.Now().Before(leaderDeadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
 	if role := c.roleOf(victim, 1); jepIsLeader(role) {
-		t.Fatalf("jepsen: isolated follower %d became leader without quorum", victim)
+		t.Fatalf("jepsen: isolated replica %d remained leader without quorum", victim)
 	}
 	probeKey := fmt.Sprintf("%s-stale-probe", rig.prefix)
 	probeResp, probeErr := jepProbeWrite(c.clients[victim], probeKey, "should-not-commit")
@@ -1072,13 +1078,6 @@ func TestJepsenCrossRangePartition(t *testing.T) {
 
 	// Invariant: a cross-range transaction that fails before commit (here the
 	// secondary prewrite hits a foreign lock) must leave neither side visible.
-	//
-	// LIMITATION: this covers clean pre-commit failures. Injecting a fault
-	// between the primary commit and the secondary commit (and the recovery
-	// that must resolve a leftover secondary lock) is task 0025's crash-point
-	// test, not this partition test. A client timeout after the primary commit
-	// is therefore not exercised here: no production code is changed to create
-	// that state, and production has no cross-range lock resolver yet.
 	baseA, baseZ := fmt.Sprintf("a-jepsen-%d-conflict", seed), fmt.Sprintf("z-jepsen-%d-conflict", seed)
 	if err := rig.put(baseA, "base-a", 2*time.Second, 4*time.Second); err != nil {
 		t.Fatalf("jepsen: seed conflict key A: %v", err)
@@ -1143,6 +1142,93 @@ func TestJepsenCrossRangePartition(t *testing.T) {
 	if err := jepWaitPair(rig, postA, postZ, "post-heal", "post-heal", 6*time.Second); err != nil {
 		t.Fatalf("jepsen: post-heal cross-range transaction not visible: %v", err)
 	}
+
+	// Invariant: a crash point after the primary range committed but before
+	// the secondary range committed must end with BOTH sides visible, never
+	// one-sided. The state is created deterministically with low-level RPCs
+	// while a minority replica is partitioned:
+	//
+	//	1. prewrite the secondary key (range 2) with a primary key in range 1;
+	//	2. commit the primary range only;
+	//	3. let the secondary lock outlive its TTL while a replica is down,
+	//	   which is when a local-only resolver would wrongly roll it back;
+	//	4. heal and read both keys through a client, which resolves the
+	//	   secondary lock by asking the primary range.
+	partialA := fmt.Sprintf("a-jepsen-%d-partial", seed)
+	partialZ := fmt.Sprintf("z-jepsen-%d-partial", seed)
+	l1, l2 := c.leaderNow(1), c.leaderNow(2)
+	partialVictim := -1
+	for i := 0; i < c.n; i++ {
+		if i != l1 && i != l2 {
+			partialVictim = i
+			break
+		}
+	}
+	if partialVictim < 0 {
+		partialVictim = (l1 + 1) % c.n
+	}
+	c.isolateNode(partialVictim)
+	c.assertIsolated(partialVictim)
+	c.waitStableLeader(1, 8*time.Second)
+	c.waitStableLeader(2, 8*time.Second)
+
+	startTS, err := rig.allocTS(2 * time.Second)
+	if err != nil {
+		t.Fatalf("jepsen: alloc partial startTS: %v", err)
+	}
+	commitTS, err := rig.allocTS(2 * time.Second)
+	if err != nil {
+		t.Fatalf("jepsen: alloc partial commitTS: %v", err)
+	}
+	if commitTS <= startTS {
+		t.Fatalf("jepsen: partial commitTS %d <= startTS %d", commitTS, startTS)
+	}
+	c.onLeader(2, "prewrite secondary of partial txn", func(cl pbv2.KVServiceClient) (bool, string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := cl.Prewrite(ctx, &pbv2.PrewriteRequest{
+			StartTs: startTS,
+			Primary: []byte(partialA),
+			Mutations: []*pbv2.Mutation{{
+				Key:   []byte(partialZ),
+				Value: []byte("partial-right"),
+			}},
+		})
+		if err != nil {
+			return false, err.Error()
+		}
+		return resp.GetSuccess() && resp.GetError() == "", resp.GetError()
+	})
+	c.onLeader(1, "commit primary of partial txn", func(cl pbv2.KVServiceClient) (bool, string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := cl.CommitSingle(ctx, &pbv2.CommitSingleRequest{
+			StartTs:  startTS,
+			CommitTs: commitTS,
+			Primary:  []byte(partialA),
+			Mutations: []*pbv2.Mutation{{
+				Key:   []byte(partialA),
+				Value: []byte("partial-left"),
+			}},
+		})
+		if err != nil {
+			return false, err.Error()
+		}
+		return resp.GetSuccess() && resp.GetError() == "", resp.GetError()
+	})
+	t.Logf("jepsen: created crash point after primary commit (a=%s committed, z=%s locked)", partialA, partialZ)
+
+	// 3s lock TTL + one resolver tick. The background resolver must leave the
+	// cross-range secondary lock alone; resolving it is the client's job.
+	time.Sleep(3500 * time.Millisecond)
+
+	c.heal()
+	c.waitStableLeader(1, 8*time.Second)
+	c.waitStableLeader(2, 8*time.Second)
+	if err := jepWaitPair(rig, partialA, partialZ, "partial-left", "partial-right", 15*time.Second); err != nil {
+		t.Fatalf("jepsen: crash point after primary commit became partially visible: %v", err)
+	}
+	t.Logf("jepsen: crash-point pair recovered atomically after heal")
 
 	t.Logf("jepsen: cross-range scenario passed in %s with %d pairs (seed=%d)",
 		time.Since(started).Round(time.Millisecond), len(pairs), seed)
