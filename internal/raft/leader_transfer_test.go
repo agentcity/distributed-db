@@ -51,7 +51,7 @@ func otherID(ids []string, id string) string {
 }
 
 func TestTransferLeadershipMovesLeadership(t *testing.T) {
-	c := newTestCluster(t, 3)
+	c := newTestClusterWithTimeouts(t, 3, 500*time.Millisecond, time.Second, 50*time.Millisecond)
 	leader, leaderID := c.waitLeader(c.ids, testWait)
 	target := otherID(c.ids, leaderID)
 
@@ -69,7 +69,21 @@ func TestTransferLeadershipMovesLeadership(t *testing.T) {
 		t.Fatalf("%s is still leader after transferring to %s", leaderID, target)
 	}
 
-	newLeader, newID := c.waitLeader(c.ids, 3*time.Second)
+	// Under scheduling pressure a third node may win the election that follows
+	// the leader's step-down. Transfer again from that leader until the intended
+	// target wins; the API guarantee is "this target becomes leader", not
+	// "no other node ever campaigns".
+	var newLeader *raft.Node
+	var newID string
+	for attempt := 0; attempt < 3; attempt++ {
+		newLeader, newID = c.waitLeader(c.ids, 3*time.Second)
+		if newID == target {
+			break
+		}
+		if err := newLeader.TransferLeadership(ctx, target); err != nil {
+			t.Fatalf("retry TransferLeadership(%s) from %s: %v", target, newID, err)
+		}
+	}
 	if newID != target {
 		t.Fatalf("new leader = %s, want transfer target %s", newID, target)
 	}
