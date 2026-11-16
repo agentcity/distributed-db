@@ -79,3 +79,24 @@ func copyProof(p *Proof) *Proof {
 	out.Right = append([]bool(nil), p.Right...)
 	return out
 }
+
+func copyAbsenceProof(p *AbsenceProof) *AbsenceProof {
+	if p == nil {
+		return nil
+	}
+	return &AbsenceProof{
+		Prefix: p.Prefix,
+		Root:   p.Root,
+		Left:   copyProof(p.Left),
+		Right:  copyProof(p.Right),
+	}
+}
+
+// prefixedHash returns a hash with a fixed segment prefix and a big-endian tail
+// byte, which makes sorted-order boundary cases easy to construct in tests.
+func prefixedHash(prefix uint16, tail byte) Hash {
+	var h Hash
+	binary.BigEndian.PutUint16(h[0:2], prefix)
+	h[len(h)-1] = tail
+	return h
+}

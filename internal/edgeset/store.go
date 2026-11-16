@@ -1,6 +1,7 @@
 package edgeset
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // Store is an immutable local view of an edgeset directory.
@@ -47,7 +50,7 @@ func newStore(dir string, m *Manifest) *Store {
 // Segment files are deterministic for a given hash set, options and signing
 // key. Build refuses a non-empty destination directory.
 func Build(hashes []Hash, opts BuildOptions) (*Store, *Manifest, error) {
-	prefixBytes, falsePositiveRate, err := normalizeBuildOptions(opts)
+	prefixBytes, falsePositiveRate, compression, err := normalizeBuildOptions(opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -79,6 +82,17 @@ func Build(hashes []Hash, opts BuildOptions) (*Store, *Manifest, error) {
 		return nil, nil, fmt.Errorf("edgeset: create segments directory: %w", err)
 	}
 
+	// One encoder is reused for every compressed segment; EncodeAll itself is
+	// deterministic, so builds with the same inputs produce identical files.
+	var encoder *zstd.Encoder
+	if compression != compressionNoneMode {
+		encoder, err = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+		if err != nil {
+			return nil, nil, fmt.Errorf("edgeset: create zstd encoder: %w", err)
+		}
+		defer func() { _ = encoder.Close() }()
+	}
+
 	segments := make([]SegmentMeta, 0)
 	for start := 0; start < len(unique); {
 		prefix := prefixOf(unique[start], prefixBytes)
@@ -100,7 +114,12 @@ func Build(hashes []Hash, opts BuildOptions) (*Store, *Manifest, error) {
 			return nil, nil, fmt.Errorf("%w: empty segment %04x", ErrCorruptSegment, prefix)
 		}
 		root := levels[len(levels)-1][0]
-		data := encodeSegment(prefix, group, bloom)
+
+		rawSize := len(bloom.bits) + len(group)*segmentHashSize
+		data, compressionName, err := encodeSegmentV2(prefix, group, bloom, compression.compress(rawSize), encoder)
+		if err != nil {
+			return nil, nil, err
+		}
 		checksum := sha256.Sum256(data)
 		relative := segmentFileFor(prefix)
 		if err := os.WriteFile(filepath.Join(target.staging, filepath.FromSlash(relative)), data, 0o644); err != nil {
@@ -108,14 +127,15 @@ func Build(hashes []Hash, opts BuildOptions) (*Store, *Manifest, error) {
 		}
 
 		segments = append(segments, SegmentMeta{
-			Prefix:    prefix,
-			Count:     len(group),
-			BloomBits: int(bloom.m),
-			BloomK:    bloom.k,
-			Root:      root,
-			File:      relative,
-			Size:      int64(len(data)),
-			SHA256:    checksum,
+			Prefix:      prefix,
+			Count:       len(group),
+			BloomBits:   int(bloom.m),
+			BloomK:      bloom.k,
+			Root:        root,
+			File:        relative,
+			Size:        int64(len(data)),
+			SHA256:      checksum,
+			Compression: compressionName,
 		})
 		start = end
 	}
@@ -125,7 +145,12 @@ func Build(hashes []Hash, opts BuildOptions) (*Store, *Manifest, error) {
 		PrefixBytes: prefixBytes,
 		Segments:    segments,
 	}
-	if len(opts.SigningKey) > 0 {
+	switch {
+	case len(opts.Ed25519PrivateKey) > 0:
+		if err := signManifestEd25519(manifest, opts.Ed25519PrivateKey); err != nil {
+			return nil, nil, err
+		}
+	case len(opts.SigningKey) > 0:
 		if err := signManifest(manifest, opts.SigningKey); err != nil {
 			return nil, nil, err
 		}
@@ -146,13 +171,28 @@ func Build(hashes []Hash, opts BuildOptions) (*Store, *Manifest, error) {
 	return newStore(target.dir, manifest), manifest, nil
 }
 
-// LoadStore opens an existing store.
+// LoadStore opens an existing store using the legacy HMAC-SHA256 verifier.
 //
-// It validates the manifest structure, verifies its HMAC when key is non-empty,
-// and verifies every segment file's size, SHA-256, header, ordering and Merkle
-// root before returning. Individual segments are nevertheless rechecked when
-// first cached, so files changed after LoadStore cannot answer lookups.
+// It validates the manifest structure, verifies its HMAC when key is non-empty
+// (an empty key disables signature verification), and verifies every segment
+// file's size, SHA-256, header, compression, ordering and Merkle root before
+// returning. Individual segments are nevertheless rechecked when first cached,
+// so files changed after LoadStore cannot answer lookups.
+//
+// Ed25519-signed stores must be opened with LoadStoreVerified. Use LoadStore
+// only for HMAC-signed or unsigned stores.
 func LoadStore(dir string, key []byte) (*Store, *Manifest, error) {
+	return LoadStoreVerified(dir, HMACVerifier{Key: key})
+}
+
+// LoadStoreVerified opens an existing store and authenticates its manifest
+// with verifier. A nil verifier skips signature verification but still checks
+// the manifest structure and every segment file.
+//
+// The verifier decides which signature algorithms are acceptable. Passing an
+// Ed25519Verifier rejects HMAC manifests (and vice versa), which prevents an
+// attacker from silently downgrading the manifest signature algorithm.
+func LoadStoreVerified(dir string, verifier Verifier) (*Store, *Manifest, error) {
 	if dir == "" {
 		return nil, nil, fmt.Errorf("%w: empty store directory", ErrInvalidOption)
 	}
@@ -168,8 +208,10 @@ func LoadStore(dir string, key []byte) (*Store, *Manifest, error) {
 	if err := validateManifest(&manifest); err != nil {
 		return nil, nil, err
 	}
-	if err := VerifyManifest(&manifest, key); err != nil {
-		return nil, nil, err
+	if verifier != nil {
+		if err := verifier.VerifyManifest(&manifest); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	store := newStore(clean, &manifest)
@@ -179,13 +221,13 @@ func LoadStore(dir string, key []byte) (*Store, *Manifest, error) {
 	return store, &manifest, nil
 }
 
-func normalizeBuildOptions(opts BuildOptions) (prefixBytes int, falsePositiveRate float64, err error) {
+func normalizeBuildOptions(opts BuildOptions) (prefixBytes int, falsePositiveRate float64, compression compressionMode, err error) {
 	prefixBytes = opts.PrefixBytes
 	if prefixBytes == 0 {
 		prefixBytes = defaultPrefixBytes
 	}
 	if prefixBytes < minPrefixBytes || prefixBytes > maxPrefixBytes {
-		return 0, 0, fmt.Errorf("%w: PrefixBytes %d outside %d..%d", ErrInvalidOption, prefixBytes, minPrefixBytes, maxPrefixBytes)
+		return 0, 0, 0, fmt.Errorf("%w: PrefixBytes %d outside %d..%d", ErrInvalidOption, prefixBytes, minPrefixBytes, maxPrefixBytes)
 	}
 
 	falsePositiveRate = opts.FalsePositiveRate
@@ -194,9 +236,21 @@ func normalizeBuildOptions(opts BuildOptions) (prefixBytes int, falsePositiveRat
 	}
 	if math.IsNaN(falsePositiveRate) || math.IsInf(falsePositiveRate, 0) ||
 		falsePositiveRate <= 0 || falsePositiveRate >= 1 {
-		return 0, 0, fmt.Errorf("%w: FalsePositiveRate %v must be in (0,1)", ErrInvalidOption, falsePositiveRate)
+		return 0, 0, 0, fmt.Errorf("%w: FalsePositiveRate %v must be in (0,1)", ErrInvalidOption, falsePositiveRate)
 	}
-	return prefixBytes, falsePositiveRate, nil
+
+	if len(opts.SigningKey) > 0 && len(opts.Ed25519PrivateKey) > 0 {
+		return 0, 0, 0, fmt.Errorf("%w: SigningKey and Ed25519PrivateKey are mutually exclusive", ErrInvalidOption)
+	}
+	if len(opts.Ed25519PrivateKey) > 0 && len(opts.Ed25519PrivateKey) != ed25519.PrivateKeySize {
+		return 0, 0, 0, fmt.Errorf("%w: Ed25519PrivateKey must be %d bytes, got %d", ErrInvalidOption, ed25519.PrivateKeySize, len(opts.Ed25519PrivateKey))
+	}
+
+	compression, err = parseCompression(opts.Compression)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return prefixBytes, falsePositiveRate, compression, nil
 }
 
 func (s *Store) verifyAllSegments() error {

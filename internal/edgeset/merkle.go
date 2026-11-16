@@ -17,6 +17,25 @@ var emptyLeaf = func() Hash {
 	return sum
 }()
 
+// emptySubtreeRoots[level] is the root of a power-of-two subtree at that level
+// in which every leaf is emptyLeaf. Absence proofs use these roots to show
+// that no non-empty leaf exists to the right of a claimed last leaf.
+var emptySubtreeRoots = func() []Hash {
+	roots := make([]Hash, maxMerkleTreeDepth+1)
+	roots[0] = emptyLeaf
+	for level := 1; level < len(roots); level++ {
+		roots[level] = nodeHash(roots[level-1], roots[level-1])
+	}
+	return roots
+}()
+
+func emptySubtreeRoot(level int) Hash {
+	if level < 0 || level >= len(emptySubtreeRoots) {
+		return Hash{}
+	}
+	return emptySubtreeRoots[level]
+}
+
 // leafHash domain-separates Merkle leaves from internal nodes. Without the
 // prefixes a 64-byte node could be interpreted as two concatenated hashes.
 func leafHash(h Hash) Hash {
@@ -101,6 +120,26 @@ func proofFor(hashes []Hash, levels [][]Hash, index int) *Proof {
 		idx >>= 1
 	}
 	return p
+}
+
+// proofShowsLastLeaf reports whether p, already verified against a root, proves
+// that its leaf is the last non-empty leaf of the segment tree.
+//
+// Padding uses the domain-separated emptyLeaf, so when the path goes left at a
+// level the right-hand sibling must be the canonical all-empty subtree root of
+// that level. If that holds at every left-step, no non-empty leaf can exist to
+// the right of the proven leaf. The proof format is unchanged; the check uses
+// only Path and Right.
+func proofShowsLastLeaf(p *Proof) bool {
+	if p == nil || len(p.Path) != len(p.Right) {
+		return false
+	}
+	for level := range p.Path {
+		if p.Right[level] && p.Path[level] != emptySubtreeRoot(level) {
+			return false
+		}
+	}
+	return true
 }
 
 // VerifyProof reports whether p proves that h is a leaf of the Merkle tree with

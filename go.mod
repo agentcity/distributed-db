@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/klauspost/compress v1.16.0
 	github.com/prometheus/client_golang v1.18.0
 	golang.org/x/crypto v0.32.0
 	golang.org/x/time v0.3.0
@@ -23,7 +24,6 @@ require (
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/klauspost/compress v1.16.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
