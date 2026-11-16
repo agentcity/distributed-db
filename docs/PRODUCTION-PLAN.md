@@ -194,8 +194,8 @@ TLS/Bearer.
 - crash-injection harness: SIGKILL + restart, fast и sync; подтверждённых
   потерь нет, fast восстанавливается replay Raft-лога;
 - ADR 0005 membership safety (joint consensus) и ADR 0006 PITR;
-- pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS helper
-  `internal/grpctls` (в kvserver/v2client ещё не интегрирован);
+- pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS/mTLS
+  интегрирован в KV/meta/Raft/v2client/CLI (опционально, plaintext default);
 - 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
 - nightly chaos CI + script; Jepsen partition harness исправлен
   (stable voter IDs + PeerAddrs), 15/15 smoke-тестов проходят.
@@ -204,7 +204,7 @@ TLS/Bearer.
 
 - joint consensus и membership snapshot (ADR, не код);
 - PITR (ADR, не код);
-- gRPC/meta TLS integration и mTLS;
+- gRPC/meta TLS включён по умолчанию и admin-listener/RBAC;
 - libpq-compatible pgwire TLS (сейчас direct TLS, не SSLRequest upgrade);
 - 1 ТБ реальный прогон, real-network soak.
 

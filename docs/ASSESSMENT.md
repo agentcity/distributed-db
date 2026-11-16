@@ -95,8 +95,10 @@ DBaaS и не замена PostgreSQL.
 3. Crash-consistency `SyncWrites=false`: durability state machine опирается на
    replay Raft-лога; нужен crash-тест/soak.
 4. Restore drills и RPO/RTO; PITR отсутствует.
-5. Безопасность v2: нет TLS/mTLS/auth/RBAC/audit/encryption; v1 HTTP имеет
-   Basic Auth/TLS, edgehash — TLS/Bearer.
+5. Безопасность v2: gRPC TLS/mTLS **есть опционально** (KV/meta/Raft,
+   v2client, CLI), но по умолчанию plaintext; нет RBAC/audit/encryption at
+   rest; SQL HTTP без TLS/auth, pgwire — один статический пользователь;
+   v1 HTTP имеет Basic Auth/TLS, edgehash — TLS/Bearer.
 6. Membership safety: нет joint consensus, membership не в state-machine
    snapshot, нет decommission.
 7. Rolling upgrade/rollback и совместимость протоколов.

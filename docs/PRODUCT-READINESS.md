@@ -66,7 +66,7 @@ SDK — scaffold, не production.
 | Prometheus-метрики KV/SQL/pgwire, SLO p50/p95/p99 | есть |
 | `/metrics`, `/debug/slo` в sqlsrv/pgsrv | есть |
 | Jepsen kill/restart, partitions, clock skew (client-side) | есть, opt-in |
-| TLS/mTLS, authn/authz, audit | **нет** (v1 HTTP — Basic/TLS; v2 — нет; edgehash — TLS/Bearer) |
+| TLS/mTLS, authn/authz, audit | gRPC TLS/mTLS **есть, опционально**; RBAC/audit/at-rest нет; SQL HTTP без TLS/auth; edgehash TLS/Bearer |
 | Multi-tenancy, quotas, rate limits | **нет** (edgehash — per-IP rate limit) |
 | PITR/continuous backup, restore drills | **нет** |
 | Helm/operator, rolling upgrade/rollback | **нет** |

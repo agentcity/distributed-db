@@ -5,6 +5,13 @@
 - Область: `cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`, `internal/{kvserver,metaserver,v2client,pgwire,grpctls,edgehttp,backup}`, `cmd/edgehash`, `mobile/`
 - Метод: чтение кода и конфигов; эксплойты не запускались, это не пентест
 
+> **Sprint 2 addendum (после аудита).** gRPC TLS/mTLS для KV, meta и Raft
+> интегрирован в HEAD `843e670`: `kvserver`/`metaserver`/`raftgrpc`/`v2client`
+> и CLI-флаги `-tls-*`. S-01 и S-04 закрыты **на уровне транспорта при
+> включённом TLS**, но plaintext остаётся default, S-02 (admin RPC на data-
+> порту, нет RBAC) и S-03 (SQL HTTP) не закрыты. Оценки ниже — на момент
+> аудита; актуальный статус — в [README.md](README.md).
+
 ## 1. Вердикт
 
 У v2 нет периметра безопасности. `internal/grpctls` (TLS 1.3, mTLS через

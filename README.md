@@ -9,8 +9,8 @@
 > Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, dynamic
 > membership, chunked snapshots, SQL P0. Production-профиль теперь
 > `-durability=sync` (fsync state machine); `fast` — opt-in. Это ещё
-> **не production-СУБД**: gRPC/meta TLS не интегрирован, PITR и joint
-> consensus только в ADR, SLO p99/1 ТБ не подтверждены.
+> **не production-СУБД**: gRPC TLS/mTLS есть опционально (plaintext default),
+> PITR и joint consensus только в ADR, SLO p99/1 ТБ не подтверждены.
 > Практическое руководство (терминал, curl, SQL, psql): [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
 Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 Что реализовать до production: [docs/PRODUCTION-PLAN.md](docs/PRODUCTION-PLAN.md).
