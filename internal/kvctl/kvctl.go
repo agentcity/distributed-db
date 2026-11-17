@@ -79,6 +79,7 @@ type Backend interface {
 	Close() error
 
 	ListRanges(ctx context.Context) ([]RangeInfo, error)
+	SetRanges(ctx context.Context, ranges []RangeInfo) error
 	SplitRange(ctx context.Context, rangeID uint64, splitKey []byte) (uint64, error)
 	MergeRanges(ctx context.Context, leftID, rightID uint64) error
 	MetaLeader(ctx context.Context) (string, uint64, error)
@@ -137,6 +138,7 @@ Commands:
   shell                     interactive shell (data commands only)
   ping                      check meta/TSO connectivity
   ranges                    list meta ranges (meta only)
+  init-ranges               bootstrap a fresh single-range meta with KV replicas
   status                    show meta leader, term and range counts (meta only)
   split <range-id> <key>    split a range at key (meta only)
   merge <left-id> <right-id>  merge two adjacent ranges (meta only)
@@ -157,13 +159,21 @@ Global flags:
   -tls-server-name NAME     expected server name for certificate verification
   -admin-token TOKEN        Bearer token for meta admin RPCs (env KVCTL_ADMIN_TOKEN)
 
-  ranges and status are read-only and never send the admin token. split and
-  merge are admin RPCs; when the meta server was started with -admin-token,
-  pass -admin-token or set KVCTL_ADMIN_TOKEN. The token is never printed.
+  ranges and status are read-only and never send the admin token. init-ranges,
+  split and merge are admin RPCs; when the meta server was started with
+  -admin-token, pass -admin-token or set KVCTL_ADMIN_TOKEN. The token is never
+  printed.
 
-  ranges, status, split and merge only need -meta. get, put, delete, scan,
-  txn, shell, ping and backup also require -nodes. Backup defaults to a 10m
-  timeout; raise -timeout for very large data sets.
+  init-ranges is a one-time, fail-closed bootstrap for a FRESH meta whose
+  single range has no replicas. It sets range 1's replicas to -replicas (or
+  -nodes when -replicas is omitted). It refuses to touch a map with more than
+  one range or with a different existing replica set, because SetRanges
+  replaces the whole range map and can orphan split ranges and data. Running it
+  twice with the same replica set is a no-op.
+
+  ranges, status, init-ranges, split and merge only need -meta. get, put,
+  delete, scan, txn, shell, ping and backup also require -nodes. Backup
+  defaults to a 10m timeout; raise -timeout for very large data sets.
 
 Examples:
   kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put user:1 alice
@@ -172,6 +182,8 @@ Examples:
   printf 'put a 1\nput b 2\ndelete a\n' | kvctl -nodes ... txn
   kvctl -nodes ... -hex put 6b 76   # key "k", value "v"
   kvctl -format json -meta 127.0.0.1:9090 ranges
+  kvctl -meta 127.0.0.1:9090 init-ranges \
+    -replicas 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
   kvctl -meta 127.0.0.1:9090 status
   kvctl -meta 127.0.0.1:9090 split 1 m
   kvctl -meta 127.0.0.1:9090 merge 2 3
@@ -379,6 +391,9 @@ func (r *Runner) execute(ctx context.Context, b Backend, cfg Config, cmd string,
 	case "ranges":
 		return r.executeRanges(ctx, b, cfg, args)
 
+	case "init-ranges":
+		return r.executeInitRanges(ctx, b, cfg, args)
+
 	case "status":
 		return r.executeStatus(ctx, b, cfg, args)
 
@@ -546,6 +561,141 @@ func (r *Runner) executeRanges(ctx context.Context, b Backend, cfg Config, args 
 			info.ID, display(info.Start, cfg.Hex), display(info.End, cfg.Hex),
 			info.Leader, strings.Join(info.Replicas, ","), info.Version)
 	}
+	return 0
+}
+
+type initRangesJSON struct {
+	Status             string   `json:"status"`
+	RangeID            uint64   `json:"range_id"`
+	Replicas           []string `json:"replicas"`
+	AlreadyInitialized bool     `json:"already_initialized"`
+}
+
+// executeInitRanges bootstraps a fresh meta range map. It is deliberately
+// narrow: only a single existing range with no replicas may be changed, and a
+// map that is already initialized is a no-op only when the replica set matches
+// exactly. SetRanges replaces the whole map, so rewriting an unknown or split
+// layout could orphan ranges and data.
+func (r *Runner) executeInitRanges(ctx context.Context, b Backend, cfg Config, args []string) int {
+	fs := flag.NewFlagSet("init-ranges", flag.ContinueOnError)
+	fs.SetOutput(r.errOut())
+	replicasFlag := fs.String("replicas", "",
+		"comma-separated KV replica addresses (default: -nodes)")
+	versionFlag := fs.Uint64("version", 0,
+		"range descriptor version to publish (0 keeps the existing version)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		return r.usage("init-ranges takes no positional arguments")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("init-ranges: -format raw is not supported; use table or json")
+	}
+
+	replicas := splitList(*replicasFlag)
+	if len(replicas) == 0 {
+		replicas = append([]string(nil), cfg.Nodes...)
+	}
+	if len(replicas) == 0 {
+		return r.usage("init-ranges requires -replicas or -nodes (comma-separated KV addresses)")
+	}
+	if len(replicas) > 5 {
+		return r.usage(fmt.Sprintf("init-ranges: at most 5 replicas are supported (got %d)", len(replicas)))
+	}
+	seen := make(map[string]struct{}, len(replicas))
+	clean := make([]string, 0, len(replicas))
+	for _, addr := range replicas {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			return r.usage("init-ranges: replica addresses must not be empty")
+		}
+		if _, ok := seen[addr]; ok {
+			return r.usage(fmt.Sprintf("init-ranges: duplicate replica address %q", addr))
+		}
+		seen[addr] = struct{}{}
+		clean = append(clean, addr)
+	}
+	replicas = clean
+
+	infos, err := b.ListRanges(ctx)
+	if err != nil {
+		return r.fail("init-ranges: list ranges", err)
+	}
+	switch len(infos) {
+	case 0:
+		return r.fail("init-ranges", errors.New("meta returned no ranges"))
+	case 1:
+		// The expected fresh state.
+	default:
+		return r.fail("init-ranges", fmt.Errorf(
+			"refusing to replace a map with %d ranges: init-ranges only bootstraps a fresh cluster", len(infos)))
+	}
+	current := infos[0]
+	if current.ID == 0 {
+		return r.fail("init-ranges", errors.New("meta returned a range with id 0"))
+	}
+	if len(current.Replicas) > 0 {
+		if !sameReplicaSet(current.Replicas, replicas) {
+			return r.fail("init-ranges", fmt.Errorf(
+				"range %d already has replicas %s; refusing to replace it with %s (SetRanges replaces the whole map)",
+				current.ID, strings.Join(current.Replicas, ","), strings.Join(replicas, ",")))
+		}
+		return r.printInitRanges(cfg, current.ID, replicas, true)
+	}
+
+	version := current.Version
+	if *versionFlag != 0 {
+		version = *versionFlag
+	}
+	desired := RangeInfo{
+		ID:       current.ID,
+		Start:    current.Start,
+		End:      current.End,
+		Replicas: replicas,
+		Version:  version,
+	}
+	if err := b.SetRanges(ctx, []RangeInfo{desired}); err != nil {
+		return r.fail("init-ranges: set ranges", err)
+	}
+
+	// Verify rather than trusting a successful RPC: this is the one command
+	// that rewrites the whole range map, and a split/merge tool must never see
+	// an unverified descriptor.
+	after, err := b.ListRanges(ctx)
+	if err != nil {
+		return r.fail("init-ranges: verify ranges", err)
+	}
+	if len(after) != 1 || after[0].ID != desired.ID || !sameReplicaSet(after[0].Replicas, replicas) {
+		return r.fail("init-ranges: verify ranges", fmt.Errorf(
+			"range map did not converge to the requested single range %d with replicas %s",
+			desired.ID, strings.Join(replicas, ",")))
+	}
+	return r.printInitRanges(cfg, desired.ID, replicas, false)
+}
+
+func (r *Runner) printInitRanges(cfg Config, rangeID uint64, replicas []string, already bool) int {
+	if cfg.Format == "json" {
+		return r.writeJSON(initRangesJSON{
+			Status:             "ok",
+			RangeID:            rangeID,
+			Replicas:           replicas,
+			AlreadyInitialized: already,
+		})
+	}
+	if cfg.Quiet {
+		return 0
+	}
+	if already {
+		fmt.Fprintf(r.out(), "range %d already initialized with %d replicas: %s\n",
+			rangeID, len(replicas), strings.Join(replicas, ","))
+		return 0
+	}
+	fmt.Fprintf(r.out(), "initialized range %d with %d replicas: %s\n",
+		rangeID, len(replicas), strings.Join(replicas, ","))
 	return 0
 }
 
@@ -1009,11 +1159,29 @@ func prefixEnd(prefix []byte) []byte {
 // therefore run without -nodes.
 func metaOnlyCommand(cmd string) bool {
 	switch cmd {
-	case "ranges", "status", "split", "merge":
+	case "ranges", "status", "init-ranges", "split", "merge":
 		return true
 	default:
 		return false
 	}
+}
+
+// sameReplicaSet compares replica addresses as a set. The order presented by
+// meta is not contractual, so idempotence must not depend on it.
+func sameReplicaSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // adminCommand reports whether cmd is an administrative command that is not

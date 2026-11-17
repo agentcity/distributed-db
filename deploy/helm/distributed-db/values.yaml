@@ -8,12 +8,15 @@
 #
 # IMAGE CONTRACT
 # --------------
-# The repository's Dockerfile currently builds ONLY cmd/db. The v2 binaries
-# (kv2, sqlsrv, pgsrv, kvctl, kvbackup) are not in that image. The default image
-# below is therefore an explicit placeholder. Build an image that contains all
-# required binaries, publish it, then override image.repository/image.tag.
-# See docs/OPERATIONS.md, "Image and binary baseline".
-
+# The repository Dockerfile builds one multi-binary image that contains
+# /app/kv2, /app/sqlsrv, /app/pgsrv, /app/kvctl, /app/kvbackup, /app/edgehash
+# and the legacy /app/db. The chart starts the v2 binaries by absolute path.
+#
+# The default below is the local name produced by:
+#   make image IMAGE_REPOSITORY=distributed-db IMAGE_TAG=0.1.0
+# It is not published to a registry by this repository. For a real cluster,
+# publish the image and override image.repository/image.tag (see README).
+# Do not use an unpinned :latest tag in production.
 nameOverride: ""
 fullnameOverride: ""
 
@@ -23,9 +26,8 @@ fullnameOverride: ""
 clusterDomain: cluster.local
 
 image:
-  # PLACEHOLDER: replace with your registry/repository.
-  repository: ghcr.io/example/distributed-db
-  tag: "0.0.0-placeholder"
+  repository: distributed-db
+  tag: "0.1.0"
   pullPolicy: IfNotPresent
   # Example: [{name: my-registry-pull-secret}]
   pullSecrets: []
@@ -308,3 +310,59 @@ ingress:
     secretName: distributed-db-ingress-tls
   # Add any client-certificate/allowlist annotations your controller needs;
   # the backend is already HTTPS.
+
+# Optional one-time range-map bootstrap for a FRESH cluster.
+#
+# A fresh meta starts with range 1 and NO replicas. The data path can still use
+# the -nodes seed list, but split/merge and the placement scheduler need an
+# explicit replica list. When enabled, a post-install Helm hook waits for a
+# meta leader and runs:
+#
+#   kvctl -meta <meta service> -nodes <KV_NODES> init-ranges \
+#     -replicas <KV_NODES>
+#
+# Safety properties:
+#   * post-install hook only: it does not run on `helm upgrade`, so it cannot
+#     rewrite an existing range map;
+#   * init-ranges refuses to act unless meta has exactly one range with no
+#     replicas, and refuses to replace a different existing replica set;
+#   * re-running it with the same replica set is a no-op;
+#   * it reads the admin token from auth.adminToken.existingSecret through a
+#     secretKeyRef. There is no literal/default token, and no unauthenticated
+#     fallback is introduced. If meta.adminToken.enabled=false, the bootstrap
+#     uses the same unauthenticated admin RPCs the cluster already exposes.
+#   * the Job has a TTL, backoffLimit and active deadline; failures fail the
+#     install instead of leaving a half-bootstrapped cluster unnoticed.
+#
+# Set bootstrap.enabled=true only for the initial install of a new cluster.
+# Do NOT enable it for a cluster that already has data, split ranges or a
+# restored range map.
+bootstrap:
+  enabled: false
+  # Kubernetes Job retry policy. The script itself waits for meta and retries
+  # readiness, so this only covers transient pod/API failures.
+  backoffLimit: 6
+  # Must exceed waitTimeoutSeconds so the in-script wait produces the error
+  # message first. 0 disables the Job deadline (not recommended).
+  activeDeadlineSeconds: 600
+  # Clean up completed and failed Job pods after this many seconds; logs are
+  # still available until then via kubectl logs.
+  ttlSecondsAfterFinished: 600
+  # Wait for a meta leader before touching the range map.
+  waitTimeoutSeconds: 300
+  waitIntervalSeconds: 3
+  # Per-command kvctl timeout (Go duration string).
+  kvctlTimeout: "10s"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+  podAnnotations: {}
+  podLabels: {}

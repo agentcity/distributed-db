@@ -10,8 +10,12 @@ real cluster as part of its validation.
 1. Preconditions (the chart does not create these)
 --------------------------------------------------------------------------
 * Image: {{ include "distributed-db.image" . }}
-  The repository Dockerfile builds only cmd/db. Replace the placeholder image
-  with one that contains kv2, sqlsrv, pgsrv, kvctl and kvbackup.
+  Built from the repository Dockerfile as one multi-binary image:
+  /app/kv2, /app/sqlsrv, /app/pgsrv, /app/kvctl, /app/kvbackup,
+  /app/edgehash and the legacy /app/db. The default is a local tag, not a
+  published registry image. Publish it and override image.repository/tag:
+    make image IMAGE_REPOSITORY=<registry>/distributed-db IMAGE_TAG=<tag>
+    make image-push IMAGE_REPOSITORY=<registry>/distributed-db IMAGE_TAG=<tag>
 * TLS Secret: {{ .Values.tls.existingSecret }}
   Keys: {{ .Values.tls.caKey }}, {{ .Values.tls.certKey }}, {{ .Values.tls.keyKey }}.
   SANs must cover the meta/kv headless wildcards and the meta, sqlsrv and pgsrv
@@ -42,6 +46,37 @@ Wait for the stateful components before sending traffic:
   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "distributed-db.fullname" . }}-kv   --timeout=10m
   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "distributed-db.fullname" . }}-sqlsrv --timeout=5m
   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "distributed-db.fullname" . }}-pgsrv  --timeout=5m
+{{- if .Values.bootstrap.enabled }}
+
+Range-map bootstrap is ENABLED as a post-install hook:
+  kubectl -n {{ .Release.Namespace }} get job {{ include "distributed-db.fullname" . }}-range-bootstrap
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "distributed-db.fullname" . }}-range-bootstrap
+The Job waits for a meta leader, then runs `kvctl init-ranges` for the
+{{ .Values.kv.replicaCount }} KV replicas. It is idempotent and fails closed on a
+split or differently-placed map. It runs ONLY on install, not on upgrade. With
+--atomic/--wait a bootstrap failure fails the release. The Job and its pods are
+removed after {{ .Values.bootstrap.ttlSecondsAfterFinished }} seconds.
+{{- else }}
+
+Range-map bootstrap is DISABLED (bootstrap.enabled=false). A fresh range map has
+range 1 with NO replicas, so split/merge and scheduler placement stay
+unavailable until an operator runs (provide the token via KVCTL_ADMIN_TOKEN):
+{{- if .Values.tls.enabled }}
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "distributed-db.fullname" . }}-sqlsrv -c sqlsrv -- \
+    /app/kvctl -meta {{ include "distributed-db.metaService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.meta.port }} \
+      -tls-ca {{ .Values.tls.mountPath }}/{{ .Values.tls.caKey }} \
+      -tls-cert {{ .Values.tls.mountPath }}/{{ .Values.tls.certKey }} \
+      -tls-key {{ .Values.tls.mountPath }}/{{ .Values.tls.keyKey }} \
+      init-ranges -replicas {{ include "distributed-db.kvNodes" . }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "distributed-db.fullname" . }}-sqlsrv -c sqlsrv -- \
+    /app/kvctl -meta {{ include "distributed-db.metaService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.meta.port }} \
+      init-ranges -replicas {{ include "distributed-db.kvNodes" . }}
+{{- end }}
+Never put the token in shell history. Enable bootstrap.enabled only for the
+initial install of a new cluster, never for one with existing data or split
+ranges.
+{{- end }}
 
 --------------------------------------------------------------------------
 3. Verify
@@ -77,8 +112,10 @@ certificate verification:
 Expected: meta and KV endpoints have one ready replica per AZ (when three
 zones exist); kvctl status shows a non-empty meta leader, meta term and range
 count; SQL /v1/sql returns a result for a trivial SELECT. On a fresh install
-range 1 may still have an empty replica list/leader until the one-time SetRanges
-bootstrap described in docs/OPERATIONS.md section 3.3.1.
+range 1 has an empty replica list/leader until the optional bootstrap Job (or a
+manual `kvctl init-ranges`) runs. If bootstrap is disabled, split/merge and
+scheduler placement remain unavailable; do not treat the data path alone as a
+complete cluster.
 
 --------------------------------------------------------------------------
 4. Rollback
@@ -103,7 +140,9 @@ new cluster instead. See docs/RUNBOOKS.md, "Rolling upgrade and rollback".
   kvctl backup supports TLS; restore currently requires a TLS-capable build.
 * No PITR, no online restore, no tested rolling upgrade, no RBAC/audit/at-rest
   encryption, no joint consensus. See docs/OPERATIONS.md, "Known gaps".
-* A fresh meta range map has range 1 with NO replicas. Data can flow through
-  the -nodes seed list, but split/merge and scheduler placement need a one-time
-  SetRanges bootstrap that this chart does not automate. See
-  docs/OPERATIONS.md section 3.3.1 before using the cluster.
+* A fresh meta range map has range 1 with NO replicas. The optional
+  bootstrap.enabled Job automates the one-time `kvctl init-ranges` for a new
+  cluster (post-install only; idempotent; refuses a split map). It is off by
+  default. It sets metadata only: it does not start KV range groups, repair an
+  existing map, or prove quorum. See the chart README for the operational
+  caveat before using the cluster.

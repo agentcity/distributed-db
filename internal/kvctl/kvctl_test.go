@@ -34,6 +34,9 @@ type fakeBackend struct {
 	metaTerm uint64
 	metaErr  error
 
+	setRangesErr   error
+	setRangesCalls [][]RangeInfo
+
 	splitNewID uint64
 	splitErr   error
 	splitCalls []splitCall
@@ -116,6 +119,22 @@ func (f *fakeBackend) ListRanges(context.Context) ([]RangeInfo, error) {
 		return nil, f.listErr
 	}
 	return append([]RangeInfo(nil), f.ranges...), nil
+}
+
+func (f *fakeBackend) SetRanges(_ context.Context, ranges []RangeInfo) error {
+	if f.setRangesErr != nil {
+		return f.setRangesErr
+	}
+	copied := make([]RangeInfo, len(ranges))
+	for i, r := range ranges {
+		copied[i] = r
+		copied[i].Start = append([]byte(nil), r.Start...)
+		copied[i].End = append([]byte(nil), r.End...)
+		copied[i].Replicas = append([]string(nil), r.Replicas...)
+	}
+	f.setRangesCalls = append(f.setRangesCalls, copied)
+	f.ranges = copied
+	return nil
 }
 
 func (f *fakeBackend) SplitRange(_ context.Context, rangeID uint64, splitKey []byte) (uint64, error) {
@@ -836,17 +855,155 @@ func TestDataCommandsRequireNodes(t *testing.T) {
 func TestMetaOnlyCommandsAllowNoNodes(t *testing.T) {
 	f := newFake()
 	f.splitNewID = 9
+	f.ranges = []RangeInfo{{ID: 1, Version: 1}}
 	cases := [][]string{
 		{"ranges"},
 		{"status"},
 		{"split", "1", "m"},
 		{"merge", "1", "2"},
+		{"init-ranges", "-replicas", "n1,n2,n3"},
 	}
 	for _, args := range cases {
 		r := runCLIArgs(t, f, "", args...)
 		if r.code != 0 || r.opens != 1 || len(r.cfg.Nodes) != 0 {
 			t.Errorf("args %v = code %d opens %d cfg %#v", args, r.code, r.opens, r.cfg)
 		}
+	}
+}
+
+func TestInitRangesBootstrapsFreshMeta(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{ID: 1, Version: 1}}
+	code, out, errOut := runCLI(t, f, "",
+		"-meta", "m1", "-format", "json", "init-ranges", "-replicas", "n1,n2,n3")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
+	}
+	var got initRangesJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json: %v (%q)", err, out)
+	}
+	if got.Status != "ok" || got.RangeID != 1 || got.AlreadyInitialized ||
+		!reflect.DeepEqual(got.Replicas, []string{"n1", "n2", "n3"}) {
+		t.Fatalf("init-ranges json = %#v", got)
+	}
+	if len(f.setRangesCalls) != 1 {
+		t.Fatalf("SetRanges calls = %d, want 1", len(f.setRangesCalls))
+	}
+	sent := f.setRangesCalls[0]
+	if len(sent) != 1 || sent[0].ID != 1 || sent[0].Version != 1 ||
+		sent[0].Start != nil || sent[0].End != nil ||
+		!reflect.DeepEqual(sent[0].Replicas, []string{"n1", "n2", "n3"}) {
+		t.Fatalf("SetRanges sent = %#v", sent)
+	}
+}
+
+func TestInitRangesIsIdempotent(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{
+		ID:       1,
+		Replicas: []string{"n3", "n1", "n2"},
+		Leader:   "n1",
+		Version:  4,
+	}}
+	code, out, errOut := runCLI(t, f, "",
+		"-meta", "m1", "init-ranges", "-replicas", "n1,n2,n3")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
+	}
+	if !strings.Contains(out, "already initialized") {
+		t.Fatalf("output = %q, want already initialized", out)
+	}
+	if len(f.setRangesCalls) != 0 {
+		t.Fatalf("SetRanges calls = %d, want 0 for an initialized map", len(f.setRangesCalls))
+	}
+}
+
+func TestInitRangesRefusesExistingDifferentReplicas(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{ID: 1, Replicas: []string{"n9"}, Version: 1}}
+	code, _, errOut := runCLI(t, f, "",
+		"-meta", "m1", "init-ranges", "-replicas", "n1,n2,n3")
+	if code != 1 || !strings.Contains(errOut, "refusing to replace") {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
+	}
+	if len(f.setRangesCalls) != 0 {
+		t.Fatalf("SetRanges calls = %d, want 0", len(f.setRangesCalls))
+	}
+}
+
+func TestInitRangesRefusesSplitMap(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{
+		{ID: 1, End: []byte("m"), Replicas: []string{"n1"}},
+		{ID: 2, Start: []byte("m"), Replicas: []string{"n1"}},
+	}
+	code, _, errOut := runCLI(t, f, "",
+		"-meta", "m1", "init-ranges", "-replicas", "n1,n2,n3")
+	if code != 1 || !strings.Contains(errOut, "2 ranges") {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
+	}
+	if len(f.setRangesCalls) != 0 {
+		t.Fatalf("SetRanges calls = %d, want 0", len(f.setRangesCalls))
+	}
+}
+
+func TestInitRangesValidation(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{ID: 1, Version: 1}}
+	cases := [][]string{
+		{"init-ranges"},
+		{"init-ranges", "extra", "-replicas", "n1"},
+		{"-format", "raw", "init-ranges", "-replicas", "n1"},
+		{"init-ranges", "-replicas", "n1,n1"},
+		{"init-ranges", "-replicas", "n1,n2,n3,n4,n5,n6"},
+		{"init-ranges", "-replicas", "n1", "-version", "not-a-number"},
+	}
+	for _, args := range cases {
+		code, _, _ := runCLI(t, f, "", append([]string{"-meta", "m1"}, args...)...)
+		if code != 2 {
+			t.Errorf("args %v = code %d, want 2", args, code)
+		}
+	}
+	if len(f.setRangesCalls) != 0 {
+		t.Fatalf("validation wrote ranges: %#v", f.setRangesCalls)
+	}
+}
+
+func TestInitRangesUsesNodesFallback(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{ID: 1, Version: 1}}
+	code, _, errOut := runCLI(t, f, "",
+		"-meta", "m1", "-nodes", "n1,n2,n3", "init-ranges")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
+	}
+	if len(f.setRangesCalls) != 1 ||
+		!reflect.DeepEqual(f.setRangesCalls[0][0].Replicas, []string{"n1", "n2", "n3"}) {
+		t.Fatalf("SetRanges calls = %#v", f.setRangesCalls)
+	}
+}
+
+func TestInitRangesRefusesEmptyMeta(t *testing.T) {
+	f := newFake()
+	code, _, errOut := runCLI(t, f, "",
+		"-meta", "m1", "init-ranges", "-replicas", "n1,n2,n3")
+	if code != 1 || !strings.Contains(errOut, "no ranges") {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
+	}
+	if len(f.setRangesCalls) != 0 {
+		t.Fatalf("SetRanges calls = %d, want 0", len(f.setRangesCalls))
+	}
+}
+
+func TestInitRangesSetRangesError(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{ID: 1, Version: 1}}
+	f.setRangesErr = errors.New("meta: unauthenticated")
+	code, _, errOut := runCLI(t, f, "",
+		"-meta", "m1", "init-ranges", "-replicas", "n1,n2,n3")
+	if code != 1 || !strings.Contains(errOut, "set ranges") {
+		t.Fatalf("init-ranges = code %d err %q", code, errOut)
 	}
 }
 

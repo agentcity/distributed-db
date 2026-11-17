@@ -3,6 +3,15 @@
 .idea
 data
 bin
+# Local sandbox/build caches are not part of the source tree. They can be
+# several GB and would otherwise be sent as build context.
+.gocache
+.gomodcache
+.gotmp
+.tmp-go
+.tmp-bin
+.tmp-verify
+.docker-buildx
 *.md
 **/*.md
 .DS_Store

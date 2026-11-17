@@ -4,7 +4,26 @@ BINARY := bin/db
 CHAOS_ROUNDS ?= 3
 CHAOS_TIMEOUT ?= 1200
 
-.PHONY: all build build-cli test test-short vet fmt proto compose-up compose-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean
+# --- image release -----------------------------------------------------------
+# The tag is derived from the checkout (git describe), not from the clock, so
+# the same commit yields the same tag. Every value can be overridden:
+#   make image IMAGE_REPOSITORY=ghcr.io/acme/distributed-db IMAGE_TAG=v2.0.0
+IMAGE_REPOSITORY ?= distributed-db
+GIT_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+IMAGE_TAG ?= $(GIT_VERSION)
+VERSION ?= $(IMAGE_TAG)
+REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+DOCKER ?= docker
+PLATFORM ?=
+IMAGE ?= $(IMAGE_REPOSITORY):$(IMAGE_TAG)
+
+# --- Helm validation ---------------------------------------------------------
+HELM ?= helm
+CHART_DIR ?= deploy/helm/distributed-db
+RELEASE ?= distributed-db
+NAMESPACE ?= distributed-db
+
+.PHONY: all build build-cli test test-short vet fmt proto compose-up compose-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean image image-push helm-lint helm-template release-check
 
 all: build
 
@@ -50,6 +69,47 @@ chaos-nightly:
 	GO="$(GO)" GOFLAGS="$(GOFLAGS)" \
 		CHAOS_ROUNDS="$(CHAOS_ROUNDS)" CHAOS_TIMEOUT="$(CHAOS_TIMEOUT)" \
 		./scripts/nightly-chaos.sh
+
+# --- container image ---------------------------------------------------------
+# Build the multi-binary image. Build args VERSION/REVISION and the tag all
+# come from the checkout (or from the overrides above).
+image:
+	IMAGE_REPOSITORY="$(IMAGE_REPOSITORY)" \
+	IMAGE_TAG="$(IMAGE_TAG)" \
+	VERSION="$(VERSION)" \
+	REVISION="$(REVISION)" \
+	DOCKER="$(DOCKER)" \
+	PLATFORM="$(PLATFORM)" \
+	./scripts/build-image.sh
+
+# Optional publishing step. Requires an authenticated `docker login`; the
+# target builds and pushes in one script invocation and never stores
+# credentials.
+image-push:
+	IMAGE_REPOSITORY="$(IMAGE_REPOSITORY)" \
+	IMAGE_TAG="$(IMAGE_TAG)" \
+	VERSION="$(VERSION)" \
+	REVISION="$(REVISION)" \
+	DOCKER="$(DOCKER)" \
+	PLATFORM="$(PLATFORM)" \
+	PUSH=1 \
+	./scripts/build-image.sh
+
+# --- Helm validation ---------------------------------------------------------
+# Render the default values and parse every document as YAML. Fails before the
+# lint if a template renders invalid YAML.
+helm-template:
+	@command -v "$(HELM)" >/dev/null || { echo "helm not found: install Helm 3.14+ or set HELM=" >&2; exit 1; }
+	"$(HELM)" template "$(RELEASE)" "$(CHART_DIR)" --namespace "$(NAMESPACE)" >/tmp/$(RELEASE)-rendered.yaml
+	@echo "rendered /tmp/$(RELEASE)-rendered.yaml"
+
+helm-lint: helm-template
+	"$(HELM)" lint --strict "$(CHART_DIR)"
+
+# Local release gate: shell syntax, rendered YAML, helm lint/template, and an
+# optional image build (WITH_IMAGE=1). See scripts/validate-release.sh.
+release-check:
+	./scripts/validate-release.sh
 
 # --- local 3-node cluster + coordinator (separate terminals) -----------------
 run-coordinator:

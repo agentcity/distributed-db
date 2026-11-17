@@ -1,0 +1,207 @@
+{{/*
+Bootstrap values are validated only when the feature is enabled. The chart's
+general invariant check (distributed-db.validate) still runs from configmap.yaml
+on every render, so kv.replicaCount 3-5, TLS and admin-token references are
+already enforced even with bootstrap disabled.
+*/}}
+{{- define "distributed-db.validateBootstrap" -}}
+{{- $b := .Values.bootstrap -}}
+{{- $kvctlTimeout := toString $b.kvctlTimeout -}}
+{{- if lt (int $b.backoffLimit) 0 -}}
+{{- fail (printf "bootstrap.backoffLimit must be >= 0 (got %d)" (int $b.backoffLimit)) -}}
+{{- end -}}
+{{- if le (int $b.waitTimeoutSeconds) 0 -}}
+{{- fail (printf "bootstrap.waitTimeoutSeconds must be > 0 (got %d)" (int $b.waitTimeoutSeconds)) -}}
+{{- end -}}
+{{- if le (int $b.waitIntervalSeconds) 0 -}}
+{{- fail (printf "bootstrap.waitIntervalSeconds must be > 0 (got %d)" (int $b.waitIntervalSeconds)) -}}
+{{- end -}}
+{{- if lt (int $b.ttlSecondsAfterFinished) 0 -}}
+{{- fail (printf "bootstrap.ttlSecondsAfterFinished must be >= 0 (got %d)" (int $b.ttlSecondsAfterFinished)) -}}
+{{- end -}}
+{{- if lt (int $b.activeDeadlineSeconds) 0 -}}
+{{- fail (printf "bootstrap.activeDeadlineSeconds must be >= 0 (got %d)" (int $b.activeDeadlineSeconds)) -}}
+{{- end -}}
+{{- if and (gt (int $b.activeDeadlineSeconds) 0) (le (int $b.activeDeadlineSeconds) (int $b.waitTimeoutSeconds)) -}}
+{{- fail (printf "bootstrap.activeDeadlineSeconds (%d) must exceed bootstrap.waitTimeoutSeconds (%d), or be 0 to disable the deadline" (int $b.activeDeadlineSeconds) (int $b.waitTimeoutSeconds)) -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*(s|m|h)$" $kvctlTimeout) -}}
+{{- fail (printf "bootstrap.kvctlTimeout must be a positive Go duration such as 10s, 2m or 1h (got %q)" $kvctlTimeout) -}}
+{{- end -}}
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecret) -}}
+{{- fail "tls.existingSecret is required when bootstrap.enabled=true and tls.enabled=true" -}}
+{{- end -}}
+{{- if and .Values.meta.adminToken.enabled (not .Values.auth.adminToken.existingSecret) -}}
+{{- fail "auth.adminToken.existingSecret is required when bootstrap.enabled=true and meta.adminToken.enabled=true" -}}
+{{- end -}}
+{{- if and .Values.meta.adminToken.enabled (not (regexMatch "^[-._a-zA-Z0-9]+$" (default "placeholder" .Values.auth.adminToken.key))) -}}
+{{- fail "auth.adminToken.key must be a valid Secret key name" -}}
+{{- end -}}
+{{- end -}}
+
+{{- if .Values.bootstrap.enabled -}}
+{{- include "distributed-db.validateBootstrap" . -}}
+{{- $base := include "distributed-db.fullname" . -}}
+{{- $metaAddr := printf "%s.%s.svc.%s:%d" (include "distributed-db.metaService" .) .Release.Namespace .Values.clusterDomain (int .Values.meta.port) -}}
+{{- $kvNodes := include "distributed-db.kvNodes" . -}}
+# The bootstrap script is a normal release resource (not a hook) so Helm
+# creates it before the post-install Job and removes it on uninstall.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $base }}-range-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: range-bootstrap
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  range-bootstrap.sh: |-
+{{ .Files.Get "files/range-bootstrap.sh" | indent 4 }}
+---
+# One-time, fail-closed range-map bootstrap for a fresh cluster.
+#
+# This is a post-install hook, so `helm upgrade` does not run it. It waits for
+# a meta leader, then calls `kvctl init-ranges`, which only rewrites a single
+# empty-replica range and refuses split or differently-placed maps.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $base }}-range-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: range-bootstrap
+  annotations:
+    helm.sh/hook: post-install
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  backoffLimit: {{ int .Values.bootstrap.backoffLimit }}
+  {{- if gt (int .Values.bootstrap.activeDeadlineSeconds) 0 }}
+  activeDeadlineSeconds: {{ int .Values.bootstrap.activeDeadlineSeconds }}
+  {{- end }}
+  ttlSecondsAfterFinished: {{ int .Values.bootstrap.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "distributed-db.labels" . | nindent 8 }}
+        app.kubernetes.io/component: range-bootstrap
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.bootstrap.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/bootstrap-script: {{ .Files.Get "files/range-bootstrap.sh" | sha256sum }}
+        {{- with .Values.bootstrap.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "distributed-db.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bootstrap.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.bootstrap.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bootstrap.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bootstrap.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: range-bootstrap
+          image: {{ include "distributed-db.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /scripts/range-bootstrap.sh
+          env:
+            - name: HOME
+              value: /tmp
+            - name: KVCTL
+              value: /app/kvctl
+            - name: META_ADDR
+              value: {{ $metaAddr | quote }}
+            - name: KV_REPLICAS
+              value: {{ $kvNodes | quote }}
+            - name: META_REPLICAS
+              value: {{ int .Values.meta.replicaCount | quote }}
+            - name: WAIT_TIMEOUT
+              value: {{ int .Values.bootstrap.waitTimeoutSeconds | quote }}
+            - name: WAIT_INTERVAL
+              value: {{ int .Values.bootstrap.waitIntervalSeconds | quote }}
+            - name: KVCTL_TIMEOUT
+              value: {{ .Values.bootstrap.kvctlTimeout | quote }}
+            - name: TLS_ENABLED
+              value: {{ .Values.tls.enabled | quote }}
+            {{- if .Values.tls.enabled }}
+            - name: TLS_DIR
+              value: {{ .Values.tls.mountPath | quote }}
+            - name: TLS_CERT_FILE
+              value: {{ .Values.tls.certKey | quote }}
+            - name: TLS_KEY_FILE
+              value: {{ .Values.tls.keyKey | quote }}
+            - name: TLS_CA_FILE
+              value: {{ .Values.tls.caKey | quote }}
+            {{- end }}
+            - name: META_ADMIN_TOKEN_ENABLED
+              value: {{ .Values.meta.adminToken.enabled | quote }}
+            {{- if .Values.meta.adminToken.enabled }}
+            - name: META_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "distributed-db.adminTokenSecret" . }}
+                  key: {{ .Values.auth.adminToken.key }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: bootstrap-script
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: bootstrap-script
+          configMap:
+            name: {{ $base }}-range-bootstrap
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "distributed-db.tlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
+{{- end }}

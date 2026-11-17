@@ -147,6 +147,21 @@ func (b *v2Backend) ListRanges(ctx context.Context) ([]RangeInfo, error) {
 	return out, nil
 }
 
+func (b *v2Backend) SetRanges(ctx context.Context, ranges []RangeInfo) error {
+	out := make([]v2client.RangeInfo, 0, len(ranges))
+	for _, r := range ranges {
+		out = append(out, v2client.RangeInfo{
+			ID:       r.ID,
+			Start:    r.Start,
+			End:      r.End,
+			Replicas: append([]string(nil), r.Replicas...),
+			Leader:   r.Leader,
+			Version:  r.Version,
+		})
+	}
+	return b.client.SetRanges(ctx, out)
+}
+
 func (b *v2Backend) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte) (uint64, error) {
 	return b.client.SplitRange(ctx, rangeID, splitKey)
 }
