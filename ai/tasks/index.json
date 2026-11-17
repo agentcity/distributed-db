@@ -286,5 +286,11 @@
     "title": "Production hardening — 8 срезов",
     "status": "done",
     "file": "0048-production-hardening.md"
+  },
+  {
+    "id": "0049",
+    "title": "Safety/recovery wave",
+    "status": "in_progress",
+    "file": "0049-safety-recovery.md"
   }
 ]
