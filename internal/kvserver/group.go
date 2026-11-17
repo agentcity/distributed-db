@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"distributed-db/internal/mvcc"
 	"distributed-db/internal/raft"
@@ -29,12 +30,18 @@ type rangeGroup struct {
 	// engine. It is never the real engine, so closing it is a no-op.
 	engine     storage.Engine
 	ownsEngine bool
-	store      *mvcc.Store
-	logStore   *raft.FileStore
-	node       *raft.Node
-	transport  *peerTransport
-	sm         *stateMachine
-	batcher    *commitBatcher
+	// shared is the unprefixed engine owned by the Server. Split/merge
+	// recovery and cleanup use it to reach sibling range prefixes.
+	shared storage.Engine
+	// dataDir is the Server data directory, used to discard the Raft log of a
+	// child range that was never published (or of a merged-away range).
+	dataDir   string
+	store     *mvcc.Store
+	logStore  *raft.FileStore
+	node      *raft.Node
+	transport *peerTransport
+	sm        *stateMachine
+	batcher   *commitBatcher
 
 	// adminMu serialises split/merge administration for this range. It is
 	// held for the whole operation (prepare, copy, clear) so a retry cannot
@@ -55,6 +62,9 @@ type rangeGroup struct {
 
 	stopOnce sync.Once
 	stopErr  error
+	// stopCh is closed when the group stops. Background maintenance (the
+	// post-restart admin recovery proposal) selects on it to exit.
+	stopCh chan struct{}
 }
 
 // rangePrefix returns the fixed 10-byte keyspace prefix of a range in the
@@ -107,7 +117,7 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig, peerCreds 
 	if rc.Epoch > 0 {
 		gen = rc.Epoch - 1
 	}
-	sm := &stateMachine{store: store, engine: engine, freezeGen: gen}
+	sm := &stateMachine{store: store, rangeID: rc.ID, log: log, engine: engine, freezeGen: gen}
 	tr := newPeerTransport(cfg.Logger, rc.ID, cfg.PeerAddrs, peerCreds)
 	node, err := raft.New(raft.Config{
 		ID:                 cfg.ID,
@@ -131,13 +141,30 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig, peerCreds 
 		log:        log,
 		engine:     engine,
 		ownsEngine: false,
+		shared:     shared,
+		dataDir:    cfg.DataDir,
 		store:      store,
 		logStore:   logStore,
 		node:       node,
 		transport:  tr,
 		sm:         sm,
+		stopCh:     make(chan struct{}),
 	}
 	g.batcher = newCommitBatcher(g)
+	// Restore the durable split/merge state before Raft can replay anything.
+	// This decides whether a prepare left in the log is stale (already
+	// resolved) and aborts or finishes an interrupted local operation without
+	// freezing the range forever.
+	if err := sm.loadAdminState(); err != nil {
+		_ = logStore.Close()
+		tr.Close()
+		return nil, fmt.Errorf("kvserver: range %d: %w", rc.ID, err)
+	}
+	if err := recoverAdminState(g); err != nil {
+		_ = logStore.Close()
+		tr.Close()
+		return nil, fmt.Errorf("kvserver: range %d: recover admin state: %w", rc.ID, err)
+	}
 	return g, nil
 }
 
@@ -145,7 +172,58 @@ func (g *rangeGroup) start(ctx context.Context) error {
 	if err := g.node.Start(ctx); err != nil {
 		return fmt.Errorf("kvserver: range %d: start raft: %w", g.cfg.ID, err)
 	}
+	// A restarted replica may still owe the group a replicated clear/finish for
+	// an operation that was resolved locally before the crash. Queue it after
+	// replay so the prepare left in the log cannot keep the range frozen.
+	g.startAdminRecovery()
 	return nil
+}
+
+// startAdminRecovery appends the pending replicated admin transition once this
+// replica is leader. Every replica runs this, so whichever node wins the
+// election resolves the aborted completion; the entry is idempotent if several
+// replicas propose it.
+func (g *rangeGroup) startAdminRecovery() {
+	if _, ok := g.sm.recoveryEntry(); !ok {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-g.stopCh:
+				return
+			case <-ticker.C:
+			}
+			if !g.node.IsLeader() {
+				continue
+			}
+			// Serialise with admin RPCs: a new local operation clears the
+			// pending recovery, and we re-check under the lock before
+			// proposing so a stale clear cannot cancel a live barrier.
+			g.adminMu.Lock()
+			recovery, ok := g.sm.recoveryEntry()
+			if !ok || !g.node.IsLeader() {
+				g.adminMu.Unlock()
+				return
+			}
+			entry, err := adminEntry(recovery.typ, recovery.op)
+			if err != nil {
+				g.adminMu.Unlock()
+				return
+			}
+			pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err = g.node.Propose(pctx, entry)
+			cancel()
+			g.adminMu.Unlock()
+			if err == nil {
+				return
+			}
+			// Not leader (leadership moved), stopped, or a transient error:
+			// keep trying while the group runs.
+		}
+	}()
 }
 
 // stop halts Raft and closes the Raft log and peer transport. It only closes
@@ -154,6 +232,9 @@ func (g *rangeGroup) start(ctx context.Context) error {
 // Close. It is idempotent and safe to call on a partially constructed group.
 func (g *rangeGroup) stop() error {
 	g.stopOnce.Do(func() {
+		if g.stopCh != nil {
+			close(g.stopCh)
+		}
 		// Stop the batcher first so no new 1PC entry is proposed while Raft is
 		// shutting down; in-flight waiters are completed with an error.
 		if g.batcher != nil {

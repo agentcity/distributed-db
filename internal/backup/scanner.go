@@ -16,15 +16,24 @@ import (
 // omitting the key would lose an acknowledged write.
 var ErrSnapshotLocked = errors.New("backup: snapshot is blocked by an unresolved lock at or below the snapshot TSO")
 
+// ErrRemoteLockAwareScanUnavailable means a RemoteScanner reached a KV node
+// that does not implement KVService.ScanForBackup and best-effort fallback was
+// not explicitly enabled. It is a hard error: a backup configured to require a
+// lock-aware scan must fail closed rather than silently downgrade to the plain
+// Scan path.
+var ErrRemoteLockAwareScanUnavailable = errors.New("backup: remote server-side lock-aware scan is unavailable")
+
 // SnapshotScanner is the narrow lock-aware scan API used by Backup. A
 // ScanForBackup implementation must return the visible key/value set at ts and
 // fail with an error matching mvcc.ErrLocked (or containing
 // *mvcc.SnapshotLockError) if a lock at or below ts is present.
 //
-// StoreScanner is the in-process implementation. A remote cluster needs a
-// server-side lock-scan RPC to implement this interface; the default
-// v2client-backed path in Backup has a narrower, explicitly documented guard
-// (see BackupConfig.Scanner and the package documentation).
+// StoreScanner is the in-process implementation and RemoteScanner is the
+// RPC-backed one. RemoteScanner needs a node that has wired
+// kvserver.RegisterKVServiceWithBackupScan; until then an old registration
+// answers Unimplemented and RemoteScanner fails closed by default. The default
+// path in Backup without a Scanner has a narrower, explicitly documented guard
+// (see BackupConfig.Scanner).
 type SnapshotScanner interface {
 	ScanForBackup(ctx context.Context, start, end []byte, ts uint64, limit int) ([]v2client.KV, error)
 }
@@ -54,6 +63,66 @@ func (s StoreScanner) ScanForBackup(ctx context.Context, start, end []byte, ts u
 		out[i] = v2client.KV{Key: kv.Key, Value: kv.Value}
 	}
 	return out, nil
+}
+
+// RemoteScanner adapts a remote v2 cluster to SnapshotScanner through the
+// KVService.ScanForBackup RPC. It is the remote counterpart of StoreScanner and
+// is the only adapter that can see locks on keys that have never been
+// committed, because the server reads the lock column itself.
+//
+// The zero value is strict: if an older node answers Unimplemented, ScanForBackup
+// returns ErrRemoteLockAwareScanUnavailable and Backup aborts. Set
+// AllowBestEffortFallback only for an explicitly best-effort backup: the
+// adapter then falls back to the historical Scan RPC at the same snapshot TSO
+// and probes the returned keys with CheckTxnStatus. That fallback still sees a
+// lock on a previously committed key, but it cannot see a lock-only key that
+// has no committed value yet, so it is not equivalent to the RPC. Do not set
+// AllowBestEffortFallback together with BackupConfig.RequireLockAwareScan.
+//
+// RangeID is intentionally not part of this adapter. Backup calls the scanner
+// once per range and passes that range's exact start/end bounds, so the client
+// sends range_id=0 and the server resolves the owning range from start. That
+// keeps split/merge epoch checks authoritative instead of pinning a stale
+// descriptor.
+type RemoteScanner struct {
+	Client *v2client.Client
+	// AllowBestEffortFallback permits the non-lock-aware Scan fallback when
+	// the server does not implement ScanForBackup. It defaults to false and
+	// must be an explicit operator choice.
+	AllowBestEffortFallback bool
+}
+
+// ScanForBackup implements SnapshotScanner.
+func (s RemoteScanner) ScanForBackup(ctx context.Context, start, end []byte, ts uint64, limit int) ([]v2client.KV, error) {
+	if s.Client == nil {
+		return nil, errors.New("backup: RemoteScanner has a nil Client")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.Client.ScanForBackup(ctx, 0, start, end, ts, limit)
+	if err == nil {
+		return rows, nil
+	}
+	if !errors.Is(err, v2client.ErrBackupScanUnavailable) {
+		return nil, err
+	}
+	if !s.AllowBestEffortFallback {
+		return nil, fmt.Errorf("%w: %w", ErrRemoteLockAwareScanUnavailable, err)
+	}
+
+	// Explicit best-effort path. This is the same plain Scan + per-key lock
+	// probe that Backup uses when no SnapshotScanner is configured, but it
+	// runs at the caller's stable backup TSO instead of allocating a new one.
+	rows, scanErr := s.Client.ScanBestEffort(ctx, start, end, ts, limit)
+	if scanErr != nil {
+		return nil, fmt.Errorf("backup: remote best-effort scan: %w", scanErr)
+	}
+	if err := probeLocks(ctx, s.Client, rows, ts); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // SnapshotLockedError carries the first blocking lock observed by a backup
@@ -114,9 +183,9 @@ func lockedError(err error, snapshotTS uint64) error {
 // scan for a lock at or below snapshotTS. It is a guard for the keys that were
 // actually observed: CheckTxnStatus exposes locks per key, not a lock-column
 // scan. A key that has never been committed and is currently locked is not
-// returned by Txn.Scan, so this fallback cannot see it; callers that need the
-// full guarantee must supply a SnapshotScanner (the server-side lock-scan RPC
-// is the remaining wiring, see the package documentation).
+// returned by the plain Scan, so this fallback cannot see it. Use
+// RemoteScanner (with AllowBestEffortFallback false) for the full guarantee;
+// this probe only protects RemoteScanner's explicit best-effort fallback.
 func probeLocks(ctx context.Context, client *v2client.Client, rows []v2client.KV, snapshotTS uint64) error {
 	for _, kv := range rows {
 		if err := ctx.Err(); err != nil {

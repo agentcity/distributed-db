@@ -44,6 +44,10 @@ type singlePlan struct {
 // committed version newer than startTS yields ErrWriteConflict, and a rolled
 // back transaction is rejected. All validation and staging happen before the
 // single batch Commit, so on any error the batch is closed and no state changes.
+//
+// The commit is registered in the apply barrier before validation and released
+// only once the batch is visible, so WaitApplied at or above commitTS waits for
+// this call even though 1PC writes no lock.
 func (s *Store) CommitSingle(mutations []Mutation, primary []byte, startTS, commitTS uint64) error {
 	return s.CommitSingles([]SingleCommand{{
 		Mutations: mutations,
@@ -58,11 +62,40 @@ func (s *Store) CommitSingle(mutations []Mutation, primary []byte, startTS, comm
 // input order and do not prevent other commands in the batch from committing.
 // If the shared batch cannot be staged or committed, every command that needed
 // a write receives that error.
+//
+// Every command with a plausible commitTS is registered in the apply barrier
+// before validation starts and unregistered only after the shared batch commit
+// returns (or after it is known that the command will not apply). A concurrent
+// WaitApplied at or above a command's commitTS therefore cannot observe the
+// store between validation and the engine batch becoming visible.
 func (s *Store) CommitSingles(commands []SingleCommand) []error {
 	errs := make([]error, len(commands))
 	if len(commands) == 0 {
 		return errs
 	}
+
+	// Register the commit timestamps before doing any work. Commands that fail
+	// validation or staging are aborted, so a rejected commit cannot leave a
+	// stale barrier entry behind.
+	leases := make([]*CommitLease, len(commands))
+	for i := range commands {
+		if commands[i].CommitTS > commands[i].StartTS {
+			leases[i] = s.AcquireCommitLease(commands[i].CommitTS)
+		}
+	}
+	applied := make([]bool, len(commands))
+	defer func() {
+		for i, lease := range leases {
+			if lease == nil {
+				continue
+			}
+			if applied[i] {
+				lease.Release()
+			} else {
+				lease.Abort()
+			}
+		}
+	}()
 
 	plans := make([][]singlePlan, len(commands))
 	needWrite := false
@@ -95,6 +128,16 @@ func (s *Store) CommitSingles(commands []SingleCommand) []error {
 			needWrite = true
 		}
 	}
+
+	// A command without a plan and without an error is already committed: its
+	// write record exists, so it is visible even though this call writes
+	// nothing. Such a command counts as applied regardless of what happens to
+	// the rest of the batch.
+	for i := range commands {
+		if errs[i] == nil && len(plans[i]) == 0 {
+			applied[i] = true
+		}
+	}
 	if !needWrite {
 		return errs
 	}
@@ -119,6 +162,13 @@ func (s *Store) CommitSingles(commands []SingleCommand) []error {
 	}
 	if err := batch.Commit(); err != nil {
 		return failAll(fmt.Errorf("mvcc: commit singles: %w", err))
+	}
+	// The batch is now visible. Commands whose plans were written count as
+	// applied even if Close below reports an error.
+	for i := range commands {
+		if errs[i] == nil && len(plans[i]) > 0 {
+			applied[i] = true
+		}
 	}
 	if err := batch.Close(); err != nil {
 		return failAll(fmt.Errorf("mvcc: close commit singles batch: %w", err))

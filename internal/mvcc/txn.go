@@ -131,6 +131,10 @@ func (s *Store) Prewrite(mutations []Mutation, primary []byte, startTS uint64) e
 // the same commitTS is a no-op returning nil; committing it at a different
 // commitTS returns ErrAlreadyCommitted. A lock owned by another transaction
 // yields ErrLocked.
+//
+// The commit is registered in the apply barrier for its whole apply window, so
+// WaitApplied at or above commitTS waits until the engine batch is visible. On
+// any error the lease is aborted, so a failed commit leaves no barrier entry.
 func (s *Store) Commit(keys [][]byte, startTS, commitTS uint64) error {
 	keys, err := normalizeKeys(keys)
 	if err != nil {
@@ -139,6 +143,16 @@ func (s *Store) Commit(keys [][]byte, startTS, commitTS uint64) error {
 	if commitTS <= startTS {
 		return fmt.Errorf("mvcc: commitTS %d must be greater than startTS %d", commitTS, startTS)
 	}
+
+	lease := s.AcquireCommitLease(commitTS)
+	applied := false
+	defer func() {
+		if applied {
+			lease.Release()
+		} else {
+			lease.Abort()
+		}
+	}()
 
 	type commitPlan struct {
 		key     []byte
@@ -196,6 +210,9 @@ func (s *Store) Commit(keys [][]byte, startTS, commitTS uint64) error {
 	}
 
 	if !anyLock {
+		// Already committed (or nothing to write): the committed versions are
+		// visible at commitTS.
+		applied = true
 		return nil
 	}
 
@@ -238,6 +255,9 @@ func (s *Store) Commit(keys [][]byte, startTS, commitTS uint64) error {
 		_ = batch.Close()
 		return fmt.Errorf("mvcc: commit: %w", err)
 	}
+	// The batch is visible now; mark the lease applied before Close, whose
+	// error must not make the barrier forget an already visible commit.
+	applied = true
 	return batch.Close()
 }
 

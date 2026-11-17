@@ -92,6 +92,27 @@ type Config struct {
 	// the disk-full/free-space gauges. It is optional; logs are always written.
 	LifecycleMetrics *metrics.Registry
 
+	// AdminToken protects the destructive/admin KVService RPCs with an
+	// "authorization: Bearer <token>" check. An empty value disables the check
+	// and is intended for development only; production clusters must set it.
+	//
+	// Protected RPCs: SplitRange, MergeRanges, AddReplica, AddLearner,
+	// PromoteReplica, RemoveVoter, RemoveReplica, TransferLeader and
+	// UpdateRangeEpoch. Data-plane RPCs (Get, Scan, Prewrite, Commit,
+	// CommitSingle, Rollback, CheckTxnStatus, ResolveLock), read-only RPCs
+	// (Status, RangeStats, Membership) and every RaftService RPC never require
+	// it. Rejections use gRPC Unauthenticated.
+	//
+	// The token is independent of TLS: it is checked by a unary interceptor on
+	// both plaintext and TLS/mTLS listeners, while TLS still protects the token
+	// in transit. A single token grants all admin operations; per-operator
+	// identity, RBAC scopes and an audit trail are not implemented.
+	//
+	// Outbound fan-out from metaserver to these KV admin RPCs is not wired yet
+	// (metaserver is out of scope); see admin_auth.go and the exported
+	// WithAdminToken/AdminTokenDialOption helpers.
+	AdminToken string
+
 	// Storage lifecycle. A completely zero lifecycle block selects
 	// production-safe defaults so a node that does not configure maintenance
 	// still compacts its Raft logs and collects old MVCC versions:
@@ -361,6 +382,11 @@ func New(cfg Config) (*Server, error) {
 	if s.cfg.Metrics != nil {
 		opts = append(opts, grpc.ChainUnaryInterceptor(s.metricsInterceptor))
 	}
+	// Admin auth runs before the disk guard so an unauthenticated destructive
+	// call is rejected as Unauthenticated (not with a storage status) and
+	// before the handler so protected RPCs never mutate state on a bad token.
+	// An empty AdminToken makes the interceptor a pass-through.
+	opts = append(opts, grpc.ChainUnaryInterceptor(adminAuthUnaryInterceptor(s.cfg.AdminToken)))
 	// Reject mutating KV RPCs with a clear ResourceExhausted status while
 	// storage is full. Reads keep working. The interceptor is cheap: one
 	// atomic load per unary RPC.
@@ -368,7 +394,7 @@ func New(cfg Config) (*Server, error) {
 		opts = append(opts, grpc.ChainUnaryInterceptor(s.diskGuardUnaryInterceptor))
 	}
 	s.grpcSrv = grpc.NewServer(opts...)
-	pbv2.RegisterKVServiceServer(s.grpcSrv, &kvService{s: s})
+	RegisterKVServiceWithBackupScan(s.grpcSrv, s)
 	pbv2.RegisterRaftServiceServer(s.grpcSrv, &raftService{s: s})
 	return s, nil
 }
@@ -439,6 +465,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.log.Info("kvserver started",
 		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID,
 		"sync_writes", s.syncWrites, "tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
+		"admin_auth", s.cfg.AdminToken != "",
 		"snapshot_interval", snapshotInterval, "gc_interval", gcInterval)
 	return nil
 }

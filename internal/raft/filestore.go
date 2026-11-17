@@ -44,12 +44,17 @@ type walRecord struct {
 	VotedFor  string        `json:"voted_for,omitempty"`
 	Entries   []model.Entry `json:"entries,omitempty"`
 	FromIndex uint64        `json:"from_index,omitempty"`
-	// Membership records. Voters includes the local node; Learners are
-	// non-voting members. ConfigEpoch is the membership version; 0 marks a
-	// record written by an older version (normalized to epoch 1 on load).
-	Voters      []string `json:"voters,omitempty"`
-	Learners    []string `json:"learners,omitempty"`
-	ConfigEpoch uint64   `json:"config_epoch,omitempty"`
+	// Membership records. Voters is C_new and includes the local node;
+	// VotersOld is C_old and is non-empty exactly while the persisted
+	// configuration is joint. Learners are non-voting members. ConfigEpoch is
+	// the membership version; 0 marks a record written by an older version
+	// (normalized to epoch 1 on load). AutoFinalize records that a
+	// single-change API still needs to append C_new after a restart.
+	VotersOld    []string `json:"voters_old,omitempty"`
+	Voters       []string `json:"voters,omitempty"`
+	Learners     []string `json:"learners,omitempty"`
+	AutoFinalize bool     `json:"auto_finalize,omitempty"`
+	ConfigEpoch  uint64   `json:"config_epoch,omitempty"`
 }
 
 // snapshotMeta is the durable description of the current snapshot. The data
@@ -83,11 +88,14 @@ type FileStore struct {
 	term     uint64
 	votedFor string
 	entries  []model.Entry
-	// voters and learners are the last persisted Raft membership. A nil
-	// voters slice means no membership record has ever been written.
-	// configEpoch is the persisted membership version (0 for a legacy record).
+	// votersOld, voters and learners are the last persisted Raft membership.
+	// A nil voters slice means no membership record has ever been written.
+	// votersOld is non-empty exactly while joint. configEpoch is the persisted
+	// membership version (0 for a legacy record).
+	votersOld   []string
 	voters      []string
 	learners    []string
+	autoFinal   bool
 	configEpoch uint64
 	// prefix is the highest index removed by TruncatePrefix. Entries are
 	// contiguous from prefix+1 (or empty).
@@ -106,6 +114,7 @@ var (
 	_ SnapshotMembershipStreamStore = (*FileStore)(nil)
 	_ MembershipStore               = (*FileStore)(nil)
 	_ MembershipEpochStore          = (*FileStore)(nil)
+	_ JointMembershipStore          = (*FileStore)(nil)
 )
 
 // NewFileStore opens (creating if needed) the WAL in dir and replays it. A
@@ -252,12 +261,15 @@ func (s *FileStore) applyRecord(rec walRecord) error {
 		// A legacy WAL has no membership record and keeps working: the node
 		// then initializes from its static configuration. A record without a
 		// config epoch was written by an older version; epoch 0 is normalized
-		// to the initial epoch (1) by the node.
+		// to the initial epoch (1) by the node. A record with voters_old
+		// captures an intermediate joint configuration.
 		if len(rec.Voters) == 0 {
 			return errors.New("raft: WAL membership record has no voters")
 		}
+		s.votersOld = append([]string(nil), rec.VotersOld...)
 		s.voters = append([]string(nil), rec.Voters...)
 		s.learners = append([]string(nil), rec.Learners...)
+		s.autoFinal = rec.AutoFinalize
 		s.configEpoch = rec.ConfigEpoch
 	default:
 		return fmt.Errorf("raft: unknown WAL record type %q", rec.Type)
@@ -344,8 +356,16 @@ func (s *FileStore) SaveMembership(voters, learners []string) error {
 
 // SaveMembershipEpoch durably records the voter/learner sets together with the
 // monotonic membership config epoch. An epoch of 0 is written as a legacy
-// record.
+// record. This is the non-joint form; SaveJointMembership preserves C_old and
+// the auto-finalize intent.
 func (s *FileStore) SaveMembershipEpoch(voters, learners []string, epoch uint64) error {
+	return s.SaveJointMembership(nil, voters, learners, false, epoch)
+}
+
+// SaveJointMembership durably records a complete configuration. votersOld is
+// non-empty exactly while the configuration is joint; autoFinalize is the
+// single-change API completion intent. voters must be non-empty.
+func (s *FileStore) SaveJointMembership(votersOld, voters, learners []string, autoFinalize bool, epoch uint64) error {
 	if len(voters) == 0 {
 		return errors.New("raft: membership must have at least one voter")
 	}
@@ -354,13 +374,26 @@ func (s *FileStore) SaveMembershipEpoch(voters, learners []string, epoch uint64)
 	if s.closed {
 		return errStoreClosed
 	}
+	old := append([]string(nil), votersOld...)
 	v := append([]string(nil), voters...)
 	l := append([]string(nil), learners...)
-	if err := s.writeRecord(walRecord{Type: "membership", Voters: v, Learners: l, ConfigEpoch: epoch}); err != nil {
+	if len(old) == 0 {
+		autoFinalize = false
+	}
+	if err := s.writeRecord(walRecord{
+		Type:         "membership",
+		VotersOld:    old,
+		Voters:       v,
+		Learners:     l,
+		AutoFinalize: autoFinalize,
+		ConfigEpoch:  epoch,
+	}); err != nil {
 		return err
 	}
+	s.votersOld = old
 	s.voters = v
 	s.learners = l
+	s.autoFinal = autoFinalize
 	s.configEpoch = epoch
 	return nil
 }
@@ -393,6 +426,26 @@ func (s *FileStore) LoadMembershipEpoch() ([]string, []string, uint64, error) {
 		return nil, nil, 0, nil
 	}
 	return append([]string(nil), s.voters...), append([]string(nil), s.learners...), s.configEpoch, nil
+}
+
+// LoadJointMembership returns the complete persisted configuration. A store
+// with no membership record returns nil, nil, nil, false, 0, nil. votersOld is
+// non-empty exactly while the persisted configuration is joint.
+func (s *FileStore) LoadJointMembership() ([]string, []string, []string, bool, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, nil, false, 0, errStoreClosed
+	}
+	if len(s.voters) == 0 {
+		return nil, nil, nil, false, 0, nil
+	}
+	return append([]string(nil), s.votersOld...),
+		append([]string(nil), s.voters...),
+		append([]string(nil), s.learners...),
+		s.autoFinal,
+		s.configEpoch,
+		nil
 }
 
 // Append durably appends contiguous entries. It is atomic with respect to the

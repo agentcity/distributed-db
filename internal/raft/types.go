@@ -4,15 +4,20 @@
 // durable log, the state machine and the peer-to-peer transport are injected
 // through interfaces so that the core stays testable and transport agnostic.
 //
-// Membership uses the single-server change algorithm and deliberately omits
-// joint consensus: AddLearner, PromoteLearner and RemoveVoter each append one
-// config entry, only one change may be in flight, and the old and new voter
-// majorities therefore always overlap. Learners replicate but never vote or
-// count towards a quorum. Voter/learner sets are persisted through the optional
-// MembershipStore capability (FileStore implements it) and are also rebuilt
-// deterministically by replaying config entries.
+// Membership uses joint consensus. A change first appends and commits a joint
+// configuration C_old,new, then a final configuration C_new. While joined, both
+// voter sets must reach a majority for elections, quorum leases and commit, so
+// the old and new configurations cannot diverge and no second change may start.
+// AddLearner, PromoteLearner and RemoveVoter keep their single-change API but
+// are implemented as enter-joint followed by leave-joint. EnterJoint and
+// LeaveJoint expose the two phases directly for callers that need to hold the
+// joint configuration across several operations. Learners replicate but never
+// vote or count towards a quorum. Voter/learner sets are persisted through the
+// optional MembershipStore/JointMembershipStore capabilities (FileStore
+// implements both) and are also rebuilt deterministically by replaying config
+// entries.
 //
-// The current membership is also embedded in every snapshot, together with a
+// The current configuration is also embedded in every snapshot, together with a
 // monotonically increasing config epoch. A node that was partitioned while
 // membership changed may have to install a snapshot after its log prefix was
 // compacted; the membership in that snapshot is authoritative, so the node
@@ -20,14 +25,9 @@
 // Snapshots written by older versions carry no membership: loading one falls
 // back to the persisted MembershipStore record or the static Config. Restoring
 // a snapshot whose membership config epoch is lower than this node's is
-// rejected as stale.
-//
-// Remaining G2 gap: this is not joint consensus. A change is still one
-// single-server step with overlapping majorities, and there is no intermediate
-// joint configuration that tolerates a crash between the old and new voter
-// sets. Snapshot metadata makes membership recoverable after compaction, but it
-// does not add the C_old,new safety guarantees that joint consensus provides;
-// operators must still avoid changing membership while quorum is at risk.
+// rejected as stale. Joint snapshots additionally carry the old voter set and
+// the auto-finalize intent, so a restart in the joint state can complete the
+// pending change.
 package raft
 
 import (
@@ -97,9 +97,19 @@ type Status struct {
 	Voters      []string
 	Learners    []string
 	Learner     bool // the local node is currently a learner
+	// Joint reports whether the node is in the intermediate C_old,new
+	// configuration. While joint, VotersOld and VotersNew hold the two voter
+	// sets and a quorum is required in both. Voters is their union.
+	Joint bool
+	// VotersOld is C_old while joint; nil otherwise.
+	VotersOld []string
+	// VotersNew is C_new while joint; nil otherwise. In the final state
+	// (Joint == false) Voters itself is C_new.
+	VotersNew []string
 	// ConfigEpoch is the version of the voter/learner configuration. It starts
 	// at 1 and increases with every effective membership change; a value of 0
-	// only appears on a zero Status.
+	// only appears on a zero Status. A joint change advances the epoch twice:
+	// once when C_old,new is applied and once when C_new is applied.
 	ConfigEpoch uint64
 }
 
@@ -168,10 +178,10 @@ type TimeoutNowTransport interface {
 }
 
 // StateMachine consumes committed log entries in index order. Raft membership
-// commands (config_add_learner, config_promote_learner, config_remove_voter)
-// are consumed by Raft itself and are not delivered to the state machine, so
-// the indices it sees may have gaps; "in index order" means increasing, not
-// necessarily contiguous.
+// commands (config_add_learner, config_promote_learner, config_remove_voter,
+// config_joint, config_final) are consumed by Raft itself and are not delivered
+// to the state machine, so the indices it sees may have gaps; "in index order"
+// means increasing, not necessarily contiguous.
 type StateMachine interface {
 	Apply(entry model.Entry) error
 }
@@ -183,13 +193,28 @@ type StateMachine interface {
 // metadata; an empty/nil Voters slice inside a non-nil value is corrupt and is
 // rejected.
 //
+// Voters is C_new (the current voter set outside a joint configuration). When
+// VotersOld is non-empty the snapshot captured the intermediate joint
+// configuration C_old,new: elections and commits then need a majority of both
+// VotersOld and Voters. AutoFinalize records that the joint configuration came
+// from a single-change API call and should be completed to Voters automatically
+// by the next leader; it is meaningful only while joint.
+//
 // Voters includes the node that produced the snapshot when it was a voter.
-// Learners are non-voting members. Both slices are sorted and de-duplicated
-// when a snapshot is created or validated.
+// Learners are non-voting members. All slices are sorted and de-duplicated when
+// a snapshot is created or validated, and learners never overlap a voter.
 type SnapshotMembership struct {
-	Voters      []string `json:"voters"`
-	Learners    []string `json:"learners,omitempty"`
-	ConfigEpoch uint64   `json:"config_epoch"`
+	Voters       []string `json:"voters"`
+	VotersOld    []string `json:"voters_old,omitempty"`
+	Learners     []string `json:"learners,omitempty"`
+	AutoFinalize bool     `json:"auto_finalize,omitempty"`
+	ConfigEpoch  uint64   `json:"config_epoch"`
+}
+
+// Joint reports whether the snapshot captured an intermediate C_old,new
+// configuration. A nil envelope is never joint.
+func (m *SnapshotMembership) Joint() bool {
+	return m != nil && len(m.VotersOld) > 0
 }
 
 // Snapshot is a compact image of the state machine at Index. Term is the term
@@ -431,6 +456,25 @@ type MembershipEpochStore interface {
 	LoadMembershipEpoch() (voters, learners []string, epoch uint64, err error)
 }
 
+// JointMembershipStore is the optional extension of MembershipEpochStore that
+// can persist an intermediate joint configuration. Node uses it when available
+// so a restart while joint (or while a single-change API is completing) keeps
+// C_old and the auto-finalize intent. A store that only implements
+// MembershipStore/MembershipEpochStore still works, but a joint configuration
+// is then persisted as its C_new voter set only: the node may restart in the
+// final configuration or, if the joint entry is still in the log, replay it.
+// FileStore implements this interface.
+//
+// LoadJointMembership returns nil, nil, nil, false, 0, nil when no membership
+// has ever been saved. voters is C_new; votersOld is non-empty exactly while
+// the persisted configuration is joint. Implementations must keep older
+// records loadable.
+type JointMembershipStore interface {
+	MembershipEpochStore
+	SaveJointMembership(votersOld, voters, learners []string, autoFinalize bool, epoch uint64) error
+	LoadJointMembership() (votersOld, voters, learners []string, autoFinalize bool, epoch uint64, err error)
+}
+
 // BatchAppender is the optional LogStore capability used for group commit. A
 // store that implements it can persist a contiguous batch of entries with one
 // durable write (one fsync for FileStore) instead of one append per proposal.
@@ -481,13 +525,26 @@ var (
 	// ErrNotVoter is returned when RemoveVoter names a peer that is not a
 	// voter.
 	ErrNotVoter = errors.New("raft: peer is not a voter")
-	// ErrUnsafeConfigChange is returned when a membership change would remove
-	// the leader or the last voter, or would otherwise be unsafe without joint
-	// consensus.
+	// ErrUnsafeConfigChange is returned when a membership change would leave
+	// the group without voters (for example removing the last voter).
 	ErrUnsafeConfigChange = errors.New("raft: unsafe membership change")
 	// ErrConfigChangeInProgress is returned when a membership change is
-	// already being applied. Changes are strictly one server at a time.
+	// already being applied. Changes are strictly one at a time, and no other
+	// configuration change may start while the group is joint.
 	ErrConfigChangeInProgress = errors.New("raft: membership change already in progress")
+	// ErrNoJointConfig is returned by LeaveJoint when the node is not in a
+	// joint configuration.
+	ErrNoJointConfig = errors.New("raft: no joint configuration")
+	// ErrStaleConfigChange is returned when a configuration entry or snapshot
+	// carries an epoch older than the applied configuration, or when applying
+	// it would regress or conflict with the current configuration. Stale
+	// entries are never applied.
+	ErrStaleConfigChange = errors.New("raft: stale configuration")
+	// ErrInvalidConfigEntry is returned for a malformed joint or final
+	// configuration entry (missing voters, duplicate/empty ids, learners that
+	// overlap voters, a missing epoch, or a missing old voter set on a joint
+	// entry).
+	ErrInvalidConfigEntry = errors.New("raft: invalid configuration entry")
 	// ErrInvalidSnapshotMembership is returned when a snapshot carries a
 	// membership envelope that is structurally invalid (no voters, an empty
 	// id, duplicates, a voter that is also a learner, or no config epoch).
@@ -509,7 +566,8 @@ var errLostQuorum = errors.Join(ErrNotLeader, ErrTimeout)
 // the node applies itself instead of forwarding to the state machine.
 func isConfigCommand(t model.CommandType) bool {
 	switch t {
-	case model.CommandAddLearner, model.CommandPromoteLearner, model.CommandRemoveVoter:
+	case model.CommandAddLearner, model.CommandPromoteLearner, model.CommandRemoveVoter,
+		CommandJointConfig, CommandFinalConfig:
 		return true
 	default:
 		return false
@@ -553,9 +611,12 @@ func cloneMembership(m *SnapshotMembership) *SnapshotMembership {
 	if m == nil {
 		return nil
 	}
-	c := &SnapshotMembership{ConfigEpoch: m.ConfigEpoch}
+	c := &SnapshotMembership{ConfigEpoch: m.ConfigEpoch, AutoFinalize: m.AutoFinalize}
 	if m.Voters != nil {
 		c.Voters = append([]string(nil), m.Voters...)
+	}
+	if m.VotersOld != nil {
+		c.VotersOld = append([]string(nil), m.VotersOld...)
 	}
 	if m.Learners != nil {
 		c.Learners = append([]string(nil), m.Learners...)
@@ -584,6 +645,8 @@ func membershipEqual(a, b *SnapshotMembership) bool {
 		return a == nil && b == nil
 	}
 	return a.ConfigEpoch == b.ConfigEpoch &&
+		a.AutoFinalize == b.AutoFinalize &&
 		equalStrings(a.Voters, b.Voters) &&
+		equalStrings(a.VotersOld, b.VotersOld) &&
 		equalStrings(a.Learners, b.Learners)
 }

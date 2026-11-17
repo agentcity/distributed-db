@@ -167,10 +167,11 @@ func (s *Store) Scan(start, end []byte, ts uint64, limit int) ([]KV, error) {
 //
 // ScanForBackup cannot detect a commit that was allocated at or below ts but
 // whose atomic write batch has not yet reached the engine (notably 1PC commits,
-// which never install a lock). That gap is a TSO/commit-lease problem, not a
-// lock problem: callers must run a barrier that either waits for in-flight
-// commits at or below the snapshot TSO to apply or chooses a lagged TSO. See
-// the backup package for the barrier and its documented limits.
+// which never install a lock). That gap is closed by the apply barrier in this
+// package: callers acquire commit leases before exposing commit timestamps and
+// call WaitApplied(ctx, ts) before scanning, so every commit at or below ts is
+// visible when the scan starts. See Store.WaitApplied and the package
+// documentation for the lease and restart contract.
 func (s *Store) ScanForBackup(start, end []byte, ts uint64, limit int) ([]KV, error) {
 	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
 		return []KV{}, nil

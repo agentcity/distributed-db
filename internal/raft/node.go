@@ -64,20 +64,39 @@ type Node struct {
 	leaderID         string
 	electionDeadline time.Time
 	votes            map[string]bool
-	// voters and learners are the mutable Raft membership. voters includes
-	// this node when it is a voter. cfg.Peers is only the bootstrap input.
-	voters   []string
-	learners map[string]bool
-	// configEpoch is the monotonic version of voters/learners. It is embedded
-	// in snapshots and persisted with membership when the store supports it.
+	// voters and learners are the mutable Raft membership. voters is C_new
+	// (the current voter set outside a joint configuration) and includes this
+	// node when it is a voter. votersOld is C_old and is non-empty exactly
+	// while the node is in the intermediate joint configuration. cfg.Peers is
+	// only the bootstrap input.
+	voters    []string
+	votersOld []string
+	learners  map[string]bool
+	// configEpoch is the monotonic version of the configuration. It is
+	// embedded in snapshots and persisted with membership when the store
+	// supports it. A joint change advances it twice (joint, then final).
 	configEpoch uint64
-	// configInFlight gates membership changes to one server at a time.
+	// configInFlight gates membership changes: one single-change operation at
+	// a time, and no new change while joint.
 	configInFlight bool
-	nextIndex      map[string]uint64
-	matchIndex     map[string]uint64
-	lastAck        map[string]time.Time
-	triggers       map[string]chan struct{}
-	pending        map[uint64]*proposal
+	// autoFinalize marks a joint configuration created by a single-change API
+	// that the leader should complete automatically. It is part of the
+	// configuration and is persisted with it.
+	autoFinalize bool
+	// finalInFlight is set after this leader appended C_new and is waiting for
+	// it to commit/apply. It prevents duplicate final entries while the joint
+	// configuration is still applied.
+	finalInFlight bool
+	// configCh is closed and replaced whenever the applied configuration
+	// changes, waking configuration waiters.
+	configCh chan struct{}
+	// autoFinalSignal wakes autoFinalizeLoop.
+	autoFinalSignal chan struct{}
+	nextIndex       map[string]uint64
+	matchIndex      map[string]uint64
+	lastAck         map[string]time.Time
+	triggers        map[string]chan struct{}
+	pending         map[uint64]*proposal
 
 	// proposeQueue and proposeSignal implement group commit. Both are guarded
 	// by mu. Propose enqueues under mu (no I/O) and then waits without mu; the
@@ -165,19 +184,19 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	voters, learners, configEpoch, err := initMembership(cfg, store, snap.Membership)
+	config, err := initMembership(cfg, store, snap.Membership)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.ForceLearner {
 		// Re-adding a range to a node with an old data directory: overwrite
 		// the stale on-disk membership before the node can campaign.
-		if err := saveMembership(store, voters, learners, configEpoch); err != nil {
+		if err := saveConfigState(store, config); err != nil {
 			return nil, fmt.Errorf("raft: persist forced learner membership: %w", err)
 		}
 	}
-	learnerSet := make(map[string]bool, len(learners))
-	for _, l := range learners {
+	learnerSet := make(map[string]bool, len(config.learners))
+	for _, l := range config.learners {
 		learnerSet[l] = true
 	}
 	n := &Node{
@@ -194,9 +213,12 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 		lastApplied:          snap.Index,
 		role:                 Follower,
 		votes:                make(map[string]bool),
-		voters:               voters,
+		voters:               config.voters,
+		votersOld:            config.votersOld,
 		learners:             learnerSet,
-		configEpoch:          configEpoch,
+		configEpoch:          config.epoch,
+		configInFlight:       config.joint(),
+		autoFinalize:         config.autoFinalize,
 		nextIndex:            make(map[string]uint64),
 		matchIndex:           make(map[string]uint64),
 		lastAck:              make(map[string]time.Time),
@@ -204,10 +226,15 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 		pending:              make(map[uint64]*proposal),
 		snapshotRecv:         make(map[string]*snapshotChunkRecv),
 		snapshotChunkTimeout: snapshotChunkIdleTimeout,
+		configCh:             make(chan struct{}),
+		autoFinalSignal:      make(chan struct{}, 1),
 		stopCh:               make(chan struct{}),
 		proposeSignal:        make(chan struct{}, 1),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
+	// An uncommitted config entry already in the log means a configuration
+	// change is in progress even if the applied configuration is still old.
+	n.configInFlight = n.configInFlight || n.pendingConfigLocked()
 	return n, nil
 }
 
@@ -304,7 +331,7 @@ func (n *Node) Start(ctx context.Context) error {
 	n.resetElectionDeadlineLocked()
 	// Add before releasing mu: Stop sets stopped under mu before waiting, so
 	// no Add can race with Wait.
-	n.wg.Add(4)
+	n.wg.Add(5)
 	n.mu.Unlock()
 
 	go func() {
@@ -318,6 +345,10 @@ func (n *Node) Start(ctx context.Context) error {
 	go func() {
 		defer n.wg.Done()
 		n.proposeLoop()
+	}()
+	go func() {
+		defer n.wg.Done()
+		n.autoFinalizeLoop(runCtx)
 	}()
 	go func() {
 		defer n.wg.Done()
@@ -526,7 +557,7 @@ func (n *Node) ReadBarrier(ctx context.Context) error {
 func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return Status{
+	status := Status{
 		ID:          n.cfg.ID,
 		Role:        n.role,
 		Term:        n.term,
@@ -534,11 +565,17 @@ func (n *Node) Status() Status {
 		CommitIndex: n.commitIndex,
 		LastIndex:   n.lastIndexLocked(),
 		LastApplied: n.lastApplied,
-		Voters:      append([]string(nil), n.voters...),
+		Voters:      n.votingMembersLocked(),
 		Learners:    n.learnerListLocked(),
 		Learner:     n.isLearnerLocked(n.cfg.ID),
+		Joint:       n.isJointLocked(),
 		ConfigEpoch: n.configEpoch,
 	}
+	if n.isJointLocked() {
+		status.VotersOld = append([]string(nil), n.votersOld...)
+		status.VotersNew = append([]string(nil), n.voters...)
+	}
+	return status
 }
 
 // Leader returns the last known leader id, or "" when unknown.
@@ -1200,7 +1237,10 @@ func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 			return nil, err
 		}
 	}
-	if !n.isVoterLocked(req.CandidateID) || !n.selfIsVoterLocked() {
+	// Elections use the latest configuration in the log, including a config
+	// entry that is present but not yet applied (see electoralConfigLocked).
+	electorate := n.electoralConfigLocked()
+	if !configNewVoter(electorate, req.CandidateID) || !configVotingMember(electorate, n.cfg.ID) {
 		return &RequestVoteResponse{Term: n.term, VoteGranted: false}, nil
 	}
 	lastIndex := n.lastIndexLocked()
@@ -1507,6 +1547,14 @@ func (n *Node) commitProposalBatch(batch []*proposal) {
 			n.pending[p.index] = p
 		}
 		n.entries = append(n.entries, entries...)
+		if batchHasJointConfig(entries) {
+			// New voters in the pending joint configuration must receive the
+			// entry before it can commit; start their replicators now. The
+			// configuration change gate stays closed until the final entry is
+			// applied, even before the joint entry commits.
+			n.configInFlight = true
+			n.syncReplicatorsLocked()
+		}
 		n.signalAllLocked()
 		n.maybeCommitLocked()
 		return
@@ -1526,9 +1574,23 @@ func (n *Node) commitProposalBatch(batch []*proposal) {
 		p.index = e.Index
 		n.pending[e.Index] = p
 		n.entries = append(n.entries, e)
+		if e.Type == CommandJointConfig {
+			n.configInFlight = true
+			n.syncReplicatorsLocked()
+		}
 	}
 	n.signalAllLocked()
 	n.maybeCommitLocked()
+}
+
+// batchHasJointConfig reports whether entries contain a joint config entry.
+func batchHasJointConfig(entries []model.Entry) bool {
+	for _, e := range entries {
+		if e.Type == CommandJointConfig {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) electionLoop(ctx context.Context) {
@@ -1579,7 +1641,7 @@ func (n *Node) beginElection() {
 		n.mu.Unlock()
 		return
 	}
-	if !n.selfIsVoterLocked() {
+	if !n.selfIsElectoralVoterLocked() {
 		// A learner (or a node removed from the configuration) never
 		// campaigns. Keep the deadline moving so the election loop does not
 		// spin on an expired timer.
@@ -1609,7 +1671,7 @@ func (n *Node) beginElection() {
 		LastLogIndex: n.lastIndexLocked(),
 		LastLogTerm:  n.lastLogTermLocked(),
 	}
-	peers := n.votersExceptSelfLocked()
+	peers := n.electoralVotersExceptSelfLocked()
 	n.wg.Add(len(peers))
 	n.mu.Unlock()
 
@@ -1623,7 +1685,7 @@ func (n *Node) beginElection() {
 	// A single-node cluster (or one that already has a quorum via previous
 	// grants) becomes leader immediately.
 	n.mu.Lock()
-	if n.role == Candidate && n.term == newTerm && len(n.votes) >= n.majority() {
+	if n.role == Candidate && n.term == newTerm && n.voteQuorumLocked() {
 		n.becomeLeaderLocked()
 	}
 	n.mu.Unlock()
@@ -1638,7 +1700,7 @@ func (n *Node) requestVote(peer string, req *RequestVoteRequest, electionTerm ui
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role != Candidate || n.term != electionTerm || !n.selfIsVoterLocked() {
+	if n.stopped || n.role != Candidate || n.term != electionTerm || !n.selfIsElectoralVoterLocked() {
 		return
 	}
 	if resp.Term > n.term {
@@ -1651,7 +1713,7 @@ func (n *Node) requestVote(peer string, req *RequestVoteRequest, electionTerm ui
 		return
 	}
 	n.votes[peer] = true
-	if len(n.votes) >= n.majority() {
+	if n.voteQuorumLocked() {
 		n.becomeLeaderLocked()
 	}
 }
@@ -1659,13 +1721,16 @@ func (n *Node) requestVote(peer string, req *RequestVoteRequest, electionTerm ui
 // becomeLeaderLocked transitions to leader, appends the mandatory no-op entry
 // and starts one replicator per peer. Caller must hold mu.
 func (n *Node) becomeLeaderLocked() {
-	if n.stopped || n.role != Candidate || !n.selfIsVoterLocked() {
+	if n.stopped || n.role != Candidate || !n.selfIsElectoralVoterLocked() {
 		return
 	}
 	n.role = Leader
 	n.leaderID = n.cfg.ID
 	n.leaderNoopIndex = 0
-	n.configInFlight = false
+	// A joint configuration is still an in-progress change: keep the gate
+	// closed and let the finalizer complete it (when AutoFinalize is set).
+	n.configInFlight = n.isJointLocked() || n.pendingConfigLocked()
+	n.finalInFlight = false
 	voters := n.votes
 	n.votes = nil
 	n.cancelLeaderLocked()
@@ -1714,6 +1779,10 @@ func (n *Node) becomeLeaderLocked() {
 	n.logger.Info("raft: became leader", "id", n.cfg.ID, "term", n.term, "last_index", n.lastIndexLocked())
 	n.maybeCommitLocked()
 	n.signalAllLocked()
+	// If this node became leader in the middle of a single-change operation,
+	// finish it: the joint target is fixed, and the final entry may have been
+	// lost with the previous leader.
+	n.signalAutoFinalLocked()
 }
 
 func (n *Node) replicateLoop(ctx context.Context, peer string, trigger <-chan struct{}, term uint64) {
@@ -1788,7 +1857,7 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role != Leader || n.term != term || (!n.isVoterLocked(peer) && !n.isLearnerLocked(peer)) {
+	if n.stopped || n.role != Leader || n.term != term || !n.isReplicationTargetLocked(peer) {
 		return false
 	}
 	if resp.Term > n.term {
@@ -1995,6 +2064,11 @@ func (n *Node) applyLoop() {
 
 		n.mu.Lock()
 		n.lastApplied = index
+		if isConfigCommand(entry.Type) {
+			// Wake configuration waiters only after lastApplied covers the
+			// entry, so they cannot observe a config ahead of the applied index.
+			n.notifyConfigLocked()
+		}
 		if err != nil {
 			n.logger.Error("raft: state machine apply failed", "id", n.cfg.ID, "index", index, "error", err)
 		}
@@ -2011,13 +2085,6 @@ func (n *Node) applyLoop() {
 // State helpers (caller holds n.mu)
 // ---------------------------------------------------------------------------
 
-func (n *Node) majority() int {
-	if len(n.voters) == 0 {
-		return 1
-	}
-	return len(n.voters)/2 + 1
-}
-
 func (n *Node) lastIndexLocked() uint64 {
 	return n.snapshot.Index + uint64(len(n.entries))
 }
@@ -2026,17 +2093,20 @@ func (n *Node) lastIndexLocked() uint64 {
 // applied log entries that are Raft config commands. The state machine never
 // sees config entries, so its reported applied index may be older than
 // lastApplied; the membership embedded in the snapshot belongs to lastApplied.
-// The index is only advanced while every intervening entry is a config command
-// and still present in memory; otherwise the state machine's index is kept.
-// Caller holds mu.
+// The index is only advanced while every intervening entry is a config command.
+// Entries already covered by the current snapshot (i <= n.snapshot.Index) are
+// skipped: the snapshot index was itself only advanced across config entries,
+// so the compacted gap contains no state-machine mutations. An entry beyond the
+// snapshot that is not a config command stops the extension. Caller holds mu.
 func (n *Node) snapshotIndexLocked(index uint64) uint64 {
 	if index == 0 || n.lastApplied <= index {
 		return index
 	}
 	for i := index + 1; i <= n.lastApplied; i++ {
 		if i <= n.snapshot.Index {
-			// The entry is compacted and cannot be inspected.
-			return index
+			// Covered by the current snapshot; it contains only Raft config
+			// entries the state machine never observed.
+			continue
 		}
 		e := n.entries[i-n.snapshot.Index-1]
 		if !isConfigCommand(e.Type) {
@@ -2117,6 +2187,7 @@ func (n *Node) stepDownWithErrorLocked(leaderID string, pendingErr error) {
 	n.leaderID = leaderID
 	n.votes = nil
 	n.configInFlight = false
+	n.finalInFlight = false
 	// Pending proposals can no longer be completed on this node. Failing them
 	// here prevents a caller using a background context from hanging forever.
 	n.failPendingLocked(pendingErr)
@@ -2140,6 +2211,7 @@ func (n *Node) adoptTermLocked(term uint64, leaderID string) error {
 	n.leaderID = leaderID
 	n.votes = nil
 	n.configInFlight = false
+	n.finalInFlight = false
 	n.failPendingLocked(ErrNotLeader)
 	n.failQueuedLocked(ErrNotLeader)
 	n.resetElectionDeadlineLocked()
@@ -2193,52 +2265,40 @@ func (n *Node) completeLocked(p *proposal, err error) {
 }
 
 func (n *Node) hasQuorumLocked(now time.Time) bool {
-	count := 0
-	if n.selfIsVoterLocked() {
-		count = 1
-	}
-	for _, peer := range n.voters {
-		if peer == n.cfg.ID {
-			continue
-		}
-		if ts, ok := n.lastAck[peer]; ok && now.Sub(ts) <= n.cfg.ElectionTimeoutMin {
-			count++
-		}
-	}
-	return count >= n.majority()
+	return n.leaseQuorumLocked(now)
 }
 
 // maybeCommitLocked advances commitIndex to the highest entry from the current
-// term stored on a strict majority. Entries from older terms are never
-// committed directly; they are committed by induction once a current-term
-// entry is committed. Caller must hold mu.
+// term stored on a quorum of the configuration that governs it. Entries from
+// older terms are never committed directly; they are committed by induction
+// once a current-term entry is committed. Caller holds mu.
+//
+// The governing configuration includes a config entry at the candidate index
+// (so C_old,new itself needs both majorities and a later entry appended while
+// it is uncommitted cannot commit under the old configuration alone). A pending
+// final entry does not take effect here until it is applied, so leaving the
+// joint state always requires majorities of both C_old and C_new.
 func (n *Node) maybeCommitLocked() {
 	last := n.lastIndexLocked()
-	for index := last; index > n.commitIndex; index-- {
-		// Skip foreign-term entries and keep scanning: a lower entry from the
-		// current term may already have a majority even if a higher one does
-		// not. Only current-term entries are eligible for direct commit.
-		term, ok := n.termAtLocked(index)
-		if !ok || term != n.term {
-			continue
+	if last <= n.commitIndex {
+		return
+	}
+	st := n.commitConfigThroughLocked(n.configStateLocked(), n.commitIndex)
+	newCommit := n.commitIndex
+	for index := n.commitIndex + 1; index <= last; index++ {
+		// A config entry takes effect for its own commit (except a final
+		// entry, which stays joint until applied).
+		if index > n.snapshot.Index {
+			st = nextCommitConfig(st, n.entries[index-n.snapshot.Index-1])
 		}
-		count := 0
-		if n.selfIsVoterLocked() {
-			count = 1
+		if term, ok := n.termAtLocked(index); ok && term == n.term &&
+			n.commitQuorumInConfigLocked(st, index) {
+			newCommit = index
 		}
-		for _, peer := range n.voters {
-			if peer == n.cfg.ID {
-				continue
-			}
-			if n.matchIndex[peer] >= index {
-				count++
-			}
-		}
-		if count >= n.majority() {
-			n.commitIndex = index
-			n.applyCond.Broadcast()
-			return
-		}
+	}
+	if newCommit > n.commitIndex {
+		n.commitIndex = newCommit
+		n.applyCond.Broadcast()
 	}
 }
 

@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	KVService_Get_FullMethodName              = "/dbv2.KVService/Get"
 	KVService_Scan_FullMethodName             = "/dbv2.KVService/Scan"
+	KVService_ScanForBackup_FullMethodName    = "/dbv2.KVService/ScanForBackup"
 	KVService_Prewrite_FullMethodName         = "/dbv2.KVService/Prewrite"
 	KVService_Commit_FullMethodName           = "/dbv2.KVService/Commit"
 	KVService_CommitSingle_FullMethodName     = "/dbv2.KVService/CommitSingle"
@@ -49,6 +50,19 @@ const (
 type KVServiceClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error)
+	// ScanForBackup is the lock-aware variant of Scan used by logical backups.
+	// It returns the same visible key/value set as Scan at ts, but fails closed
+	// with locked=true (and error="locked") when a lock with startTS <= ts is
+	// present anywhere in [start, end), including a key that has never been
+	// committed. That is what lets a remote backup distinguish "no value" from
+	// "a transaction may still become visible below the snapshot TSO".
+	//
+	// The RPC and its messages are additive: older servers answer Unimplemented,
+	// which a strict backup client treats as a hard error; older clients never
+	// call the method. The response keeps the historical in-band string error,
+	// but locked/locked_key/lock_ts carry structured details so a client can
+	// build a precise lock error instead of parsing error text.
+	ScanForBackup(ctx context.Context, in *ScanForBackupRequest, opts ...grpc.CallOption) (*ScanForBackupResponse, error)
 	Prewrite(ctx context.Context, in *PrewriteRequest, opts ...grpc.CallOption) (*PrewriteResponse, error)
 	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
 	CommitSingle(ctx context.Context, in *CommitSingleRequest, opts ...grpc.CallOption) (*CommitSingleResponse, error)
@@ -102,6 +116,16 @@ func (c *kVServiceClient) Scan(ctx context.Context, in *ScanRequest, opts ...grp
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ScanResponse)
 	err := c.cc.Invoke(ctx, KVService_Scan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) ScanForBackup(ctx context.Context, in *ScanForBackupRequest, opts ...grpc.CallOption) (*ScanForBackupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ScanForBackupResponse)
+	err := c.cc.Invoke(ctx, KVService_ScanForBackup_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -296,6 +320,19 @@ func (c *kVServiceClient) UpdateRangeEpoch(ctx context.Context, in *UpdateRangeE
 type KVServiceServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Scan(context.Context, *ScanRequest) (*ScanResponse, error)
+	// ScanForBackup is the lock-aware variant of Scan used by logical backups.
+	// It returns the same visible key/value set as Scan at ts, but fails closed
+	// with locked=true (and error="locked") when a lock with startTS <= ts is
+	// present anywhere in [start, end), including a key that has never been
+	// committed. That is what lets a remote backup distinguish "no value" from
+	// "a transaction may still become visible below the snapshot TSO".
+	//
+	// The RPC and its messages are additive: older servers answer Unimplemented,
+	// which a strict backup client treats as a hard error; older clients never
+	// call the method. The response keeps the historical in-band string error,
+	// but locked/locked_key/lock_ts carry structured details so a client can
+	// build a precise lock error instead of parsing error text.
+	ScanForBackup(context.Context, *ScanForBackupRequest) (*ScanForBackupResponse, error)
 	Prewrite(context.Context, *PrewriteRequest) (*PrewriteResponse, error)
 	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
 	CommitSingle(context.Context, *CommitSingleRequest) (*CommitSingleResponse, error)
@@ -340,6 +377,9 @@ func (UnimplementedKVServiceServer) Get(context.Context, *GetRequest) (*GetRespo
 }
 func (UnimplementedKVServiceServer) Scan(context.Context, *ScanRequest) (*ScanResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Scan not implemented")
+}
+func (UnimplementedKVServiceServer) ScanForBackup(context.Context, *ScanForBackupRequest) (*ScanForBackupResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ScanForBackup not implemented")
 }
 func (UnimplementedKVServiceServer) Prewrite(context.Context, *PrewriteRequest) (*PrewriteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Prewrite not implemented")
@@ -448,6 +488,24 @@ func _KVService_Scan_Handler(srv interface{}, ctx context.Context, dec func(inte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(KVServiceServer).Scan(ctx, req.(*ScanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_ScanForBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ScanForBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).ScanForBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_ScanForBackup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).ScanForBackup(ctx, req.(*ScanForBackupRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -790,6 +848,10 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Scan",
 			Handler:    _KVService_Scan_Handler,
+		},
+		{
+			MethodName: "ScanForBackup",
+			Handler:    _KVService_ScanForBackup_Handler,
 		},
 		{
 			MethodName: "Prewrite",

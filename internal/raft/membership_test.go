@@ -281,8 +281,9 @@ func TestMembershipRemoveVoterAndSafety(t *testing.T) {
 		t.Fatalf("follower RemoveVoter = %v, want ErrNotLeader", err)
 	}
 
-	// The leader itself cannot be removed without a transfer.
-	c.requireUnsafeSelfRemoval()
+	// Removing the leader is allowed under joint consensus: it keeps leading
+	// through C_old,new and steps down only after C_new excludes it. That path
+	// is covered by TestLeaderRemovalStepsDownAfterFinalConfig.
 
 	victim := otherID(c.ids, leaderID)
 	c.removeVoterWithRetry(victim)

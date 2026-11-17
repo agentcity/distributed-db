@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,8 @@ type applyCommand struct {
 // itself.
 type stateMachine struct {
 	store       *mvcc.Store
+	rangeID     uint64
+	log         *slog.Logger
 	engine      storage.Engine
 	lastApplied atomic.Uint64
 
@@ -52,14 +55,53 @@ type stateMachine struct {
 	// be in flight.
 	applyGate sync.RWMutex
 
+	// splitMu protects every field below. The active freeze markers are the
+	// authority for rejecting client writes; the remaining fields mirror the
+	// durable adminRecord so a restart can reconcile an in-flight split/merge
+	// with the persisted range map.
 	splitMu    sync.RWMutex
 	splitKey   []byte
 	mergeLeft  uint64
 	mergeRight uint64
 	// freezeGen increments once per freeze barrier and is stamped into every
-	// write proposal. It is initialised from the range epoch so a restart
-	// does not forget an epoch already published through the range map.
+	// write proposal. It is initialised from the range epoch and raised to the
+	// persisted admin generation, so stale proposals replayed from the Raft log
+	// after a restart are still rejected.
 	freezeGen uint64
+
+	// Durable admin state (see split.go). adminKind/adminPhase/adminIndex
+	// describe the last replicated (or recovered) transition; the split/merge
+	// bounds let recovery finish or abort it.
+	adminKind       string
+	adminPhase      string
+	adminIndex      uint64
+	adminSplitKey   []byte
+	splitNewID      uint64
+	splitOldEnd     []byte
+	mergeRightStart []byte
+	mergeRightEnd   []byte
+	// genSteps/genCursor replay the freeze-generation timeline in log order;
+	// recovery is the replicated admin entry this replica still has to append
+	// after replay (nil when replay already resolved the operation).
+	genSteps  []genStep
+	genCursor int
+	recovery  *adminRecovery
+
+	// Replica-local progress. A replicated finish must not clear the freeze
+	// while this replica is still copying/cutting data.
+	localKind       string
+	localDone       bool
+	finishApplied   bool
+	finishCommitted bool
+	clearCommitted  bool
+	abortPending    bool
+
+	// Last prepare observed, kept even after a finish clears the active
+	// marker, so an admin RPC that raced replication can still confirm that
+	// its prepare was applied.
+	preparedSplitKey   []byte
+	preparedMergeLeft  uint64
+	preparedMergeRight uint64
 
 	// batchResults holds the per-command outcome of recently applied
 	// CommandTxnBatch entries until the proposing batcher consumes it.
@@ -67,6 +109,14 @@ type stateMachine struct {
 }
 
 func (m *stateMachine) Apply(entry model.Entry) error {
+	// Advance the freeze generation to the value this log position carried in
+	// the original run before any command (including a prepare) is evaluated.
+	// Apply is the single apply goroutine, so this is ordered with writeTicket
+	// readers through splitMu.
+	m.splitMu.Lock()
+	m.advanceGenLocked(entry.Index)
+	m.splitMu.Unlock()
+
 	var err error
 	switch entry.Type {
 	case model.CommandPrewrite, model.CommandCommit, model.CommandPrewriteCommit,
@@ -82,6 +132,10 @@ func (m *stateMachine) Apply(entry model.Entry) error {
 		err = m.apply(entry)
 	}
 	m.lastApplied.Store(entry.Index)
+	if err != nil && errors.Is(err, ErrRangeFrozen) && m.log != nil {
+		m.log.Debug("write rejected during split/merge barrier",
+			"range", m.rangeID, "index", entry.Index, "type", entry.Type, "error", err)
+	}
 	return err
 }
 
@@ -115,68 +169,22 @@ func (m *stateMachine) writeTicket() (uint64, bool) {
 	return m.freezeGen, frozen
 }
 
-// prepareSplit records a split freeze barrier. It is idempotent for a retry of
-// the same split key and returns an error for a conflicting split/merge. The
-// caller must hold applyGate for writing or be the apply loop.
-func (m *stateMachine) prepareSplit(key []byte) error {
-	if len(key) == 0 {
-		return fmt.Errorf("%w: split key is empty", ErrRangeFrozen)
-	}
-	m.splitMu.Lock()
-	defer m.splitMu.Unlock()
-	if m.mergeLeft != 0 || m.mergeRight != 0 {
-		return fmt.Errorf("%w: merge %d/%d is already prepared",
-			ErrRangeFrozen, m.mergeLeft, m.mergeRight)
-	}
-	if len(m.splitKey) > 0 {
-		if bytes.Equal(m.splitKey, key) {
-			return nil // Retry of the same prepare: do not double-freeze.
-		}
-		return fmt.Errorf("%w: split key %q is already prepared", ErrRangeFrozen, m.splitKey)
-	}
-	m.splitKey = append([]byte(nil), key...)
-	m.freezeGen++
-	return nil
-}
-
-// prepareMerge records a merge freeze barrier on one of the two participating
-// ranges. It is idempotent for a retry of the same pair.
-func (m *stateMachine) prepareMerge(left, right uint64) error {
-	if left == 0 || right == 0 || left == right {
-		return fmt.Errorf("%w: invalid merge pair %d/%d", ErrRangeFrozen, left, right)
-	}
-	m.splitMu.Lock()
-	defer m.splitMu.Unlock()
-	if len(m.splitKey) > 0 {
-		return fmt.Errorf("%w: split key %q is already prepared", ErrRangeFrozen, m.splitKey)
-	}
-	if m.mergeLeft != 0 || m.mergeRight != 0 {
-		if m.mergeLeft == left && m.mergeRight == right {
-			return nil // Retry of the same prepare: do not double-freeze.
-		}
-		return fmt.Errorf("%w: merge %d/%d is already prepared",
-			ErrRangeFrozen, m.mergeLeft, m.mergeRight)
-	}
-	m.mergeLeft, m.mergeRight = left, right
-	m.freezeGen++
-	return nil
-}
-
 // freezeSplit installs a local split barrier. Unlike a replicated prepare it
 // only freezes this host, matching the host-local contract of Server.SplitRange.
 // Holding the write side of applyGate guarantees that no earlier write is
-// still mutating the store when the copy starts.
+// still mutating the store when the copy starts. The barrier is persisted so a
+// restart after a crash cannot resurrect a stale freeze.
 func (m *stateMachine) freezeSplit(key []byte) error {
 	m.applyGate.Lock()
 	defer m.applyGate.Unlock()
-	return m.prepareSplit(key)
+	return m.prepareSplitPlan(key, 0, nil, 0)
 }
 
 // freezeMerge installs a local merge barrier on this host.
 func (m *stateMachine) freezeMerge(left, right uint64) error {
 	m.applyGate.Lock()
 	defer m.applyGate.Unlock()
-	return m.prepareMerge(left, right)
+	return m.prepareMergePlan(left, right, nil, nil, 0)
 }
 
 func (m *stateMachine) apply(entry model.Entry) error {
@@ -259,22 +267,35 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		}
 		return m.store.Rollback(cmd.Keys, cmd.StartTS)
 	case model.CommandSplitPrepare:
-		var cmd struct {
-			SplitKey []byte `json:"split_key"`
-		}
-		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
+		var op adminOp
+		if err := json.Unmarshal(entry.Value, &op); err != nil {
 			return fmt.Errorf("kvserver: decode split prepare: %w", err)
 		}
-		return m.prepareSplit(cmd.SplitKey)
-	case model.CommandMergePrepare:
-		var cmd struct {
-			Left  uint64 `json:"left"`
-			Right uint64 `json:"right"`
+		switch op.Op {
+		case "", adminOpPrepare:
+			return m.prepareSplitPlan(op.SplitKey, op.NewRangeID, op.OldEnd, entry.Index)
+		case adminOpFinish:
+			return m.applySplitFinish(op, entry.Index)
+		case adminOpClear:
+			return m.applyAdminClear(adminKindSplit, entry.Index)
+		default:
+			return fmt.Errorf("kvserver: unknown split admin op %q", op.Op)
 		}
-		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
+	case model.CommandMergePrepare:
+		var op adminOp
+		if err := json.Unmarshal(entry.Value, &op); err != nil {
 			return fmt.Errorf("kvserver: decode merge prepare: %w", err)
 		}
-		return m.prepareMerge(cmd.Left, cmd.Right)
+		switch op.Op {
+		case "", adminOpPrepare:
+			return m.prepareMergePlan(op.Left, op.Right, op.RightStart, op.RightEnd, entry.Index)
+		case adminOpFinish:
+			return m.applyMergeFinish(op, entry.Index)
+		case adminOpClear:
+			return m.applyAdminClear(adminKindMerge, entry.Index)
+		default:
+			return fmt.Errorf("kvserver: unknown merge admin op %q", op.Op)
+		}
 	default:
 		return fmt.Errorf("kvserver: unknown command type %q", entry.Type)
 	}
@@ -295,13 +316,20 @@ func (m *stateMachine) splitPrepared() []byte {
 	return append([]byte(nil), m.splitKey...)
 }
 
-// clearSplit removes the split freeze marker. It is idempotent and does not
-// change the freeze generation, so a write that was proposed during the freeze
-// but applies later is still rejected by checkWrite.
+// lastSplitPrepared returns the split key of the last applied prepare. Unlike
+// splitPrepared it survives a finish, so an admin RPC whose prepare was
+// replicated and immediately finished can still observe that it was applied.
+func (m *stateMachine) lastSplitPrepared() []byte {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	return append([]byte(nil), m.preparedSplitKey...)
+}
+
+// clearSplit removes the split freeze marker and durably records the abort. It
+// is idempotent and does not change the freeze generation, so a write that was
+// proposed during the freeze but applies later is still rejected by checkWrite.
 func (m *stateMachine) clearSplit() {
-	m.splitMu.Lock()
-	m.splitKey = nil
-	m.splitMu.Unlock()
+	m.clearAdminFreeze(adminKindSplit)
 }
 
 func (m *stateMachine) mergePrepared() (uint64, uint64) {
@@ -310,22 +338,55 @@ func (m *stateMachine) mergePrepared() (uint64, uint64) {
 	return m.mergeLeft, m.mergeRight
 }
 
-// clearMerge removes the merge freeze marker from one range. It is idempotent
-// and leaves the generation untouched for the same reason as clearSplit.
+// lastMergePrepared returns the pair of the last applied merge prepare,
+// surviving a finish for the same reason as lastSplitPrepared.
+func (m *stateMachine) lastMergePrepared() (uint64, uint64) {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	return m.preparedMergeLeft, m.preparedMergeRight
+}
+
+// clearMerge removes the merge freeze marker from one range and durably
+// records the abort. It is idempotent and leaves the generation untouched.
 func (m *stateMachine) clearMerge() {
-	m.splitMu.Lock()
-	m.mergeLeft, m.mergeRight = 0, 0
-	m.splitMu.Unlock()
+	m.clearAdminFreeze(adminKindMerge)
 }
 
 // clearFreeze removes both split and merge markers. Admin retries and conflict
 // paths use it so a failed or stale prepare can never permanently freeze a
-// range.
+// range. The abort is persisted (with the current generation) so a restart
+// does not replay the stale prepare into a freeze.
 func (m *stateMachine) clearFreeze() {
+	m.clearAdminFreeze("")
+}
+
+// clearAdminFreeze clears the in-memory markers and persists an aborted record.
+// kind selects one marker family; the empty string clears both.
+func (m *stateMachine) clearAdminFreeze(kind string) {
 	m.splitMu.Lock()
-	m.splitKey = nil
-	m.mergeLeft, m.mergeRight = 0, 0
-	m.splitMu.Unlock()
+	defer m.splitMu.Unlock()
+	hadState := m.adminKind != "" || len(m.splitKey) > 0 || m.mergeLeft != 0 || m.mergeRight != 0
+	switch kind {
+	case adminKindSplit:
+		m.splitKey = nil
+	case adminKindMerge:
+		m.mergeLeft, m.mergeRight = 0, 0
+	default:
+		m.splitKey = nil
+		m.mergeLeft, m.mergeRight = 0, 0
+	}
+	m.localKind = ""
+	m.localDone = false
+	m.finishApplied = false
+	m.abortPending = false
+	if !hadState {
+		return
+	}
+	if kind != "" {
+		m.adminKind = kind
+	}
+	m.adminPhase = adminPhaseAborted
+	_ = m.persistLocked()
 }
 
 // Snapshot implements raft.Snapshotter. The Raft interface requires the whole
@@ -644,8 +705,10 @@ func (g *rangeGroup) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbac
 
 // SplitRange is the admin RPC used by the coordinator. The leader first
 // replicates a split-prepare command; every replica then copies its local
-// slice and creates the new Raft group. Meta is updated by the coordinator
-// after all replicas succeed.
+// slice and creates the new Raft group. After the local copy and range-map cut
+// are durable the leader replicates a split-finish command, which clears the
+// freeze on every replica that has finished its own data move. Meta is updated
+// by the coordinator after all replicas succeed.
 func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest) (*pbv2.SplitRangeResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -661,66 +724,102 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 		return &pbv2.SplitRangeResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
 	leader := g.node.Leader()
-	if req.GetNewRangeId() == 0 || len(req.GetSplitKey()) == 0 {
+	splitKey := req.GetSplitKey()
+	newID := req.GetNewRangeId()
+	if newID == 0 || len(splitKey) == 0 {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: "bad split request"}, nil
 	}
-	// A retry after a successful split is idempotent: no prepare is needed and
-	// no records are copied again.
-	if existing := k.s.hostedGroup(req.GetNewRangeId()); existing != nil {
-		g.sm.clearFreeze()
-		if bytes.Equal(existing.cfg.Start, req.GetSplitKey()) {
-			return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
+	// A retry after a successful split is idempotent: no prepare is needed,
+	// no records are copied again, and any leftover freeze is resolved through
+	// the replicated finish (with a local fallback once the child is published).
+	if existing := k.s.hostedGroup(newID); existing != nil {
+		if !bytes.Equal(existing.cfg.Start, splitKey) {
+			return &pbv2.SplitRangeResponse{Leader: leader, Error: "split range id already in use"}, nil
 		}
-		return &pbv2.SplitRangeResponse{Leader: leader, Error: "split range id already in use"}, nil
+		k.settleSplit(ctx, g, splitKey, newID)
+		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
 	}
 	if err := k.s.acceptEpoch(g, req.GetEpoch()); err != nil {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
 	}
+	k.s.hostMu.RLock()
+	oldEnd := cloneBytes(g.cfg.End)
+	k.s.hostMu.RUnlock()
 
-	// From here on the range may become frozen by our prepare. Every return
-	// path, including a timeout or a failed proposal, must clear it.
-	defer g.sm.clearFreeze()
-	if g.node.IsLeader() {
-		payload, err := json.Marshal(struct {
-			SplitKey []byte `json:"split_key"`
-		}{SplitKey: req.GetSplitKey()})
-		if err != nil {
-			return &pbv2.SplitRangeResponse{Leader: leader, Error: "encode"}, nil
+	// The replica-local marker is set before the prepare proposal so a
+	// replicated finish that arrives while this replica is still copying
+	// cannot clear the write barrier early.
+	if err := g.sm.beginLocalSplit(splitKey, newID, oldEnd); err != nil {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
 		}
-		if err := proposeWhileLeader(ctx, g, model.Entry{Type: model.CommandSplitPrepare, Value: payload}); err != nil {
+		g.sm.abortLocalAdmin()
+		// Best effort: unfreeze the other replicas too. A coordinator retry
+		// proposes a fresh prepare, and recovery resolves the persisted state.
+		proposeAdminClear(ctx, g, model.CommandSplitPrepare, adminOp{SplitKey: splitKey, NewRangeID: newID})
+		g.sm.clearFreeze()
+	}()
+
+	entry, err := adminEntry(model.CommandSplitPrepare, adminOp{
+		Op: adminOpPrepare, SplitKey: splitKey, NewRangeID: newID, OldEnd: oldEnd,
+	})
+	if err != nil {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: "encode"}, nil
+	}
+	if g.node.IsLeader() {
+		if err := proposeWhileLeader(ctx, g, entry); err != nil {
 			return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
 		}
 	}
 	// Followers wait for the leader's prepare command to arrive through Raft.
-	deadline := time.Now().Add(30 * time.Second)
-	for !bytes.Equal(g.sm.splitPrepared(), req.GetSplitKey()) {
-		if time.Now().After(deadline) {
-			return &pbv2.SplitRangeResponse{Leader: leader, Error: "split prepare timeout"}, nil
-		}
-		select {
-		case <-ctx.Done():
-			return &pbv2.SplitRangeResponse{Leader: leader, Error: "canceled"}, nil
-		case <-time.After(20 * time.Millisecond):
-		}
+	if err := waitSplitPrepared(ctx, g, splitKey, entry); err != nil {
+		return &pbv2.SplitRangeResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 
 	k.s.mu.Lock()
-	defer k.s.mu.Unlock()
 	if k.s.stopped {
+		k.s.mu.Unlock()
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: "stopped"}, nil
 	}
-	if existing := k.s.hostedGroup(req.GetNewRangeId()); existing != nil {
+	if existing := k.s.hostedGroup(newID); existing != nil {
+		k.s.mu.Unlock()
+		committed = true
+		k.settleSplit(ctx, g, splitKey, newID)
 		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
 	}
-	if _, err := k.s.splitLocalLocked(g, req.GetSplitKey(), req.GetNewRangeId(), false); err != nil {
-		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
+	_, err = k.s.splitLocalLocked(ctx, g, splitKey, newID, false, true)
+	k.s.mu.Unlock()
+	if err != nil {
+		return &pbv2.SplitRangeResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
+	committed = true
+	return &pbv2.SplitRangeResponse{Success: true, Leader: g.node.Leader()}, nil
+}
+
+// settleSplit resolves the idempotent retry path for a split whose child group
+// is already published on this host: replicate the finish when this replica
+// leads, then make sure the local barrier is gone.
+func (k *kvService) settleSplit(ctx context.Context, g *rangeGroup, splitKey []byte, newID uint64) {
+	entry, err := adminEntry(model.CommandSplitPrepare, adminOp{
+		Op: adminOpFinish, SplitKey: splitKey, NewRangeID: newID,
+	})
+	if err == nil && g.node.IsLeader() {
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = proposeAdminEntry(pctx, g, entry)
+		cancel()
+	}
+	g.sm.forceFinishedSplit()
 }
 
 // MergeRanges is the admin RPC for a replicated merge. The leaders of both
 // groups replicate a prepare command; every replica then moves the right half
-// into the left group and stops the right Raft group.
+// into the left group, stops the right Raft group and publishes the wider left
+// range map. The leader then replicates a merge-finish command that clears the
+// barrier once the local move is durable on each replica.
 func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesRequest) (*pbv2.MergeRangesResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -744,16 +843,18 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	if right == nil {
 		// A retry may arrive after the merge already finished: the right group
 		// is gone and the left end covers the requested right end (or the left
-		// group recorded the absorption). Clear any leftover freeze and report
-		// success idempotently.
-		left.sm.clearFreeze()
-		done := len(req.GetRightEnd()) > 0 && bytes.Equal(left.cfg.End, req.GetRightEnd())
-		if left.merged(req.GetRightRangeId()) {
+		// group recorded the absorption). Settle the freeze and report success.
+		done := left.merged(req.GetRightRangeId())
+		if len(req.GetRightEnd()) > 0 && bytes.Equal(left.cfg.End, req.GetRightEnd()) {
 			done = true
 		}
 		if done {
+			k.settleMerge(ctx, left, adminOp{
+				Left: req.GetLeftRangeId(), Right: req.GetRightRangeId(), RightEnd: req.GetRightEnd(),
+			}, req.GetRightRangeId())
 			return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
 		}
+		left.sm.clearFreeze()
 		return &pbv2.MergeRangesResponse{
 			Leader: left.node.Leader(),
 			Error:  opError(fmt.Errorf("%w: right id %d", ErrRangeNotFound, req.GetRightRangeId())),
@@ -770,72 +871,87 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	if err := k.s.acceptEpoch(left, req.GetEpoch()); err != nil {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 	}
-	payload, err := json.Marshal(struct {
-		Left  uint64 `json:"left"`
-		Right uint64 `json:"right"`
-	}{Left: left.cfg.ID, Right: right.cfg.ID})
+	rightStart := cloneBytes(right.cfg.Start)
+	rightEnd := cloneBytes(right.cfg.End)
+	op := adminOp{Op: adminOpPrepare, Left: left.cfg.ID, Right: right.cfg.ID, RightStart: rightStart, RightEnd: rightEnd}
+	entry, err := adminEntry(model.CommandMergePrepare, op)
 	if err != nil {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "encode"}, nil
 	}
 
-	// Every path after this point may leave either range frozen. Always clear
-	// both markers on return, including prepare timeouts, copy failures and
-	// stop failures, so no range stays permanently frozen.
+	if err := left.sm.beginLocalMerge(left.cfg.ID, right.cfg.ID, rightStart, rightEnd); err != nil {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+	}
+	if err := right.sm.beginLocalMerge(left.cfg.ID, right.cfg.ID, rightStart, rightEnd); err != nil {
+		left.sm.abortLocalAdmin()
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+	}
+	committed := false
 	defer func() {
+		if committed {
+			return
+		}
+		left.sm.abortLocalAdmin()
+		right.sm.abortLocalAdmin()
+		proposeAdminClear(ctx, left, model.CommandMergePrepare, op)
+		proposeAdminClear(ctx, right, model.CommandMergePrepare, op)
 		left.sm.clearFreeze()
 		right.sm.clearFreeze()
 	}()
+
 	if left.node.IsLeader() {
-		if err := proposeWhileLeader(ctx, left, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
+		if err := proposeWhileLeader(ctx, left, entry); err != nil {
 			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 		}
 	}
 	if right.node.IsLeader() {
-		if err := proposeWhileLeader(ctx, right, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
+		if err := proposeWhileLeader(ctx, right, entry); err != nil {
 			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 		}
 	}
-
-	deadline := time.Now().Add(30 * time.Second)
-	lastTry := time.Time{}
-	for {
-		if time.Since(lastTry) > 250*time.Millisecond {
-			tryPrepare(ctx, left, model.Entry{Type: model.CommandMergePrepare, Value: payload})
-			tryPrepare(ctx, right, model.Entry{Type: model.CommandMergePrepare, Value: payload})
-			lastTry = time.Now()
-		}
-		ll, lr := left.sm.mergePrepared()
-		rl, rr := right.sm.mergePrepared()
-		if ll == left.cfg.ID && lr == right.cfg.ID && rl == left.cfg.ID && rr == right.cfg.ID {
-			break
-		}
-		if time.Now().After(deadline) {
-			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "merge prepare timeout"}, nil
-		}
-		select {
-		case <-ctx.Done():
-			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "canceled"}, nil
-		case <-time.After(20 * time.Millisecond):
-		}
+	if err := waitMergePrepared(ctx, left, right, left.cfg.ID, right.cfg.ID, entry); err != nil {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 	}
 
 	k.s.mu.Lock()
-	defer k.s.mu.Unlock()
 	if k.s.stopped {
+		k.s.mu.Unlock()
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "stopped"}, nil
 	}
 	if k.s.hostedGroup(left.cfg.ID) != left || k.s.hostedGroup(right.cfg.ID) != right {
 		// Membership removed one side while this RPC waited for s.mu. Report
 		// the idempotent case when the left group already covers the right end.
-		if k.s.hostedGroup(left.cfg.ID) == left && left.merged(right.cfg.ID) {
+		dropped := k.s.hostedGroup(left.cfg.ID) == left && left.merged(right.cfg.ID)
+		k.s.mu.Unlock()
+		if dropped {
+			committed = true
+			k.settleMerge(ctx, left, adminOp{
+				Left: left.cfg.ID, Right: right.cfg.ID, RightStart: rightStart, RightEnd: rightEnd,
+			}, right.cfg.ID)
 			return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
 		}
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "range disappeared during merge"}, nil
 	}
-	if _, err := k.s.mergeLocalLocked(left, right); err != nil {
+	_, err = k.s.mergeLocalLocked(ctx, left, right, true)
+	k.s.mu.Unlock()
+	if err != nil {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 	}
+	committed = true
 	return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
+}
+
+// settleMerge resolves the idempotent retry path for an already-applied merge:
+// replicate the finish if this replica leads, then clear the local barrier.
+func (k *kvService) settleMerge(ctx context.Context, left *rangeGroup, op adminOp, rightID uint64) {
+	op.Op = adminOpFinish
+	if entry, err := adminEntry(model.CommandMergePrepare, op); err == nil && left.node.IsLeader() {
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = proposeAdminEntry(pctx, left, entry)
+		cancel()
+	}
+	left.markMerged(rightID)
+	left.sm.forceFinishedMerge()
 }
 
 func (k *kvService) Status(_ context.Context, req *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {

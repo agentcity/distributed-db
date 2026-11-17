@@ -31,6 +31,33 @@
 // startTS and commitTS are supplied by the caller (normally a TSO); this
 // package only requires commitTS > startTS and that no two transactions reuse
 // a timestamp. It never reads a wall clock.
+//
+// # Commit apply barrier
+//
+// A commit can have a commitTS at or below a snapshot timestamp T while its
+// engine batch has not reached the engine yet; 1PC commits write no lock, so
+// ScanForBackup cannot detect them. Store closes that gap in-process with an
+// in-memory apply barrier:
+//
+//	lease := store.AcquireCommitLease(commitTS) // before the TSO is exposed
+//	// allocate/propose/apply the commit
+//	lease.Release()                             // after the batch is visible
+//	err := store.WaitApplied(ctx, T)            // snapshot barrier at T
+//
+// CommitSingle, CommitSingles and Commit acquire their own lease for the apply
+// window, so a barrier cannot observe the store between validation and the
+// engine batch commit. Callers must additionally hold a lease across commitTS
+// allocation and retries (the caller-side "commit lease") if they need the
+// guarantee for that window as well. AppliedTS reports a timestamp through
+// which every registered commit is currently applied, and is useful for
+// monitoring or for choosing a conservative start point.
+//
+// The barrier is process-local and not persisted. After a crash or restart it
+// is empty, so recovery/replay must finish and re-establish applied state
+// before snapshots or backups are considered safe; this package makes no claim
+// that the barrier survives a restart. Release means the engine batch Commit
+// returned, not that the write is durable: durability follows the storage
+// engine's SyncWrites policy.
 package mvcc
 
 import (
@@ -111,13 +138,15 @@ type Mutation struct {
 // Store is a versioned view over a storage.Engine. It is safe for concurrent
 // use as long as the underlying engine is.
 type Store struct {
-	engine storage.Engine
+	engine  storage.Engine
+	barrier *commitBarrier
 }
 
 // New returns a Store backed by engine. The store does not own the engine and
-// does not close it.
+// does not close it. The returned store starts with an empty in-memory commit
+// barrier.
 func New(engine storage.Engine) *Store {
-	return &Store{engine: engine}
+	return &Store{engine: engine, barrier: newCommitBarrier()}
 }
 
 // writeRecord is the decoded value of a write column entry.

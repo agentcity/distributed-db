@@ -8,6 +8,19 @@ option go_package = "distributed-db/internal/pb/v2;pbv2";
 service KVService {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Scan(ScanRequest) returns (ScanResponse);
+  // ScanForBackup is the lock-aware variant of Scan used by logical backups.
+  // It returns the same visible key/value set as Scan at ts, but fails closed
+  // with locked=true (and error="locked") when a lock with startTS <= ts is
+  // present anywhere in [start, end), including a key that has never been
+  // committed. That is what lets a remote backup distinguish "no value" from
+  // "a transaction may still become visible below the snapshot TSO".
+  //
+  // The RPC and its messages are additive: older servers answer Unimplemented,
+  // which a strict backup client treats as a hard error; older clients never
+  // call the method. The response keeps the historical in-band string error,
+  // but locked/locked_key/lock_ts carry structured details so a client can
+  // build a precise lock error instead of parsing error text.
+  rpc ScanForBackup(ScanForBackupRequest) returns (ScanForBackupResponse);
   rpc Prewrite(PrewriteRequest) returns (PrewriteResponse);
   rpc Commit(CommitRequest) returns (CommitResponse);
   rpc CommitSingle(CommitSingleRequest) returns (CommitSingleResponse);
@@ -100,6 +113,36 @@ message ScanResponse {
   repeated KV kvs = 1;
   string leader = 2;
   string error = 3;
+}
+
+// ScanForBackupRequest asks one range for a lock-aware snapshot scan.
+//
+// range_id is optional: 0 lets the server resolve the range from start, which
+// is what the backup RemoteScanner adapter uses so a concurrent split/merge is
+// still rejected through the normal epoch check rather than pinned to a stale
+// descriptor. A non-zero range_id pins the request to that range and must
+// contain [start, end).
+message ScanForBackupRequest {
+  uint64 range_id = 1;
+  bytes start = 2;
+  bytes end = 3;
+  uint64 ts = 4;
+  int32 limit = 5;
+}
+// ScanForBackupResponse is the lock-aware counterpart of ScanResponse.
+//
+// locked is true when the server found a lock with startTS <= ts in the
+// requested interval. In that case kvs is empty: a partial result must never be
+// mistaken for a complete snapshot. locked_key and lock_ts identify the first
+// blocking lock. error is "locked" for this case; other failures use the
+// existing opError categories ("not leader", "range mismatch", ...).
+message ScanForBackupResponse {
+  repeated KV kvs = 1;
+  string leader = 2;
+  string error = 3;
+  bool locked = 4;
+  bytes locked_key = 5;
+  uint64 lock_ts = 6;
 }
 
 message Mutation {
@@ -384,6 +427,8 @@ message SnapshotMembership {
   repeated string voters = 1;
   repeated string learners = 2;
   uint64 config_epoch = 3;
+  repeated string voters_old = 4;
+  bool auto_finalize = 5;
 }
 message Snapshot {
   uint64 index = 1;

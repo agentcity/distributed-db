@@ -11,33 +11,44 @@ import (
 
 // Membership model
 //
-// Node.voters holds every voting member, including the local node when it is a
-// voter. Node.cfg.Peers is only the bootstrap configuration ("the other
-// members"): after New the mutable voters/learners sets are authoritative and
-// are what quorum, elections and replication use.
+// Node.voters holds the current voter set C_new (or the only voter set outside
+// a joint configuration). While Node.votersOld is non-empty the node is joint:
+// C_old and C_new both vote, both must reach a majority for elections, quorum
+// leases and commits, and no other configuration change is allowed until the
+// final C_new entry is applied. Node.learners is the single learner set.
 //
-// Voters is kept sorted so membership is deterministic on every replica and in
-// the persisted record. Learners are non-voting: the leader replicates to them,
-// but they never campaign, never grant votes, and never count toward a quorum
-// or commit index.
+// Node.cfg.Peers is only the bootstrap configuration ("the other members"):
+// after New the mutable sets are authoritative and are what quorum, elections
+// and replication use. Voters is kept sorted so membership is deterministic on
+// every replica and in the persisted record. Learners are non-voting: the
+// leader replicates to them, but they never campaign, never grant votes and
+// never count toward a quorum.
 //
-// This implementation changes one server at a time and has no joint consensus
-// (see the package documentation on membership). Every change is a replicated
-// entry applied in log order on every node; callers wait for it to commit and
-// apply before it returns, so there is never more than one in-flight change.
+// Every change is a replicated entry applied in log order on every node. The
+// single-change APIs use joint consensus: they first append C_old,new with
+// AutoFinalize set, then the leader appends C_new once the joint entry is
+// applied. A caller waits until C_new is applied, so other configuration
+// changes cannot overlap it; the joint state itself also rejects them.
+//
+// Membership is applied only when the entry is committed (the apply loop runs
+// only up to commitIndex). Snapshots embed the applied configuration, including
+// C_old and the auto-finalize intent, so a restart or a snapshot install cannot
+// resurrect a stale voter set.
 
-// Membership returns copies of the current voter and learner sets. Voters
-// includes the local node when it is a voter.
+// Membership returns copies of the current voting membership (the union of both
+// voter sets while joint) and the learner set. Voters includes the local node
+// when it is a voter.
 func (n *Node) Membership() (voters, learners []string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return append([]string(nil), n.voters...), n.learnerListLocked()
+	return n.votingMembersLocked(), n.learnerListLocked()
 }
 
 // AddLearner registers peer as a non-voting member of the group and waits for
 // the change to commit and apply. It must be called on the leader. Adding a
 // peer that is already a voter returns ErrAlreadyVoter, and an existing learner
-// returns ErrAlreadyLearner.
+// returns ErrAlreadyLearner. The change is a joint configuration whose two
+// voter sets are equal.
 func (n *Node) AddLearner(ctx context.Context, peer string) error {
 	return n.changeMembership(ctx, model.CommandAddLearner, peer)
 }
@@ -52,16 +63,19 @@ func (n *Node) PromoteLearner(ctx context.Context, peer string) error {
 }
 
 // RemoveVoter removes a voter from the group and waits for the change to commit
-// and apply. It must be called on the leader. Removing the leader itself is
-// rejected: leadership must be transferred first. Removing the last voter is
-// rejected as unsafe.
+// and apply. It must be called on the leader. Removing the leader is allowed:
+// the leader keeps leading through the joint configuration (it is still in
+// C_old) and steps down only after C_new, which excludes it, is applied.
+// Removing the last voter is rejected as unsafe.
 func (n *Node) RemoveVoter(ctx context.Context, peer string) error {
 	return n.changeMembership(ctx, model.CommandRemoveVoter, peer)
 }
 
-// changeMembership validates one single-server membership change, appends it
-// as a replicated config entry and waits for it to be applied. The
-// configInFlight gate enforces "one change at a time" even when callers race.
+// changeMembership implements one single-server change as enter-joint followed
+// by leave-joint. It computes the target configuration under mu, proposes the
+// joint entry with AutoFinalize set, then waits for the final entry. The leader
+// appends C_new automatically (apply-side signal); a later leader repairs the
+// change if this one loses leadership first.
 func (n *Node) changeMembership(ctx context.Context, typ model.CommandType, peer string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -79,85 +93,170 @@ func (n *Node) changeMembership(ctx context.Context, typ model.CommandType, peer
 		n.mu.Unlock()
 		return ErrNotLeader
 	}
-	if n.configInFlight {
+	if n.configInFlight || n.isJointLocked() {
 		n.mu.Unlock()
 		return ErrConfigChangeInProgress
 	}
-	if err := n.validateMembershipChangeLocked(typ, peer); err != nil {
+	voters, learners, err := n.targetConfigLocked(typ, peer)
+	if err != nil {
 		n.mu.Unlock()
 		return err
+	}
+	data := ConfigEntryData{
+		VotersOld:    append([]string(nil), n.voters...),
+		Voters:       voters,
+		Learners:     learners,
+		AutoFinalize: true,
+		Epoch:        n.configEpoch + 1,
 	}
 	n.configInFlight = true
 	n.mu.Unlock()
 
-	_, err := n.Propose(ctx, model.Entry{Type: typ, Key: peer})
-	if err == nil {
-		// Propose returns after the apply loop consumed the entry, and
-		// applyConfigEntry has already cleared the gate.
-		return nil
+	if err := n.proposeJointConfig(ctx, data); err != nil {
+		n.mu.Lock()
+		jointApplied := n.isJointLocked() && n.configEpoch >= data.Epoch && n.autoFinalize
+		finalApplied := !n.isJointLocked() && n.configEpoch >= data.Epoch+1
+		n.mu.Unlock()
+		if !jointApplied && !finalApplied {
+			return err
+		}
 	}
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	// A timeout or cancellation can leave a durable entry that may still
-	// commit. Keep the gate closed so a second change cannot overlap; it is
-	// cleared when the entry is applied or when this node stops being leader.
-	if n.role != Leader || n.stopped ||
-		(!errors.Is(err, ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)) {
-		n.configInFlight = false
-	}
-	return err
+	// Wait until C_new is applied. The automatic finalizer appends it as soon
+	// as the joint entry is applied on the leader; a new leader does the same
+	// after an election, so waiting through a leadership change is safe.
+	return n.waitConfig(ctx, func() bool {
+		return !n.isJointLocked() && n.configEpoch >= data.Epoch+1
+	})
 }
 
-// validateMembershipChangeLocked checks one change against the current
-// membership. Caller holds mu.
-func (n *Node) validateMembershipChangeLocked(typ model.CommandType, peer string) error {
+// targetConfigLocked computes the target C_new for one single-change command.
+// Caller holds mu and has checked that the node is leader and not joint.
+func (n *Node) targetConfigLocked(typ model.CommandType, peer string) (voters, learners []string, err error) {
 	switch typ {
 	case model.CommandAddLearner:
-		if n.isVoterLocked(peer) {
-			return fmt.Errorf("%w: %s", ErrAlreadyVoter, peer)
+		if n.isVotingMemberLocked(peer) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrAlreadyVoter, peer)
 		}
 		if n.isLearnerLocked(peer) {
-			return fmt.Errorf("%w: %s", ErrAlreadyLearner, peer)
+			return nil, nil, fmt.Errorf("%w: %s", ErrAlreadyLearner, peer)
 		}
+		voters = append([]string(nil), n.voters...)
+		learners = append(n.learnerListLocked(), peer)
+		sort.Strings(learners)
+		return voters, learners, nil
 	case model.CommandPromoteLearner:
+		if n.isVotingMemberLocked(peer) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrAlreadyVoter, peer)
+		}
 		if !n.isLearnerLocked(peer) {
-			if n.isVoterLocked(peer) {
-				return fmt.Errorf("%w: %s", ErrAlreadyVoter, peer)
+			return nil, nil, fmt.Errorf("%w: %s", ErrNotLearner, peer)
+		}
+		voters = append(append([]string(nil), n.voters...), peer)
+		sort.Strings(voters)
+		for _, l := range n.learnerListLocked() {
+			if l != peer {
+				learners = append(learners, l)
 			}
-			return fmt.Errorf("%w: %s", ErrNotLearner, peer)
 		}
+		return voters, learners, nil
 	case model.CommandRemoveVoter:
-		if peer == n.cfg.ID {
-			return fmt.Errorf("%w: cannot remove the current leader %s; transfer leadership first",
-				ErrUnsafeConfigChange, peer)
-		}
-		if !n.isVoterLocked(peer) {
-			return fmt.Errorf("%w: %s", ErrNotVoter, peer)
+		if !n.isVotingMemberLocked(peer) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrNotVoter, peer)
 		}
 		if len(n.voters) <= 1 {
-			return fmt.Errorf("%w: cannot remove the last voter %s", ErrUnsafeConfigChange, peer)
+			return nil, nil, fmt.Errorf("%w: cannot remove the last voter %s", ErrUnsafeConfigChange, peer)
 		}
+		for _, v := range n.voters {
+			if v != peer {
+				voters = append(voters, v)
+			}
+		}
+		for _, l := range n.learnerListLocked() {
+			if l != peer {
+				learners = append(learners, l)
+			}
+		}
+		return voters, learners, nil
 	default:
-		return fmt.Errorf("raft: %q is not a membership command", typ)
+		return nil, nil, fmt.Errorf("raft: %q is not a membership command", typ)
 	}
-	return nil
 }
 
 // applyConfigEntry applies one committed membership command. It is called by
 // the apply loop instead of the application state machine and is deterministic:
-// every replica applies the same entries in the same order.
+// every replica applies the same entries in the same order. Configuration
+// changes take effect only here, after commit.
 func (n *Node) applyConfigEntry(entry model.Entry) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopped {
 		return ErrStopped
 	}
-	peer := entry.Key
-	if peer == "" {
-		return fmt.Errorf("raft: %q config entry with empty peer", entry.Type)
+
+	var (
+		changed bool
+		err     error
+	)
+	switch entry.Type {
+	case CommandJointConfig:
+		changed, err = n.applyJointConfigLocked(entry)
+	case CommandFinalConfig:
+		changed, err = n.applyFinalConfigLocked(entry)
+	case model.CommandAddLearner, model.CommandPromoteLearner, model.CommandRemoveVoter:
+		if n.isJointLocked() {
+			return fmt.Errorf("%w: legacy config entry while joint", ErrConfigChangeInProgress)
+		}
+		changed, err = n.applyLegacyConfigLocked(entry)
+	default:
+		return fmt.Errorf("raft: %q is not a config entry", entry.Type)
+	}
+	if err != nil {
+		return err
 	}
 
+	// Keep the one-change gate closed while joint; the final entry clears it.
+	if n.isJointLocked() {
+		n.configInFlight = true
+	} else {
+		n.configInFlight = false
+		n.finalInFlight = false
+	}
+
+	var persistErr error
+	if changed {
+		persistErr = n.persistConfigLocked()
+	}
+	n.syncReplicatorsLocked()
+	n.signalAllLocked()
+	// Configuration waiters are notified by the apply loop after lastApplied
+	// advances, so a caller that observes the new configuration also sees the
+	// snapshot/index state that includes it.
+	// A single-change joint configuration is completed by the dedicated
+	// finalizer goroutine; EnterJoint leaves AutoFinalize false and waits for
+	// an explicit LeaveJoint.
+	n.signalAutoFinalLocked()
+	if !n.selfIsVoterLocked() && (n.role == Leader || n.role == Candidate) {
+		// The applied configuration excludes this node from every voter set;
+		// it can no longer lead or campaign. A learner may remain a follower.
+		n.stepDownWithErrorLocked("", ErrNotLeader)
+	}
+	if persistErr != nil {
+		n.logger.Error("raft: persist membership failed", "id", n.cfg.ID, "error", persistErr)
+		return persistErr
+	}
+	return nil
+}
+
+// applyLegacyConfigLocked applies one of the original single-server commands.
+// New code writes joint entries instead, but a log created by an older version
+// (or an entry proposed before an upgrade) must still apply deterministically.
+// Caller holds mu.
+func (n *Node) applyLegacyConfigLocked(entry model.Entry) (bool, error) {
+	peer := entry.Key
+	if peer == "" {
+		return false, fmt.Errorf("raft: %q config entry with empty peer", entry.Type)
+	}
 	beforeVoters := append([]string(nil), n.voters...)
 	beforeLearners := n.learnerListLocked()
 
@@ -174,97 +273,69 @@ func (n *Node) applyConfigEntry(entry model.Entry) error {
 		n.removeVoterLocked(peer)
 		delete(n.learners, peer)
 	default:
-		return fmt.Errorf("raft: %q is not a config entry", entry.Type)
+		return false, fmt.Errorf("raft: %q is not a config entry", entry.Type)
 	}
 
 	voters := append([]string(nil), n.voters...)
 	learners := n.learnerListLocked()
-	// Advance the config epoch only when this entry actually changes the
-	// voter/learner sets. Replaying an entry that is already reflected in a
-	// restored snapshot is then a no-op for the epoch, so a snapshot's
-	// config epoch stays comparable across replicas.
-	if !equalStrings(voters, beforeVoters) || !equalStrings(learners, beforeLearners) {
+	// Advance the epoch only when this entry actually changes the sets. A
+	// replayed legacy entry is then a no-op for the epoch.
+	changed := !equalStrings(voters, beforeVoters) || !equalStrings(learners, beforeLearners)
+	if changed {
 		n.configEpoch++
 	}
-	persistErr := n.persistMembershipLocked(voters, learners)
-
-	// The committed entry is authoritative even if the durable membership
-	// record failed: keep serving with the new membership and report the
-	// persistence failure to the proposal waiter.
-	n.configInFlight = false
-	n.syncReplicatorsLocked()
-	n.signalAllLocked()
-	if !n.selfIsVoterLocked() && (n.role == Leader || n.role == Candidate) {
-		// The committed configuration no longer contains this node, so it
-		// cannot lead or campaign. A learner may remain a follower.
-		n.stepDownWithErrorLocked("", ErrNotLeader)
-	}
-	if persistErr != nil {
-		n.logger.Error("raft: persist membership failed", "id", n.cfg.ID, "error", persistErr)
-	}
-	return persistErr
+	return changed, nil
 }
 
-// persistMembershipLocked saves the voter/learner sets through the optional
-// MembershipStore capability. Stores without it keep membership only in memory
-// and in the replicated log. Caller holds mu.
-func (n *Node) persistMembershipLocked(voters, learners []string) error {
-	return saveMembership(n.store, voters, learners, n.configEpoch)
+// persistConfigLocked saves the applied configuration through the optional
+// membership capabilities. Stores without them keep membership only in memory
+// and in the replicated log/snapshots. Caller holds mu.
+func (n *Node) persistConfigLocked() error {
+	return saveConfigState(n.store, n.configStateLocked())
 }
 
-// saveMembership persists membership and, when the store supports it, the
-// config epoch. A legacy MembershipStore only receives the sets; the epoch is
-// then reconstructed on the next start.
-func saveMembership(store LogStore, voters, learners []string, epoch uint64) error {
-	if mes, ok := store.(MembershipEpochStore); ok {
-		return mes.SaveMembershipEpoch(voters, learners, epoch)
-	}
-	if ms, ok := store.(MembershipStore); ok {
-		return ms.SaveMembership(voters, learners)
-	}
-	return nil
-}
-
-// initMembership recovers the membership from the snapshot, then the store,
+// initMembership recovers the configuration from the snapshot, then the store,
 // then the static Config. The snapshot wins when its config epoch is at least
 // the persisted epoch, so a node that missed membership changes and restarts
 // after installing a snapshot cannot keep a stale voter set. A snapshot without
-// membership (legacy) always falls back to the persisted record or Config.
-//
-// The returned voters always include the local node when they came from the
-// static configuration, sorted; the local node is a learner instead when
-// cfg.Learner is set (and was not overridden by a persisted record).
-func initMembership(cfg Config, store LogStore, snapMembership *SnapshotMembership) ([]string, []string, uint64, error) {
-	var persistedVoters, persistedLearners []string
-	var persistedEpoch uint64
-	if mes, ok := store.(MembershipEpochStore); ok {
+// membership (legacy) falls back to the persisted record or Config.
+func initMembership(cfg Config, store LogStore, snapMembership *SnapshotMembership) (configState, error) {
+	var persisted configState
+	var hasPersisted bool
+	if js, ok := store.(JointMembershipStore); ok {
+		votersOld, voters, learners, auto, epoch, err := js.LoadJointMembership()
+		if err != nil {
+			return configState{}, fmt.Errorf("raft: load membership: %w", err)
+		}
+		persisted, hasPersisted = canonicalConfigState(votersOld, voters, learners, auto, epoch)
+	} else if mes, ok := store.(MembershipEpochStore); ok {
 		voters, learners, epoch, err := mes.LoadMembershipEpoch()
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("raft: load membership: %w", err)
+			return configState{}, fmt.Errorf("raft: load membership: %w", err)
 		}
-		persistedVoters, persistedLearners, persistedEpoch = voters, learners, epoch
+		persisted, hasPersisted = canonicalConfigState(nil, voters, learners, false, epoch)
 	} else if ms, ok := store.(MembershipStore); ok {
 		voters, learners, err := ms.LoadMembership()
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("raft: load membership: %w", err)
+			return configState{}, fmt.Errorf("raft: load membership: %w", err)
 		}
-		persistedVoters, persistedLearners = voters, learners
+		persisted, hasPersisted = canonicalConfigState(nil, voters, learners, false, 0)
 	}
 
 	snapMembership, err := normalizeSnapshotMembership(snapMembership)
 	if err != nil {
-		return nil, nil, 0, err
+		return configState{}, err
 	}
 
 	if cfg.ForceLearner {
 		voters := canonicalVoters(cfg.Peers)
 		if len(voters) == 0 {
-			return nil, nil, 0, errors.New("raft: learner configuration has no voters")
+			return configState{}, errors.New("raft: learner configuration has no voters")
 		}
 		learners := canonicalLearners([]string{cfg.ID}, voters)
 		// ForceLearner deliberately replaces the configuration with a fresh
 		// one, so advance past any epoch this node may already have seen.
-		epoch := persistedEpoch
+		epoch := persisted.epoch
 		if snapMembership != nil && snapMembership.ConfigEpoch > epoch {
 			epoch = snapMembership.ConfigEpoch
 		}
@@ -273,48 +344,75 @@ func initMembership(cfg Config, store LogStore, snapMembership *SnapshotMembersh
 		} else {
 			epoch++
 		}
-		return voters, learners, epoch, nil
+		return configState{voters: voters, learners: learners, epoch: epoch}, nil
 	}
 
-	if snapMembership != nil && (len(persistedVoters) == 0 || snapMembership.ConfigEpoch >= persistedEpoch) {
+	if snapMembership != nil && (!hasPersisted || snapMembership.ConfigEpoch >= persisted.epoch) {
 		// The snapshot is at least as new as the persisted membership. Persist
 		// the reconciled state so a restart without the snapshot (or with a
 		// different load path) still sees the same configuration.
-		if err := saveMembership(store, snapMembership.Voters, snapMembership.Learners, snapMembership.ConfigEpoch); err != nil {
-			return nil, nil, 0, fmt.Errorf("raft: persist snapshot membership: %w", err)
+		state := configState{
+			votersOld:    append([]string(nil), snapMembership.VotersOld...),
+			voters:       append([]string(nil), snapMembership.Voters...),
+			learners:     append([]string(nil), snapMembership.Learners...),
+			autoFinalize: snapMembership.AutoFinalize,
+			epoch:        snapMembership.ConfigEpoch,
 		}
-		return append([]string(nil), snapMembership.Voters...), append([]string(nil), snapMembership.Learners...),
-			snapMembership.ConfigEpoch, nil
+		if err := saveConfigState(store, state); err != nil {
+			return configState{}, fmt.Errorf("raft: persist snapshot membership: %w", err)
+		}
+		return state, nil
 	}
 
-	if len(persistedVoters) > 0 {
-		epoch := persistedEpoch
-		if epoch == 0 {
+	if hasPersisted {
+		if persisted.epoch == 0 {
 			// A record written before config epochs existed is the initial
 			// configuration.
-			epoch = 1
+			persisted.epoch = 1
 		}
-		voters := canonicalVoters(persistedVoters)
-		return voters, canonicalLearners(persistedLearners, voters), epoch, nil
+		return persisted, nil
 	}
 
 	if cfg.Learner {
 		voters := canonicalVoters(cfg.Peers)
 		if len(voters) == 0 {
-			return nil, nil, 0, errors.New("raft: learner configuration has no voters")
+			return configState{}, errors.New("raft: learner configuration has no voters")
 		}
 		learners := canonicalLearners([]string{cfg.ID}, voters)
-		return voters, learners, 1, nil
+		return configState{voters: voters, learners: learners, epoch: 1}, nil
 	}
 	voters := canonicalVoters(append(append([]string(nil), cfg.Peers...), cfg.ID))
-	return voters, nil, 1, nil
+	return configState{voters: voters, epoch: 1}, nil
+}
+
+// canonicalConfigState normalizes a persisted record. It tolerates empty and
+// duplicate ids from legacy records but reports "not persisted" when no voter
+// set was ever written.
+func canonicalConfigState(votersOld, voters, learners []string, auto bool, epoch uint64) (configState, bool) {
+	voters = canonicalVoters(voters)
+	if len(voters) == 0 {
+		return configState{}, false
+	}
+	votersOld = canonicalVoters(votersOld)
+	learners = canonicalLearners(learners, append(append([]string(nil), voters...), votersOld...))
+	if len(votersOld) == 0 {
+		auto = false
+	}
+	return configState{
+		votersOld:    votersOld,
+		voters:       voters,
+		learners:     learners,
+		autoFinalize: auto,
+		epoch:        epoch,
+	}, true
 }
 
 // normalizeSnapshotMembership validates a membership envelope and returns a
 // canonical copy (sorted, de-duplicated slices). A nil envelope is a legacy
 // snapshot and passes through as nil. Corrupt values are rejected: a present
 // envelope must have a positive config epoch, at least one voter, no empty ids,
-// no duplicates, and no id that is both a voter and a learner.
+// no duplicates, no id that is both a voter and a learner, and an old voter set
+// exactly when it is joint (AutoFinalize requires one).
 func normalizeSnapshotMembership(m *SnapshotMembership) (*SnapshotMembership, error) {
 	if m == nil {
 		return nil, nil
@@ -322,48 +420,63 @@ func normalizeSnapshotMembership(m *SnapshotMembership) (*SnapshotMembership, er
 	if m.ConfigEpoch == 0 {
 		return nil, fmt.Errorf("%w: missing config epoch", ErrInvalidSnapshotMembership)
 	}
-	if len(m.Voters) == 0 {
+	voters, err := canonicalSnapshotIDs(m.Voters, "voter")
+	if err != nil {
+		return nil, err
+	}
+	if len(voters) == 0 {
 		return nil, fmt.Errorf("%w: no voters", ErrInvalidSnapshotMembership)
 	}
-	seen := make(map[string]bool, len(m.Voters)+len(m.Learners))
-	voters := make([]string, 0, len(m.Voters))
-	for _, v := range m.Voters {
-		if v == "" {
-			return nil, fmt.Errorf("%w: empty voter id", ErrInvalidSnapshotMembership)
-		}
-		if seen[v] {
-			return nil, fmt.Errorf("%w: duplicate id %q", ErrInvalidSnapshotMembership, v)
-		}
-		seen[v] = true
-		voters = append(voters, v)
+	votersOld, err := canonicalSnapshotIDs(m.VotersOld, "old voter")
+	if err != nil {
+		return nil, err
 	}
-	learners := make([]string, 0, len(m.Learners))
-	for _, l := range m.Learners {
-		if l == "" {
-			return nil, fmt.Errorf("%w: empty learner id", ErrInvalidSnapshotMembership)
-		}
-		if seen[l] {
-			return nil, fmt.Errorf("%w: duplicate or overlapping id %q", ErrInvalidSnapshotMembership, l)
-		}
-		seen[l] = true
-		learners = append(learners, l)
+	learners, err := canonicalSnapshotIDs(m.Learners, "learner")
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(voters)
-	sort.Strings(learners)
+	seen := make(map[string]bool, len(voters)+len(votersOld))
+	for _, id := range voters {
+		seen[id] = true
+	}
+	for _, id := range votersOld {
+		seen[id] = true
+	}
+	for _, id := range learners {
+		if seen[id] {
+			return nil, fmt.Errorf("%w: %q is both a voter and a learner", ErrInvalidSnapshotMembership, id)
+		}
+	}
+	if m.AutoFinalize && len(votersOld) == 0 {
+		return nil, fmt.Errorf("%w: auto-finalize on a non-joint membership", ErrInvalidSnapshotMembership)
+	}
 	return &SnapshotMembership{
-		Voters:      voters,
-		Learners:    learners,
-		ConfigEpoch: m.ConfigEpoch,
+		Voters:       voters,
+		VotersOld:    votersOld,
+		Learners:     learners,
+		AutoFinalize: m.AutoFinalize,
+		ConfigEpoch:  m.ConfigEpoch,
 	}, nil
 }
 
-// snapshotMembershipLocked returns the current membership as a snapshot
-// envelope. Caller holds mu. The result is always non-nil and canonical.
+func canonicalSnapshotIDs(ids []string, what string) ([]string, error) {
+	out, err := canonicalConfigIDs(ids, what)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSnapshotMembership, err)
+	}
+	return out, nil
+}
+
+// snapshotMembershipLocked returns the current configuration as a snapshot
+// envelope. Caller holds mu. The result is always non-nil and canonical, and
+// preserves the joint old set and auto-finalize intent.
 func (n *Node) snapshotMembershipLocked() *SnapshotMembership {
 	return &SnapshotMembership{
-		Voters:      append([]string(nil), n.voters...),
-		Learners:    n.learnerListLocked(),
-		ConfigEpoch: n.configEpoch,
+		Voters:       append([]string(nil), n.voters...),
+		VotersOld:    append([]string(nil), n.votersOld...),
+		Learners:     n.learnerListLocked(),
+		AutoFinalize: n.autoFinalize,
+		ConfigEpoch:  n.configEpoch,
 	}
 }
 
@@ -371,8 +484,9 @@ func (n *Node) snapshotMembershipLocked() *SnapshotMembership {
 // envelope carried by an installed snapshot and persists it. A nil envelope
 // (legacy snapshot) leaves the current membership untouched. The snapshot is
 // authoritative: any stale voter or learner is removed, the config epoch moves
-// to the snapshot's epoch, and a leader/candidate that is no longer a voter
-// steps down. Caller holds mu.
+// to the snapshot's epoch (never backwards), and a leader/candidate that is no
+// longer a voter in any of the snapshot's voter sets steps down. Caller holds
+// mu.
 func (n *Node) applySnapshotMembershipLocked(m *SnapshotMembership) error {
 	if m == nil {
 		return nil
@@ -385,20 +499,21 @@ func (n *Node) applySnapshotMembershipLocked(m *SnapshotMembership) error {
 		return fmt.Errorf("%w: snapshot epoch %d, local epoch %d",
 			ErrStaleSnapshotMembership, normalized.ConfigEpoch, n.configEpoch)
 	}
-
+	n.votersOld = append([]string(nil), normalized.VotersOld...)
 	n.voters = append([]string(nil), normalized.Voters...)
-	n.learners = make(map[string]bool, len(normalized.Learners))
-	for _, l := range normalized.Learners {
-		n.learners[l] = true
-	}
+	n.learners = stringSet(normalized.Learners)
+	n.autoFinalize = normalized.AutoFinalize
 	n.configEpoch = normalized.ConfigEpoch
-	n.configInFlight = false
+	n.configInFlight = n.isJointLocked()
+	n.finalInFlight = false
 	n.syncReplicatorsLocked()
 	n.signalAllLocked()
+	n.notifyConfigLocked()
+	n.signalAutoFinalLocked()
 	if !n.selfIsVoterLocked() && (n.role == Leader || n.role == Candidate) {
 		n.stepDownWithErrorLocked("", ErrNotLeader)
 	}
-	if err := n.persistMembershipLocked(n.voters, normalized.Learners); err != nil {
+	if err := n.persistConfigLocked(); err != nil {
 		n.logger.Error("raft: persist snapshot membership failed", "id", n.cfg.ID, "error", err)
 		return err
 	}
@@ -447,6 +562,13 @@ func canonicalLearners(learners, voters []string) []string {
 	return out
 }
 
+// isJointLocked reports whether the node is in the C_old,new configuration.
+func (n *Node) isJointLocked() bool {
+	return len(n.votersOld) > 0
+}
+
+// isVoterLocked reports membership in C_new (the current voter set outside a
+// joint configuration).
 func (n *Node) isVoterLocked(id string) bool {
 	for _, v := range n.voters {
 		if v == id {
@@ -456,13 +578,57 @@ func (n *Node) isVoterLocked(id string) bool {
 	return false
 }
 
+// isOldVoterLocked reports membership in C_old while joint.
+func (n *Node) isOldVoterLocked(id string) bool {
+	for _, v := range n.votersOld {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+// isVotingMemberLocked reports whether id may vote and campaign in the current
+// configuration: it is in C_new, or in C_old while joint.
+func (n *Node) isVotingMemberLocked(id string) bool {
+	return n.isVoterLocked(id) || n.isOldVoterLocked(id)
+}
+
 func (n *Node) isLearnerLocked(id string) bool {
 	return n.learners[id]
 }
 
-// selfIsVoterLocked reports whether the local node may campaign and vote.
+// selfIsVoterLocked reports whether the local node may campaign and vote. While
+// joint this includes nodes that only C_old still contains: they remain voters
+// until C_new is applied, and step down only then if removed.
 func (n *Node) selfIsVoterLocked() bool {
-	return n.isVoterLocked(n.cfg.ID)
+	return n.isVotingMemberLocked(n.cfg.ID)
+}
+
+// votingMembersLocked returns the sorted union of C_old and C_new. Outside a
+// joint configuration it is simply the current voter set.
+func (n *Node) votingMembersLocked() []string {
+	if !n.isJointLocked() {
+		return append([]string(nil), n.voters...)
+	}
+	seen := make(map[string]bool, len(n.voters)+len(n.votersOld))
+	out := make([]string, 0, len(n.voters)+len(n.votersOld))
+	for _, v := range n.voters {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	for _, v := range n.votersOld {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (n *Node) addVoterLocked(id string) {
@@ -495,23 +661,45 @@ func (n *Node) learnerListLocked() []string {
 	return out
 }
 
-// votersExceptSelfLocked returns this node's voters excluding the local id.
-func (n *Node) votersExceptSelfLocked() []string {
-	out := make([]string, 0, len(n.voters))
-	for _, v := range n.voters {
-		if v != n.cfg.ID {
-			out = append(out, v)
+// replicationVotingMembersLocked returns the voters this leader must replicate
+// to. It is the union of the applied voter sets and the electoral sets derived
+// from config entries already in the log. Adding the pending joint target means
+// a leader starts replicating to brand-new voters as soon as it appends
+// C_old,new: without that, a joint entry that requires a majority of those new
+// voters could never commit. The applied sets are always kept, so a pending
+// final entry cannot stop replication to C_old voters before the final entry is
+// committed.
+func (n *Node) replicationVotingMembersLocked() []string {
+	applied := n.votingMembersLocked()
+	pending := electoralVotingMembers(n.electoralConfigLocked())
+	seen := make(map[string]bool, len(applied)+len(pending))
+	out := make([]string, 0, len(applied)+len(pending))
+	for _, v := range applied {
+		if seen[v] {
+			continue
 		}
+		seen[v] = true
+		out = append(out, v)
 	}
+	for _, v := range pending {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	sort.Strings(out)
 	return out
 }
 
 // replicationTargetsLocked lists every non-self peer the leader must replicate
-// to: all other voters plus every learner, sorted.
+// to: every voting member (both applied and pending sets) plus every learner,
+// sorted.
 func (n *Node) replicationTargetsLocked() []string {
-	seen := make(map[string]bool, len(n.voters)+len(n.learners))
-	out := make([]string, 0, len(n.voters)+len(n.learners))
-	for _, v := range n.voters {
+	members := n.replicationVotingMembersLocked()
+	seen := make(map[string]bool, len(members)+len(n.learners))
+	out := make([]string, 0, len(members)+len(n.learners))
+	for _, v := range members {
 		if v == n.cfg.ID || seen[v] {
 			continue
 		}
@@ -529,13 +717,27 @@ func (n *Node) replicationTargetsLocked() []string {
 	return out
 }
 
+// isReplicationTargetLocked reports whether peer is an applied or pending
+// voter, or a learner. Caller holds mu.
+func (n *Node) isReplicationTargetLocked(peer string) bool {
+	if n.isLearnerLocked(peer) {
+		return true
+	}
+	for _, v := range n.replicationVotingMembersLocked() {
+		if v == peer {
+			return true
+		}
+	}
+	return false
+}
+
 // replicationTarget reports whether peer is still a voter or learner this node
 // must replicate to. It is used by long-lived replicator loops to notice a
 // removal without a per-peer cancellation channel.
 func (n *Node) replicationTarget(peer string) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.isVoterLocked(peer) || n.isLearnerLocked(peer)
+	return n.isReplicationTargetLocked(peer)
 }
 
 // syncReplicatorsLocked starts a replicator for every new member and forgets

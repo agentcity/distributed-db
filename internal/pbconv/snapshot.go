@@ -12,9 +12,11 @@ func SnapshotMembershipToPB(m *raft.SnapshotMembership) *pbv2.SnapshotMembership
 		return nil
 	}
 	return &pbv2.SnapshotMembership{
-		Voters:      append([]string(nil), m.Voters...),
-		Learners:    append([]string(nil), m.Learners...),
-		ConfigEpoch: m.ConfigEpoch,
+		Voters:       append([]string(nil), m.Voters...),
+		Learners:     append([]string(nil), m.Learners...),
+		ConfigEpoch:  m.ConfigEpoch,
+		VotersOld:    append([]string(nil), m.VotersOld...),
+		AutoFinalize: m.AutoFinalize,
 	}
 }
 
@@ -24,8 +26,10 @@ func SnapshotMembershipFromPB(m *pbv2.SnapshotMembership) *raft.SnapshotMembersh
 		return nil
 	}
 	return &raft.SnapshotMembership{
-		Voters:      append([]string(nil), m.GetVoters()...),
-		Learners:    append([]string(nil), m.GetLearners()...),
-		ConfigEpoch: m.GetConfigEpoch(),
+		Voters:       append([]string(nil), m.GetVoters()...),
+		Learners:     append([]string(nil), m.GetLearners()...),
+		ConfigEpoch:  m.GetConfigEpoch(),
+		VotersOld:    append([]string(nil), m.GetVotersOld()...),
+		AutoFinalize: m.GetAutoFinalize(),
 	}
 }

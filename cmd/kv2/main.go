@@ -87,6 +87,7 @@ func main() {
 			DurabilityMode: *durability,
 			Logger:         log,
 			TLS:            tlsCfg,
+			AdminToken:     *adminToken,
 		})
 		if err != nil {
 			fatal(err)
