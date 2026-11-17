@@ -40,6 +40,12 @@ const (
 // AddReplica RPC is served by kvserver and is outside this package; if these
 // orchestration APIs are ever exposed over the network they need their own
 // admin authentication.
+//
+// Every outbound KV admin call made by this orchestration (AddReplica,
+// AddLearner, PromoteReplica, RemoveVoter, RemoveReplica, UpdateRangeEpoch)
+// carries Config.AdminToken through the dial helper in dial.go, so a KV node
+// started with kvserver.Config.AdminToken accepts it. Read-only Status and
+// leader probes never receive the token.
 func (s *Server) AddReplica(ctx context.Context, rangeID uint64, target string) error {
 	if ctx == nil {
 		ctx = context.Background()

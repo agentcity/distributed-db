@@ -112,12 +112,18 @@ func main() {
 	}
 }
 
-// registerAdminTokenFlag registers the meta admin-token flag. It is split out
-// so a test can assert the flag name and parsing without starting a server.
+// registerAdminTokenFlag registers the admin-token flag. It is split out so a
+// test can assert the flag name and parsing without starting a server.
+//
+// The same value protects the server's own admin surface and, in meta mode,
+// the outbound KV admin fan-out (split/merge, membership, leader transfer,
+// epoch propagation). In a cluster where meta and KV nodes both enable admin
+// auth, every node must use the same token.
 func registerAdminTokenFlag(fs *flag.FlagSet) *string {
 	return fs.String("admin-token", "",
-		"meta mode: Bearer token required on meta admin RPCs "+
-			"(SetRanges/SplitRange/MergeRanges); empty disables the check (development only)")
+		"Bearer token for this server's admin RPCs "+
+			"(meta mode: SetRanges/SplitRange/MergeRanges and outbound KV admin fan-out; "+
+			"node mode: KV admin/membership RPCs); empty disables the check (development only)")
 }
 
 // metaServerConfig assembles the meta server configuration from flags. It is a

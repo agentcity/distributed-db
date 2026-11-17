@@ -71,6 +71,11 @@ var (
 	ErrRangeMismatch = errors.New("pitr: range mismatch")
 	// ErrInvalidBase is returned when the base backup manifest is unusable.
 	ErrInvalidBase = errors.New("pitr: invalid base backup manifest")
+	// ErrArchiveIncomplete is returned when a restore target is above the
+	// newest TSO the archive actually observed for a needed range, so
+	// completeness cannot be proven. RestoreToTS fails closed unless PlanRequest.AllowUnprovenTarget
+	// is set.
+	ErrArchiveIncomplete = errors.New("pitr: archive does not prove coverage of the target tso")
 )
 
 // crc32cTable is immutable after package initialization.

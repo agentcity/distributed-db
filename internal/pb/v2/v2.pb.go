@@ -3495,19 +3495,28 @@ func (x *InstallSnapshotResponse) GetLastIndex() uint64 {
 // every chunk (zero means "not supplied"). data is at most 1 MiB. done=true
 // marks the final chunk and may carry the last bytes in data; the leader sends
 // a final done=true request with empty data at offset=total_size.
+//
+// chunk_crc32 is the IEEE CRC-32 of this chunk's data. The receiver verifies
+// it before staging the bytes, so a corrupted chunk is rejected before it can
+// pollute the partial upload. It is zero when the sender does not supply it
+// (a legacy sender, or the final empty done chunk); in that case only the
+// total crc32 remains as the end-to-end check. This field is wire-additive:
+// older servers ignore it and older senders leave it at zero.
 type InstallSnapshotChunkRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RangeId       uint64                 `protobuf:"varint,1,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
-	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
-	LeaderId      string                 `protobuf:"bytes,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
-	Index         uint64                 `protobuf:"varint,4,opt,name=index,proto3" json:"index,omitempty"`
-	SnapshotTerm  uint64                 `protobuf:"varint,5,opt,name=snapshot_term,json=snapshotTerm,proto3" json:"snapshot_term,omitempty"`
-	Offset        uint64                 `protobuf:"varint,6,opt,name=offset,proto3" json:"offset,omitempty"`
-	Data          []byte                 `protobuf:"bytes,7,opt,name=data,proto3" json:"data,omitempty"`
-	Done          bool                   `protobuf:"varint,8,opt,name=done,proto3" json:"done,omitempty"`
-	Size          int64                  `protobuf:"varint,9,opt,name=size,proto3" json:"size,omitempty"`
-	Crc32         uint32                 `protobuf:"varint,10,opt,name=crc32,proto3" json:"crc32,omitempty"`
-	Membership    *SnapshotMembership    `protobuf:"bytes,11,opt,name=membership,proto3" json:"membership,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	RangeId      uint64                 `protobuf:"varint,1,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
+	Term         uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId     string                 `protobuf:"bytes,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	Index        uint64                 `protobuf:"varint,4,opt,name=index,proto3" json:"index,omitempty"`
+	SnapshotTerm uint64                 `protobuf:"varint,5,opt,name=snapshot_term,json=snapshotTerm,proto3" json:"snapshot_term,omitempty"`
+	Offset       uint64                 `protobuf:"varint,6,opt,name=offset,proto3" json:"offset,omitempty"`
+	Data         []byte                 `protobuf:"bytes,7,opt,name=data,proto3" json:"data,omitempty"`
+	Done         bool                   `protobuf:"varint,8,opt,name=done,proto3" json:"done,omitempty"`
+	Size         int64                  `protobuf:"varint,9,opt,name=size,proto3" json:"size,omitempty"`
+	Crc32        uint32                 `protobuf:"varint,10,opt,name=crc32,proto3" json:"crc32,omitempty"`
+	Membership   *SnapshotMembership    `protobuf:"bytes,11,opt,name=membership,proto3" json:"membership,omitempty"`
+	// IEEE CRC-32 of data; 0 means not supplied (legacy sender or empty done).
+	ChunkCrc32    uint32 `protobuf:"varint,12,opt,name=chunk_crc32,json=chunkCrc32,proto3" json:"chunk_crc32,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3617,6 +3626,13 @@ func (x *InstallSnapshotChunkRequest) GetMembership() *SnapshotMembership {
 		return x.Membership
 	}
 	return nil
+}
+
+func (x *InstallSnapshotChunkRequest) GetChunkCrc32() uint32 {
+	if x != nil {
+		return x.ChunkCrc32
+	}
+	return 0
 }
 
 type InstallSnapshotChunkResponse struct {
@@ -4665,7 +4681,7 @@ const file_v2_proto_rawDesc = "" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1d\n" +
 	"\n" +
-	"last_index\x18\x03 \x01(\x04R\tlastIndex\"\xc8\x02\n" +
+	"last_index\x18\x03 \x01(\x04R\tlastIndex\"\xe9\x02\n" +
 	"\x1bInstallSnapshotChunkRequest\x12\x19\n" +
 	"\brange_id\x18\x01 \x01(\x04R\arangeId\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x1b\n" +
@@ -4680,7 +4696,9 @@ const file_v2_proto_rawDesc = "" +
 	" \x01(\rR\x05crc32\x128\n" +
 	"\n" +
 	"membership\x18\v \x01(\v2\x18.dbv2.SnapshotMembershipR\n" +
-	"membership\"\xa2\x01\n" +
+	"membership\x12\x1f\n" +
+	"\vchunk_crc32\x18\f \x01(\rR\n" +
+	"chunkCrc32\"\xa2\x01\n" +
 	"\x1cInstallSnapshotChunkResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1d\n" +

@@ -32,7 +32,7 @@ func (c *testCluster) addNode(id string, peers []string, learner bool) *raft.Nod
 	c.dirs[id] = dir
 	c.stores[id] = store
 	c.sms[id] = sm
-	c.nodes[id] = node
+	c.setNode(id, node)
 	c.net.Register(id, node)
 	if err := node.Start(c.ctx); err != nil {
 		c.t.Fatalf("Start(%s): %v", id, err)
@@ -182,7 +182,7 @@ func TestMembershipAddLearnerReplicatesAndDoesNotVote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart New: %v", err)
 	}
-	c.nodes[leaderID] = restarted
+	c.setNode(leaderID, restarted)
 	c.net.Register(leaderID, restarted)
 	if err := restarted.Start(c.ctx); err != nil {
 		t.Fatalf("restart Start: %v", err)

@@ -1135,28 +1135,11 @@ func (r *raftService) InstallSnapshotChunk(ctx context.Context, req *pbv2.Instal
 	if err != nil {
 		return nil, err
 	}
-	resp, err := g.node.HandleInstallSnapshotChunk(ctx, &raft.InstallSnapshotChunkRequest{
-		Term:         req.GetTerm(),
-		LeaderID:     req.GetLeaderId(),
-		Index:        req.GetIndex(),
-		SnapshotTerm: req.GetSnapshotTerm(),
-		Offset:       req.GetOffset(),
-		Data:         req.GetData(),
-		Done:         req.GetDone(),
-		Size:         req.GetSize(),
-		CRC32:        req.GetCrc32(),
-		Membership:   pbconv.SnapshotMembershipFromPB(req.GetMembership()),
-	})
+	resp, err := g.node.HandleInstallSnapshotChunk(ctx, pbconv.InstallSnapshotChunkRequestFromPB(req))
 	if err != nil {
 		return nil, err
 	}
-	return &pbv2.InstallSnapshotChunkResponse{
-		Term:       resp.Term,
-		Success:    resp.Success,
-		LastIndex:  resp.LastIndex,
-		Error:      resp.Error,
-		NextOffset: resp.NextOffset,
-	}, nil
+	return pbconv.InstallSnapshotChunkResponseToPB(resp), nil
 }
 
 // TimeoutNow routes a leadership-transfer trigger to the Raft node hosting

@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pbv2 "distributed-db/internal/pb/v2"
@@ -38,33 +38,23 @@ type MetaClient struct {
 	clients map[string]pbv2.MetaServiceClient
 	leader  string
 	closed  bool
+
+	// creds secures every meta connection. It is never nil: OpenMeta uses
+	// plaintext credentials and OpenMetaWithOptions builds TLS/mTLS ones.
+	creds credentials.TransportCredentials
+	// adminToken is attached as a Bearer credential to SetRanges only. It is
+	// never logged and never included in an error.
+	adminToken string
 }
 
-// OpenMeta creates a client over the given meta service addresses. At least
-// one address is required. Addresses are tried in order until the leader
-// answers.
+// OpenMeta creates a plaintext client without an admin token over the given
+// meta service addresses. At least one address is required. Addresses are
+// tried in order until the leader answers.
+//
+// Use OpenMetaWithOptions for a TLS/mTLS cluster or a meta server that
+// requires the admin token.
 func OpenMeta(seeds []string) (*MetaClient, error) {
-	clean := make([]string, 0, len(seeds))
-	seen := make(map[string]struct{}, len(seeds))
-	for _, addr := range seeds {
-		addr = strings.TrimSpace(addr)
-		if addr == "" {
-			continue
-		}
-		if _, ok := seen[addr]; ok {
-			continue
-		}
-		seen[addr] = struct{}{}
-		clean = append(clean, addr)
-	}
-	if len(clean) == 0 {
-		return nil, errors.New("backup: at least one meta address is required")
-	}
-	return &MetaClient{
-		seeds:   clean,
-		conns:   make(map[string]*grpc.ClientConn),
-		clients: make(map[string]pbv2.MetaServiceClient),
-	}, nil
+	return newMetaClient(seeds, insecure.NewCredentials(), "")
 }
 
 // Close closes every meta connection.
@@ -93,7 +83,7 @@ func (m *MetaClient) clientLocked(addr string) (pbv2.MetaServiceClient, error) {
 	if c, ok := m.clients[addr]; ok {
 		return c, nil
 	}
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(m.creds))
 	if err != nil {
 		return nil, fmt.Errorf("backup: dial meta %s: %w", addr, err)
 	}
@@ -217,7 +207,7 @@ func (m *MetaClient) SetRanges(ctx context.Context, ranges []Range) error {
 		req.Ranges = append(req.Ranges, rangeToProto(r))
 	}
 	return m.forEachCandidate(ctx, func(callCtx context.Context, c pbv2.MetaServiceClient) error {
-		resp, err := c.SetRanges(callCtx, req)
+		resp, err := c.SetRanges(m.adminCallContext(callCtx), req)
 		if err != nil {
 			return err
 		}

@@ -457,6 +457,13 @@ message InstallSnapshotResponse {
 // every chunk (zero means "not supplied"). data is at most 1 MiB. done=true
 // marks the final chunk and may carry the last bytes in data; the leader sends
 // a final done=true request with empty data at offset=total_size.
+//
+// chunk_crc32 is the IEEE CRC-32 of this chunk's data. The receiver verifies
+// it before staging the bytes, so a corrupted chunk is rejected before it can
+// pollute the partial upload. It is zero when the sender does not supply it
+// (a legacy sender, or the final empty done chunk); in that case only the
+// total crc32 remains as the end-to-end check. This field is wire-additive:
+// older servers ignore it and older senders leave it at zero.
 message InstallSnapshotChunkRequest {
   uint64 range_id = 1;
   uint64 term = 2;
@@ -469,6 +476,8 @@ message InstallSnapshotChunkRequest {
   int64 size = 9;
   uint32 crc32 = 10;
   SnapshotMembership membership = 11;
+  // IEEE CRC-32 of data; 0 means not supplied (legacy sender or empty done).
+  uint32 chunk_crc32 = 12;
 }
 message InstallSnapshotChunkResponse {
   uint64 term = 1;

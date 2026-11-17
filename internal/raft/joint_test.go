@@ -409,7 +409,7 @@ func TestJointConfigSurvivesSnapshotAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart New: %v", err)
 	}
-	c.nodes[follower] = restarted
+	c.setNode(follower, restarted)
 	c.net.Register(follower, restarted)
 	if err := restarted.Start(c.ctx); err != nil {
 		t.Fatalf("restart Start: %v", err)
@@ -447,7 +447,7 @@ func TestJointConfigSurvivesSnapshotAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart after final New: %v", err)
 	}
-	c.nodes[follower] = restarted
+	c.setNode(follower, restarted)
 	c.net.Register(follower, restarted)
 	if err := restarted.Start(c.ctx); err != nil {
 		t.Fatalf("restart after final Start: %v", err)

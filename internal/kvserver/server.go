@@ -13,12 +13,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"distributed-db/internal/audit"
+	"distributed-db/internal/grpctls"
 	"distributed-db/internal/metrics"
 	"distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
+	"distributed-db/internal/rbac"
 	"distributed-db/internal/storage"
-
-	"distributed-db/internal/grpctls"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -93,25 +94,64 @@ type Config struct {
 	LifecycleMetrics *metrics.Registry
 
 	// AdminToken protects the destructive/admin KVService RPCs with an
-	// "authorization: Bearer <token>" check. An empty value disables the check
-	// and is intended for development only; production clusters must set it.
+	// "authorization: Bearer <token>" check. An empty value leaves admin auth
+	// disabled unless AdminTokenRoles/AdminMTLSRoles configure credentials;
+	// that default keeps development clusters working, but production clusters
+	// must configure at least one credential.
+	//
+	// AdminToken always grants the admin role. Use AdminTokenRoles or
+	// AdminMTLSRoles to issue operator or read-only credentials.
 	//
 	// Protected RPCs: SplitRange, MergeRanges, AddReplica, AddLearner,
 	// PromoteReplica, RemoveVoter, RemoveReplica, TransferLeader and
 	// UpdateRangeEpoch. Data-plane RPCs (Get, Scan, Prewrite, Commit,
 	// CommitSingle, Rollback, CheckTxnStatus, ResolveLock), read-only RPCs
 	// (Status, RangeStats, Membership) and every RaftService RPC never require
-	// it. Rejections use gRPC Unauthenticated.
+	// it. Rejections use gRPC Unauthenticated (no/bad credential) or
+	// PermissionDenied (authenticated but insufficient role).
 	//
 	// The token is independent of TLS: it is checked by a unary interceptor on
 	// both plaintext and TLS/mTLS listeners, while TLS still protects the token
-	// in transit. A single token grants all admin operations; per-operator
-	// identity, RBAC scopes and an audit trail are not implemented.
+	// in transit. With AdminMTLSRoles, a role can instead come from the Common
+	// Name of a client certificate verified by the mTLS listener.
 	//
-	// Outbound fan-out from metaserver to these KV admin RPCs is not wired yet
-	// (metaserver is out of scope); see admin_auth.go and the exported
-	// WithAdminToken/AdminTokenDialOption helpers.
+	// AuditLogPath enables structured JSONL audit of protected RPC attempts
+	// (allowed, denied and handler failures). See audit.Event for the format.
+	// Empty config = historical behaviour: no admin auth, no audit.
+	//
+	// Outbound fan-out from metaserver to these KV admin RPCs is not wired yet;
+	// see the exported WithAdminToken/AdminTokenDialOption helpers.
 	AdminToken string
+
+	// AdminTokenRoles maps additional bearer tokens to RBAC roles. Accepted
+	// role values are admin, operator and read-only (case-insensitive, plus
+	// readonly/read_only). An unknown role fails New rather than defaulting to
+	// a permissive role. Tokens are stored as SHA-256 digests and are never
+	// logged or included in errors.
+	//
+	// Permission mapping: admin RPCs require cluster_admin (admin and
+	// operator); MetaService.SetRanges-style configuration is admin-only. On
+	// the KV listener every protected RPC is cluster_admin, so an operator may
+	// perform all of them and read-only may perform none.
+	AdminTokenRoles map[string]string
+
+	// AdminMTLSRoles maps the Common Name of a verified mTLS client
+	// certificate to an RBAC role. It requires TLS.Server.ClientCAFile (mTLS);
+	// New rejects the config otherwise so a plaintext peer can never spoof a
+	// CN. Token credentials take precedence over a CN when both are present.
+	AdminMTLSRoles map[string]string
+
+	// AuditLogPath enables append-only JSON Lines audit of protected RPC
+	// attempts at that path. The file is created with mode 0600 and the parent
+	// directory is created if needed. There is no built-in rotation; rotate
+	// externally and restrict access. The path requires at least one
+	// configured credential (New rejects audit without auth).
+	AuditLogPath string
+
+	// AuditLogSync fsyncs the audit file after every record. It trades
+	// throughput for durability; the default (false) relies on the OS page
+	// cache. Audit write failures are logged but do not fail the RPC.
+	AuditLogSync bool
 
 	// Storage lifecycle. A completely zero lifecycle block selects
 	// production-safe defaults so a node that does not configure maintenance
@@ -224,6 +264,15 @@ type Server struct {
 	cfg Config
 	log *slog.Logger
 
+	// authz is the admin RBAC policy. It is disabled (Enabled() == false) when
+	// no credential is configured, in which case the interceptor passes every
+	// call through, preserving historical behaviour.
+	authz *rbac.Policy
+
+	// auditLog records protected admin attempts. It is nil when audit is
+	// disabled or no server has started yet.
+	auditLog *audit.Logger
+
 	// engine is the one Pebble engine shared by every group. It is opened in
 	// New and closed in Stop after all groups have stopped.
 	engine storage.Engine
@@ -287,6 +336,23 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	// Build and validate admin RBAC and open the audit sink before touching
+	// storage, so a bad role configuration or audit path fails fast. An
+	// unconfigured server gets a disabled policy and a nil audit logger.
+	authz, err := buildKVAdminPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	auditLog, err := openKVAdminAudit(cfg)
+	if err != nil {
+		return nil, err
+	}
+	keepAudit := false
+	defer func() {
+		if !keepAudit && auditLog != nil {
+			_ = auditLog.Close()
+		}
+	}()
 	if cfg.ElectionTimeoutMin <= 0 {
 		cfg.ElectionTimeoutMin = 300 * time.Millisecond
 	}
@@ -345,6 +411,8 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		cfg:        cfg,
 		log:        cfg.Logger.With("node", cfg.ID),
+		authz:      authz,
+		auditLog:   auditLog,
 		engine:     guarded,
 		syncWrites: syncWrites,
 		peerCreds:  peerCreds,
@@ -382,11 +450,12 @@ func New(cfg Config) (*Server, error) {
 	if s.cfg.Metrics != nil {
 		opts = append(opts, grpc.ChainUnaryInterceptor(s.metricsInterceptor))
 	}
-	// Admin auth runs before the disk guard so an unauthenticated destructive
-	// call is rejected as Unauthenticated (not with a storage status) and
-	// before the handler so protected RPCs never mutate state on a bad token.
-	// An empty AdminToken makes the interceptor a pass-through.
-	opts = append(opts, grpc.ChainUnaryInterceptor(adminAuthUnaryInterceptor(s.cfg.AdminToken)))
+	// Admin auth/RBAC runs before the disk guard so an unauthenticated or
+	// forbidden destructive call is rejected as Unauthenticated /
+	// PermissionDenied (not with a storage status) and before the handler so
+	// protected RPCs never mutate state on a bad credential. A disabled policy
+	// makes the interceptor a pass-through.
+	opts = append(opts, grpc.ChainUnaryInterceptor(newKVAdminInterceptor(s.authz, s.auditLog)))
 	// Reject mutating KV RPCs with a clear ResourceExhausted status while
 	// storage is full. Reads keep working. The interceptor is cheap: one
 	// atomic load per unary RPC.
@@ -396,6 +465,7 @@ func New(cfg Config) (*Server, error) {
 	s.grpcSrv = grpc.NewServer(opts...)
 	RegisterKVServiceWithBackupScan(s.grpcSrv, s)
 	pbv2.RegisterRaftServiceServer(s.grpcSrv, &raftService{s: s})
+	keepAudit = true
 	return s, nil
 }
 
@@ -465,7 +535,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.log.Info("kvserver started",
 		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID,
 		"sync_writes", s.syncWrites, "tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
-		"admin_auth", s.cfg.AdminToken != "",
+		"admin_auth", s.authz.Enabled(), "admin_audit", s.auditLog != nil,
 		"snapshot_interval", snapshotInterval, "gc_interval", gcInterval)
 	return nil
 }
@@ -556,6 +626,12 @@ func (s *Server) stop(ctx context.Context) error {
 	if engine != nil {
 		if err := engine.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("kvserver: close shared storage: %w", err))
+		}
+	}
+	// gRPC has stopped above, so no interceptor can write concurrently.
+	if s.auditLog != nil {
+		if err := s.auditLog.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("kvserver: close admin audit log: %w", err))
 		}
 	}
 	s.log.Info("kvserver stopped")

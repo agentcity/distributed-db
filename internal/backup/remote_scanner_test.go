@@ -219,7 +219,13 @@ func TestRemoteScannerFallbackProbesCommittedKeyLock(t *testing.T) {
 	}
 }
 
-func TestBackupRequireLockAwareScanSucceedsWithRemoteScanner(t *testing.T) {
+// TestBackupRequireLockAwareScanRemoteFailsClosedWithoutBarrier records the
+// remaining integration gap: RemoteScanner has the strict server-side scan RPC
+// but no server-side applied-commit barrier. A strict remote backup must fail
+// closed rather than publish a snapshot that could miss a 1PC commit at or
+// below its TSO. The strict scan RPC itself is covered by
+// TestRemoteScannerStrictPathAvailable.
+func TestBackupRequireLockAwareScanRemoteFailsClosedWithoutBarrier(t *testing.T) {
 	ctx := context.Background()
 	cluster := startTestCluster(t, nil, nil)
 	putKV(t, cluster.client, "alpha", "one")
@@ -231,10 +237,10 @@ func TestBackupRequireLockAwareScanSucceedsWithRemoteScanner(t *testing.T) {
 		RequireLockAwareScan: true,
 		LockRetryAttempts:    1,
 	})
-	if err != nil {
-		t.Fatalf("strict backup with remote scanner: %v", err)
+	if !errors.Is(err, ErrBackupBarrierUnavailable) {
+		t.Fatalf("strict remote backup error = %v, want ErrBackupBarrierUnavailable", err)
 	}
-	if _, statErr := os.Stat(dir); statErr != nil {
-		t.Fatalf("strict backup did not publish %s: %v", dir, statErr)
+	if _, statErr := os.Stat(dir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("strict remote backup published %s", dir)
 	}
 }

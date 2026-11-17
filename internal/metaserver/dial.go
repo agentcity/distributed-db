@@ -19,6 +19,18 @@ func (s *Server) transportCredentials() credentials.TransportCredentials {
 
 // dial opens one short-lived client connection to addr using the server's
 // shared transport security.
+//
+// Every outbound KV dial also carries the server's configured admin token on
+// KV admin methods (split/merge, membership changes, leader transfer and epoch
+// propagation). The token is attached by a client interceptor rather than per
+// call site, so scheduler, membership and leader-rebalance fan-out cannot
+// diverge. Status and other read-only/data RPCs stay unauthenticated. An empty
+// AdminToken installs a pass-through interceptor, preserving the development
+// default.
 func (s *Server) dial(addr string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(s.transportCredentials()))
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(s.transportCredentials()),
+		grpc.WithChainUnaryInterceptor(adminTokenUnaryClientInterceptor(s.cfg.AdminToken)),
+	}
+	return grpc.NewClient(addr, opts...)
 }

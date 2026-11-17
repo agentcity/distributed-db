@@ -24,22 +24,27 @@
 // probe the locks of keys returned by Txn.Scan through CheckTxnStatus. Supply
 // BackupConfig.Scanner (for example StoreScanner for an in-process store) to
 // get the full lock-aware guarantee, and set RequireLockAwareScan to reject
-// the fallback. Wiring a server-side lock-scan RPC is the remaining production
-// step. Independently, a commit allocated at or below the snapshot TSO whose
-// atomic write batch has not applied yet (notably 1PC) needs the
-// commit-lease/apply barrier from docs/adr/0006-pitr.md; a TSO alone does not
-// close that gap.
+// the fallback. Independently, a commit allocated at or below the snapshot TSO
+// whose atomic write batch has not applied yet (notably 1PC) needs an applied-
+// commit barrier. BackupConfig.Barrier is called with the snapshot TSO after
+// it is obtained and before the first scan; StoreScanner supplies it
+// implicitly through mvcc.Store.WaitApplied. RequireLockAwareScan fails closed
+// with ErrBackupBarrierUnavailable when no barrier is available. The barrier
+// cannot close the timestamp-allocation window by itself: the allocator must
+// hold an mvcc.CommitLease across allocation and apply for that guarantee.
 //
 // # Point-in-time scope
 //
-// This package is not PITR. It has no continuous Raft-log archive, no global
-// checkpoint or safe point, no restore-to-an-arbitrary-TSO, no meta/TSO
-// archive, no encryption/retention policy, and no atomic cluster cutover.
-// Restore is a best-effort logical import into an existing target: it
-// overwrites keys present in the backup and does not delete keys absent from
-// it, so it is idempotent for an unchanged backup only. Use RequireEmpty, a
-// dedicated/fenced target cluster and the VerifyHook for an MVP restore drill;
-// see docs/adr/0006-pitr.md for the remaining PITR design.
+// This package is not a complete PITR implementation. It has no continuous
+// Raft-log archive, no global checkpoint or safe point, no meta/TSO archive,
+// no encryption/retention policy, and no atomic cluster cutover. Restore is a
+// best-effort logical import into an existing target: it overwrites keys
+// present in the backup and does not delete keys absent from it, so it is
+// idempotent for an unchanged backup only. Use RequireEmpty, a
+// dedicated/fenced target cluster and the VerifyHook for an MVP restore drill.
+// internal/pitr can pair this manifest with an external archive and produce a
+// deterministic restore-to-TSO plan, but it does not make the base restore or
+// the cutover atomic; see docs/adr/0006-pitr.md for the remaining design.
 package backup
 
 import (

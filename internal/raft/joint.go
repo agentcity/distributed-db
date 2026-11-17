@@ -292,12 +292,20 @@ func (n *Node) pendingConfigLocked() bool {
 	return st.joint() || st.epoch > n.configEpoch
 }
 
-// selfIsElectoralVoterLocked reports whether the local node may campaign. Only
-// a voter of C_new may campaign, including while joint: a node that C_old still
-// contains but C_new removes will be removed by the final entry and campaigning
-// only disrupts the election with terms that cannot produce a durable leader.
+// selfIsElectoralVoterLocked reports whether the local node may campaign.
+//
+// Every voter of either C_old or C_new may campaign, including a node that only
+// C_old still contains while joint. Such a node cannot become leader on its own:
+// voteQuorumLocked requires a majority of both sets. But it must be allowed to
+// campaign, because it can hold the longest log. A proposal that reached a
+// majority of only one side stays uncommitted, yet it makes that side's log
+// more up to date; if only C_new voters could campaign, the C_new candidates
+// would be rejected by the more up-to-date C_old voters and no leader could be
+// elected until a new entry arrived from a leader that does not exist
+// (liveness deadlock after a partition). A joint leader that C_new excludes
+// steps down once the final entry is applied.
 func (n *Node) selfIsElectoralVoterLocked() bool {
-	return configNewVoter(n.electoralConfigLocked(), n.cfg.ID)
+	return configVotingMember(n.electoralConfigLocked(), n.cfg.ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,19 +601,25 @@ func (n *Node) applyJointConfigLocked(entry model.Entry) (bool, error) {
 	if data.Epoch <= n.configEpoch {
 		return false, fmt.Errorf("%w: joint epoch %d, applied epoch %d", ErrStaleConfigChange, data.Epoch, n.configEpoch)
 	}
-	if data.Epoch != n.configEpoch+1 {
-		return false, fmt.Errorf("%w: joint epoch %d skips applied epoch %d", ErrStaleConfigChange, data.Epoch, n.configEpoch)
+	// A strictly increasing epoch is normally applied only when it continues
+	// the local configuration (epoch+1, not already joint, old set matches).
+	// A gap means intermediate configuration entries were compacted away or
+	// this node fell behind; the entry is committed and in our log, so it is
+	// the authoritative configuration at this index. Adopting it is the same
+	// recovery a snapshot would provide, whereas rejecting it would leave the
+	// node permanently behind and unable to apply later config entries.
+	if data.Epoch == n.configEpoch+1 && !n.isJointLocked() && equalStrings(data.VotersOld, n.voters) {
+		n.votersOld = append([]string(nil), data.VotersOld...)
+		n.voters = append([]string(nil), data.Voters...)
+		n.learners = stringSet(data.Learners)
+		n.autoFinalize = data.AutoFinalize
+		n.configEpoch = data.Epoch
+		n.finalInFlight = false
+		return true, nil
 	}
-	if n.isJointLocked() {
-		return false, fmt.Errorf("%w: configuration is already joint", ErrConfigChangeInProgress)
-	}
-	// The old voter set must be exactly the applied configuration. A mismatch
-	// means this entry belongs to a different history; applying it would
-	// invent a configuration nobody agreed on.
-	if !equalStrings(data.VotersOld, n.voters) {
-		return false, fmt.Errorf("%w: joint old voters %v, applied voters %v",
-			ErrInvalidConfigEntry, data.VotersOld, n.voters)
-	}
+	n.logger.Warn("raft: adopting joint configuration across a log gap",
+		"id", n.cfg.ID, "entry_epoch", data.Epoch, "applied_epoch", n.configEpoch,
+		"joint", n.isJointLocked(), "entry_old", data.VotersOld, "applied_voters", n.voters)
 	n.votersOld = append([]string(nil), data.VotersOld...)
 	n.voters = append([]string(nil), data.Voters...)
 	n.learners = stringSet(data.Learners)
@@ -634,16 +648,25 @@ func (n *Node) applyFinalConfigLocked(entry model.Entry) (bool, error) {
 	if data.Epoch <= n.configEpoch {
 		return false, fmt.Errorf("%w: final epoch %d, applied epoch %d", ErrStaleConfigChange, data.Epoch, n.configEpoch)
 	}
-	if data.Epoch != n.configEpoch+1 {
-		return false, fmt.Errorf("%w: final epoch %d skips applied epoch %d", ErrStaleConfigChange, data.Epoch, n.configEpoch)
+	// The sequential case is a final entry that completes the current joint
+	// configuration. A gap (or a non-joint applied state) means intermediate
+	// entries were compacted or this node fell behind; the committed final
+	// entry is authoritative, so adopt it exactly as a snapshot install would.
+	if n.isJointLocked() && data.Epoch == n.configEpoch+1 &&
+		equalStrings(data.Voters, n.voters) && equalStrings(data.Learners, n.learnerListLocked()) {
+		n.votersOld = nil
+		n.voters = append([]string(nil), data.Voters...)
+		n.learners = stringSet(data.Learners)
+		n.autoFinalize = false
+		n.configEpoch = data.Epoch
+		n.finalInFlight = false
+		n.configInFlight = false
+		return true, nil
 	}
-	if !n.isJointLocked() {
-		return false, fmt.Errorf("%w: final configuration without a joint configuration", ErrNoJointConfig)
-	}
-	if !equalStrings(data.Voters, n.voters) || !equalStrings(data.Learners, n.learnerListLocked()) {
-		return false, fmt.Errorf("%w: final configuration %v/%v does not match joint target %v/%v",
-			ErrInvalidConfigEntry, data.Voters, data.Learners, n.voters, n.learnerListLocked())
-	}
+	n.logger.Warn("raft: adopting final configuration across a log gap",
+		"id", n.cfg.ID, "entry_epoch", data.Epoch, "applied_epoch", n.configEpoch,
+		"joint", n.isJointLocked(), "entry_voters", data.Voters, "entry_learners", data.Learners,
+		"applied_voters", n.voters, "applied_learners", n.learnerListLocked())
 	n.votersOld = nil
 	n.voters = append([]string(nil), data.Voters...)
 	n.learners = stringSet(data.Learners)

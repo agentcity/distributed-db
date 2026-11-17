@@ -18,12 +18,14 @@ import (
 	"sync"
 	"time"
 
+	"distributed-db/internal/audit"
 	"distributed-db/internal/grpctls"
 	"distributed-db/internal/meta"
 	"distributed-db/internal/model"
 	pbv2 "distributed-db/internal/pb/v2"
 	"distributed-db/internal/raft"
 	"distributed-db/internal/raftgrpc"
+	"distributed-db/internal/rbac"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -39,17 +41,46 @@ type Config struct {
 
 	// AdminToken protects the meta admin RPCs (SetRanges, SplitRange,
 	// MergeRanges) with an "authorization: Bearer <token>" check. An empty
-	// value disables the check and is intended for development only.
+	// value leaves admin auth disabled unless AdminTokenRoles/AdminMTLSRoles
+	// configure credentials; that default keeps development clusters working.
+	//
+	// AdminToken always grants the admin role. Use AdminTokenRoles or
+	// AdminMTLSRoles to issue operator or read-only credentials.
 	//
 	// The token is independent of TLS: it is checked by a gRPC unary
 	// interceptor and works on both plaintext and TLS/mTLS listeners. It only
-	// authenticates callers; TLS still protects the token in transit.
+	// authenticates callers; TLS still protects the token in transit. With
+	// AdminMTLSRoles, a role can instead come from the Common Name of a client
+	// certificate verified by the mTLS listener.
 	//
-	// Read-only RPCs (AllocTS, GetRange, ListRanges, Leader) never require it.
-	// KVService admin RPCs (AddReplica, RemoveReplica, SplitRange, MergeRanges
-	// on a data node) are served by the kvserver listener and are not covered
-	// by this token.
+	// Role policy: SetRanges is configuration (admin only); SplitRange and
+	// MergeRanges are cluster operations (admin and operator); read-only is
+	// denied every meta admin RPC. Read-only RPCs (AllocTS, GetRange,
+	// ListRanges, Leader) never require a credential. KVService admin RPCs are
+	// served by the kvserver listener and are not covered here.
 	AdminToken string
+
+	// AdminTokenRoles maps additional bearer tokens to RBAC roles. Accepted
+	// role values are admin, operator and read-only (case-insensitive, plus
+	// readonly/read_only). An unknown role fails New. Tokens are stored only as
+	// SHA-256 digests and never logged or included in errors.
+	AdminTokenRoles map[string]string
+
+	// AdminMTLSRoles maps the Common Name of a verified mTLS client certificate
+	// to an RBAC role. It requires TLS.Server.ClientCAFile (mTLS); New rejects
+	// the configuration otherwise. Token credentials take precedence over a CN
+	// when both are present.
+	AdminMTLSRoles map[string]string
+
+	// AuditLogPath enables append-only JSON Lines audit of protected RPC
+	// attempts at that path (mode 0600, parent directory created if needed).
+	// There is no built-in rotation; rotate externally. The path requires at
+	// least one configured credential.
+	AuditLogPath string
+
+	// AuditLogSync fsyncs the audit file after every record. Audit write
+	// failures are logged but do not fail the RPC.
+	AuditLogSync bool
 
 	// Replicated enables the Raft meta group. ID defaults to Addr, Peers are
 	// the other meta gRPC addresses, DataDir holds the Raft WAL/snapshots.
@@ -83,6 +114,15 @@ type Server struct {
 	cfg     Config
 	log     *slog.Logger
 	cluster *meta.Cluster
+
+	// authz is the meta admin RBAC policy. It is disabled (Enabled() == false)
+	// when no credential is configured, in which case the interceptor passes
+	// every call through, preserving historical behaviour.
+	authz *rbac.Policy
+
+	// auditLog records protected admin attempts. It is nil when audit is
+	// disabled.
+	auditLog *audit.Logger
 
 	raft      *raft.Node
 	transport *raftgrpc.Transport
@@ -176,10 +216,22 @@ func New(cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
+	// Validate admin RBAC and open the audit sink before returning the server,
+	// so a bad role configuration or audit path fails New rather than Start.
+	authz, err := buildMetaAdminPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	auditLog, err := openMetaAdminAudit(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		cfg:         cfg,
 		log:         cfg.Logger,
 		cluster:     cluster,
+		authz:       authz,
+		auditLog:    auditLog,
 		serverCreds: serverCreds,
 		peerCreds:   peerCreds,
 	}, nil
@@ -205,9 +257,11 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.serverCreds != nil {
 		serverOpts = append(serverOpts, grpc.Creds(s.serverCreds))
 	}
-	// The admin-token check is independent of the transport: it is installed
-	// even on plaintext listeners, and a no-op when AdminToken is empty.
-	serverOpts = append(serverOpts, grpc.UnaryInterceptor(adminAuthUnaryInterceptor(s.cfg.AdminToken)))
+	// The admin auth/RBAC check is independent of the transport: it is
+	// installed even on plaintext listeners, and a no-op when no credential is
+	// configured. Verification of an mTLS CN still requires the listener's
+	// client CA.
+	serverOpts = append(serverOpts, grpc.UnaryInterceptor(newMetaAdminInterceptor(s.authz, s.auditLog)))
 	s.grpc = grpc.NewServer(serverOpts...)
 	pbv2.RegisterMetaServiceServer(s.grpc, s)
 	if s.cfg.Replicated {
@@ -232,7 +286,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.log.Info("meta server started",
 		"addr", lis.Addr().String(), "replicated", s.cfg.Replicated,
 		"tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
-		"admin_auth", s.cfg.AdminToken != "")
+		"admin_auth", s.authz.Enabled(), "admin_audit", s.auditLog != nil)
 
 	go func() {
 		<-ctx.Done()
@@ -325,6 +379,10 @@ func (s *Server) Stop() error {
 	}
 	if lis != nil {
 		_ = lis.Close()
+	}
+	// gRPC has stopped above, so no interceptor can write concurrently.
+	if s.auditLog != nil {
+		return s.auditLog.Close()
 	}
 	return nil
 }

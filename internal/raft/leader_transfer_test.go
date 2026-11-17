@@ -21,7 +21,7 @@ type testTransferTransport struct {
 }
 
 func (t *testTransferTransport) TimeoutNow(ctx context.Context, peer string, req *raft.TimeoutNowRequest) (*raft.TimeoutNowResponse, error) {
-	node := t.cluster.nodes[peer]
+	node := t.cluster.node(peer)
 	if node == nil {
 		return nil, fmt.Errorf("test transport: unknown peer %s", peer)
 	}
@@ -31,7 +31,7 @@ func (t *testTransferTransport) TimeoutNow(ctx context.Context, peer string, req
 // InstallSnapshot delivers the legacy unary snapshot directly to the peer so
 // membership tests can exercise learner catch-up after log compaction.
 func (t *testTransferTransport) InstallSnapshot(ctx context.Context, peer string, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
-	node := t.cluster.nodes[peer]
+	node := t.cluster.node(peer)
 	if node == nil {
 		return nil, fmt.Errorf("test transport: unknown peer %s", peer)
 	}

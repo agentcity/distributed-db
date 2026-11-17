@@ -155,8 +155,12 @@ func (s *testSM) gateApplies() func() {
 }
 
 type testCluster struct {
-	t           *testing.T
-	net         *rafttest.Network
+	t   *testing.T
+	net *rafttest.Network
+	// nodesMu protects nodes. Raft replicator goroutines resolve peers
+	// through testTransferTransport while a test may restart a node and
+	// replace its entry; without the lock those accesses race.
+	nodesMu     sync.RWMutex
 	ids         []string
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -193,6 +197,21 @@ func (c *testCluster) configFor(id string, peers []string, dir string) raft.Conf
 		HeartbeatInterval:  c.heartbeat,
 		Logger:             discardLogger(),
 	}
+}
+
+// node returns the current node registered for id. Raft transport goroutines
+// call it while the test may replace an entry after a restart.
+func (c *testCluster) node(id string) *raft.Node {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+	return c.nodes[id]
+}
+
+// setNode replaces the node registered for id under the map lock.
+func (c *testCluster) setNode(id string, node *raft.Node) {
+	c.nodesMu.Lock()
+	defer c.nodesMu.Unlock()
+	c.nodes[id] = node
 }
 
 func peersExcept(ids []string, id string) []string {
@@ -256,7 +275,7 @@ func newTestClusterWithTimeouts(t *testing.T, size int, electionMin, electionMax
 		c.dirs[id] = dir
 		c.stores[id] = store
 		c.sms[id] = sm
-		c.nodes[id] = node
+		c.setNode(id, node)
 		c.net.Register(id, node)
 		if err := node.Start(ctx); err != nil {
 			t.Fatalf("Start(%s): %v", id, err)
@@ -476,7 +495,7 @@ func TestFailoverKeepsCommittedValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart New: %v", err)
 	}
-	c.nodes[oldLeader] = restarted
+	c.setNode(oldLeader, restarted)
 	c.net.Register(oldLeader, restarted)
 	if err := restarted.Start(c.ctx); err != nil {
 		t.Fatalf("restart Start: %v", err)
@@ -723,7 +742,7 @@ func TestLogConflictTruncatedAfterHeal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New restarted node: %v", err)
 	}
-	c.nodes[oldLeaderID] = restarted
+	c.setNode(oldLeaderID, restarted)
 	c.net.Register(oldLeaderID, restarted)
 	if err := restarted.Start(c.ctx); err != nil {
 		t.Fatalf("Start restarted node: %v", err)

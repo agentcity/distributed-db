@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"strings"
 	"sync"
@@ -735,11 +736,17 @@ func requireSucceededChunks(t *testing.T, reqs []raft.InstallSnapshotChunkReques
 			if req.Offset != uint64(len(data)) {
 				t.Fatalf("Done offset = %d, want %d", req.Offset, len(data))
 			}
+			if req.ChunkCRC32 != 0 {
+				t.Fatalf("Done chunk_crc32 = %08x, want 0", req.ChunkCRC32)
+			}
 			continue
 		}
 		end := req.Offset + uint64(len(req.Data))
 		if end > uint64(len(data)) || !bytes.Equal(req.Data, data[req.Offset:end]) {
 			t.Fatalf("chunk %d at offset %d does not match the snapshot payload", i, req.Offset)
+		}
+		if want := crc32.ChecksumIEEE(req.Data); req.ChunkCRC32 != want {
+			t.Fatalf("chunk %d at offset %d chunk_crc32 = %08x, want %08x", i, req.Offset, req.ChunkCRC32, want)
 		}
 		counts[req.Offset]++
 	}

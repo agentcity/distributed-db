@@ -199,6 +199,12 @@ type fakeDecommissionControl struct {
 	promoteCalls     int
 	removeVoterCalls int
 	transferCalls    int
+
+	// transferErr, when non-nil, is returned by TransferLeadership. The hook
+	// runs first so a test can simulate leadership moving while the RPC
+	// reports ErrNotLeader.
+	transferErr  error
+	transferHook func()
 }
 
 func newFakeDecommissionControl(leader string, voters, learners []string) *fakeDecommissionControl {
@@ -251,6 +257,12 @@ func (f *fakeDecommissionControl) TransferLeadership(ctx context.Context, _ uint
 		return err
 	}
 	f.transferCalls++
+	if f.transferHook != nil {
+		f.transferHook()
+	}
+	if f.transferErr != nil {
+		return f.transferErr
+	}
 	if leader != f.leader {
 		return raft.ErrNotLeader
 	}
@@ -301,14 +313,17 @@ func TestDecommissionLeaderTransfersThenRemoves(t *testing.T) {
 	d, err := NewDecommissioner(control, meta, DecommissionOptions{
 		Logger:         testLogger(),
 		CatchUpTimeout: 5 * time.Second,
-		StepTimeout:    10 * time.Second,
-		PollInterval:   10 * time.Millisecond,
+		// Leader transfer deliberately creates a leaderless window. Keep
+		// generous headroom so the -race build and parallel package tests do
+		// not turn a healthy election into a timeout.
+		StepTimeout:  30 * time.Second,
+		PollInterval: 10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewDecommissioner: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	req := DecommissionRequest{RangeID: 1, Target: leader, Replicas: cluster.addrs, Epoch: 7}
 
@@ -691,5 +706,46 @@ func TestDecommissionRejectsQuorumLoss(t *testing.T) {
 	}
 	if len(meta.updates) != 0 {
 		t.Fatalf("meta updates = %d, want 0", len(meta.updates))
+	}
+}
+
+// TestDecommissionTransferErrNotLeaderAfterLeadershipMoved covers the transfer
+// race where the target has already stepped down but TransferLeadership still
+// reports ErrNotLeader. The orchestrator must confirm leadership with the
+// bounded discovery loop and continue, not fail the whole decommission.
+func TestDecommissionTransferErrNotLeaderAfterLeadershipMoved(t *testing.T) {
+	control := newFakeDecommissionControl("n1", []string{"n1", "n2", "n3"}, nil)
+	control.transferErr = raft.ErrNotLeader
+	control.transferHook = func() {
+		// Leadership moved to n2 before the RPC observed the change.
+		control.leader = "n2"
+	}
+	meta := &recordingDecommissionMeta{}
+	d, err := NewDecommissioner(control, meta, DecommissionOptions{
+		Logger:        testLogger(),
+		StepTimeout:   time.Second,
+		PollInterval:  5 * time.Millisecond,
+		MaxLagEntries: 4,
+	})
+	if err != nil {
+		t.Fatalf("NewDecommissioner: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := d.Decommission(ctx, DecommissionRequest{
+		RangeID: 1, Target: "n1", Replicas: []string{"n1", "n2", "n3"},
+	})
+	if err != nil {
+		t.Fatalf("Decommission: %v", err)
+	}
+	if !res.Transferred {
+		t.Fatal("leadership moved but Transferred is false")
+	}
+	if containsString(res.Voters, "n1") || len(res.Voters) != 2 {
+		t.Fatalf("voters = %v, want 2 without n1", res.Voters)
+	}
+	if len(meta.updates) != 1 || !meta.updates[0].Removed {
+		t.Fatalf("meta updates = %+v, want one Removed update", meta.updates)
 	}
 }

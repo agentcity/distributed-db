@@ -1,16 +1,19 @@
 // Package pitr implements the storage half of a point-in-time recovery (PITR)
 // archive: immutable, checksummed log segments, an atomic manifest, a reader
-// with integrity and gap checks, retention/GC, and a deterministic restore
-// planner over a base backup plus archived Raft log records.
+// with integrity and gap checks, retention/GC, an adapter from committed
+// Raft/WAL-like entries, and a deterministic restore planner and executor over
+// a base backup plus archived records.
 //
 // # Scope
 //
 // This package is an MVP archive component, not cluster-integrated PITR. It
 // does not read the Raft WAL, meta log, MVCC store, TSO allocator or the
-// existing backup chunks. A caller must feed it committed Raft entries and the
-// commit TSO it observed, pair it with an internal/backup manifest, and execute
-// the resulting plan against an isolated target. Those wirings remain open.
-// See "Integration gaps" below.
+// existing backup chunks. ArchiveAdapter consumes a committed, gap-free entry
+// source supplied by the caller; the caller also supplies the commit TSO it
+// observed. Planner pairs a internal/backup manifest with the archive, and
+// RestoreToTS feeds the resulting plan to a caller-supplied RestoreSink. Those
+// wirings are narrow interfaces, not a running cluster integration. The
+// remaining open work is listed under "Integration gaps" below.
 //
 // # Archive layout
 //
@@ -59,7 +62,7 @@
 // only when its MaxTSO is non-zero and <= ProtectTSO, so it cannot contain a
 // record needed by that base. A zero ProtectTSO disables the safety check.
 //
-// # Restore planning
+// # Restore planning and execution
 //
 // Planner combines an internal/backup manifest (SnapshotTS and range map) with
 // the archive. It emits records in base range order (by start key, then range
@@ -68,11 +71,30 @@
 // requested ranges, a trimmed prefix that may contain records above the base,
 // and missing/corrupt/non-contiguous segments needed by the requested ranges.
 //
+// RestoreToTS builds that plan and feeds it to a RestoreSink in plan order. It
+// fails closed before the first sink call when the target is above the newest
+// TSO observed for any needed range (completeness cannot be proven without a
+// global checkpoint); PlanRequest.AllowUnprovenTarget is an explicit opt-out.
+// It does not execute commands, resolve locks, delete keys absent from the
+// base, or perform an atomic cutover.
+//
 // The plan is a pure function of its inputs: building it twice yields the same
 // records, order, segment list and SHA-256 Hash. Applying the plan twice is
-// idempotent only when the executor writes at the recorded commit TSO and
-// upserts by (range, key, commitTS); this package deliberately does not
-// implement command semantics, lock resolution or storage writes.
+// idempotent only when the sink writes at the recorded commit TSO and upserts
+// by (range, key, commitTS); this package deliberately does not implement
+// command semantics, lock resolution or storage writes.
+//
+// # Entry feed
+//
+// ArchiveAdapter translates entries from an EntrySource into records and
+// appends them through Writer. CommitTSFromEntry understands the v2
+// transactional JSON payloads (commit, prewrite_commit, txn_batch) and returns
+// zero for entries that carry no single commit timestamp. The adapter requires
+// ascending, gap-free indices: Raft delivers apply entries with gaps when it
+// consumes membership commands itself, so an integration must feed the
+// committed log sequence (including those commands) rather than the state-
+// machine apply stream, or fill the gaps before calling the adapter. Neither
+// the adapter nor this package tails the WAL.
 //
 // # Guarantees
 //
@@ -82,6 +104,10 @@
 //     damaged segments.
 //   - Segments of a range are index-contiguous and hash-chained while retained,
 //     except at a recorded GC trim boundary.
+//   - ArchiveAdapter rejects gaps, duplicates, term regressions and malformed
+//     commit TSOs before calling Writer.Append.
+//   - RestoreToTS performs no sink call until the plan has been fully read,
+//     verified against segment checksums and checked for coverage.
 //   - GC never deletes a segment whose MaxTSO is above a non-zero ProtectTSO
 //     and never creates a hole inside a range's retained suffix.
 //   - Reader and Planner are safe for concurrent use and share no mutable
@@ -89,12 +115,14 @@
 //
 // # Integration gaps
 //
-//   - No Raft WAL/log-store tailing, log-truncation handling, leader/epoch
-//     fencing. The caller must supply the committed, contiguous prefix and the
-//     observed commit TSO; entries with unknown TSO are stored with TSO 0.
+//   - No Raft WAL/log-store tailing, no leadership/epoch fencing and no
+//     log-truncation handling. EntrySource is a caller-provided committed,
+//     contiguous prefix; the adapter cannot discover a configuration-entry
+//     gap on its own.
 //   - No global checkpoint/safe point (T_safe), no per-range frontier, no TSO
-//     high-water or meta archive. The planner cannot prove that a target is
-//     fully archived; it can only verify the segments it sees.
+//     high-water or meta archive. RestoreToTS can only compare the target with
+//     the newest TSO observed per needed range; it rejects a higher target
+//     unless explicitly opted out.
 //   - No RPO 0 claim. Unsealed records are lost on a writer crash, archive lag
 //     is invisible to the planner, and strict-acknowledgement mode does not
 //     exist.
@@ -102,10 +130,11 @@
 //     arbitration. Archive ranges absent from the base are skipped with a
 //     warning; two writers for one archive directory are unsupported.
 //   - No cross-range transaction reconstruction, MVCC command semantics, lock
-//     staging/resolution or imported base chunks.
+//     staging/resolution or imported base chunks. RestoreSink is the caller's
+//     executor.
 //   - No isolated target provisioning, restore lease, verification drill or
-//     atomic cutover. Restore never touches a serving cluster in this package
-//     because it performs no writes at all.
+//     atomic cutover. RestoreToTS writes only through the supplied sink; it
+//     never contacts or cuts over a serving cluster.
 //   - No object-store backend, compression, encryption, KMS or signatures.
 //     Checksums detect corruption, not tampering or rollback.
 //

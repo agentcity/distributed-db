@@ -47,6 +47,10 @@ type fakeBackend struct {
 	backupResult BackupResult
 	backupErr    error
 	backupCalls  []BackupOptions
+
+	decommissionResult DecommissionResult
+	decommissionErr    error
+	decommissionCalls  []DecommissionOptions
 }
 
 func newFake() *fakeBackend { return &fakeBackend{data: map[string][]byte{}} }
@@ -166,6 +170,14 @@ func (f *fakeBackend) Backup(_ context.Context, opts BackupOptions) (BackupResul
 		return BackupResult{}, f.backupErr
 	}
 	return f.backupResult, nil
+}
+
+func (f *fakeBackend) Decommission(_ context.Context, opts DecommissionOptions) (DecommissionResult, error) {
+	f.decommissionCalls = append(f.decommissionCalls, opts)
+	if f.decommissionErr != nil {
+		return DecommissionResult{}, f.decommissionErr
+	}
+	return f.decommissionResult, nil
 }
 
 type cliRun struct {

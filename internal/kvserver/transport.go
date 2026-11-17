@@ -167,29 +167,13 @@ func (t *peerTransport) InstallSnapshotChunk(ctx context.Context, peer string, r
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.InstallSnapshotChunk(ctx, &pbv2.InstallSnapshotChunkRequest{
-		RangeId:      t.rangeID,
-		Term:         req.Term,
-		LeaderId:     req.LeaderID,
-		Index:        req.Index,
-		SnapshotTerm: req.SnapshotTerm,
-		Offset:       req.Offset,
-		Data:         req.Data,
-		Done:         req.Done,
-		Size:         req.Size,
-		Crc32:        req.CRC32,
-		Membership:   pbconv.SnapshotMembershipToPB(req.Membership),
-	})
+	pbReq := pbconv.InstallSnapshotChunkRequestToPB(req)
+	pbReq.RangeId = t.rangeID
+	resp, err := c.InstallSnapshotChunk(ctx, pbReq)
 	if err != nil {
 		return nil, err
 	}
-	return &raft.InstallSnapshotChunkResponse{
-		Term:       resp.GetTerm(),
-		Success:    resp.GetSuccess(),
-		LastIndex:  resp.GetLastIndex(),
-		Error:      resp.GetError(),
-		NextOffset: resp.GetNextOffset(),
-	}, nil
+	return pbconv.InstallSnapshotChunkResponseFromPB(resp), nil
 }
 
 // TimeoutNow implements raft.TimeoutNowTransport. It is invoked by

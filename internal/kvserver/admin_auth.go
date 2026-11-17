@@ -2,21 +2,22 @@ package kvserver
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"strings"
+	"errors"
+	"fmt"
+	"log/slog"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/audit"
+	"distributed-db/internal/rbac"
 )
 
 // kvAdminMethods is the set of KVService RPCs that change cluster topology or
-// range metadata and therefore require the admin bearer token when
-// Config.AdminToken is set:
+// range metadata. They require an admin credential (bearer token or verified
+// mTLS identity) when admin auth is configured:
 //
 //   - SplitRange / MergeRanges: destructive data movement.
 //   - AddReplica / RemoveReplica: create or stop a local Raft group.
@@ -29,104 +30,190 @@ import (
 // every transaction and must keep working without an admin credential.
 // Observability RPCs (Status, RangeStats, Membership) are read-only. RaftService
 // methods share the listener but are the peer transport: they are authenticated
-// by TLS/mTLS and must not require this token, or elections and replication
-// would fail.
+// by TLS/mTLS and must not require an admin credential, or elections and
+// replication would fail.
 //
-// Membership is deliberately not protected: it only reports the current
-// voter/learner sets and does not mutate them.
-//
-// Limitations: this is a single shared bearer credential with all-or-nothing
-// admin authority. It provides no per-operator identity, no RBAC scopes and no
-// audit trail; those remain follow-ups. The token is independent of transport
-// TLS but TLS is still required to protect it in transit.
-//
-// Wiring gap (not fixed here; metaserver is out of scope): metaserver's
-// outbound KV admin fan-out (SplitRange, MergeRanges, AddReplica, AddLearner,
-// PromoteReplica, RemoveVoter, RemoveReplica, TransferLeader and
-// UpdateRangeEpoch) currently dials KV nodes without an admin bearer token. A
-// metaserver that fans out to a KV node with AdminToken set will therefore get
-// Unauthenticated from every admin RPC until it is wired. Once a metaserver
-// config carries the same token, its dial helper can add AdminTokenDialOption
-// to the ClientConn, or each call site can wrap its context with
-// WithAdminToken. Both helpers below are exported for exactly that purpose.
-var kvAdminMethods = map[string]struct{}{
-	pbv2.KVService_SplitRange_FullMethodName:       {},
-	pbv2.KVService_MergeRanges_FullMethodName:      {},
-	pbv2.KVService_AddReplica_FullMethodName:       {},
-	pbv2.KVService_AddLearner_FullMethodName:       {},
-	pbv2.KVService_PromoteReplica_FullMethodName:   {},
-	pbv2.KVService_RemoveVoter_FullMethodName:      {},
-	pbv2.KVService_RemoveReplica_FullMethodName:    {},
-	pbv2.KVService_TransferLeader_FullMethodName:   {},
-	pbv2.KVService_UpdateRangeEpoch_FullMethodName: {},
-}
+// Role policy lives in internal/rbac: every method above requires
+// cluster_admin, which admin and operator grant and read-only denies. The set
+// is derived from the RBAC classification table so the two cannot drift.
+var kvAdminMethods = rbac.KVAdminMethods()
 
 const (
 	adminTokenMetadataKey = "authorization"
 	adminTokenScheme      = "Bearer"
 )
 
-// adminAuthUnaryInterceptor enforces the admin bearer token on kvAdminMethods.
-// An empty token disables the check entirely (development default) so existing
-// deployments and tests are unaffected; production clusters must set
-// Config.AdminToken.
-//
-// The interceptor hashes both the configured and the presented token with
-// SHA-256 and compares the fixed-size digests with subtle.ConstantTimeCompare,
-// so timing does not depend on the token length or on the first differing byte.
-// Rejections never echo the presented or expected token, and neither token is
-// logged.
+// adminAuthUnaryInterceptor is the legacy single-token constructor retained for
+// direct unit tests. It configures one bearer token with the admin role and no
+// audit sink, matching the historical Config.AdminToken behaviour. Server.Start
+// uses newKVAdminInterceptor with the policy built from Config instead.
 func adminAuthUnaryInterceptor(token string) grpc.UnaryServerInterceptor {
 	if token == "" {
-		return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-			return handler(ctx, req)
+		return kvAdminPassThrough
+	}
+	policy, err := rbac.NewPolicy(rbac.Config{
+		Tokens: map[string]string{token: string(rbac.RoleAdmin)},
+	})
+	if err != nil {
+		// The token itself is valid; a failure here would mean rbac is broken.
+		// Deny protected calls rather than silently disabling auth.
+		return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if _, ok := kvAdminMethods[info.FullMethod]; !ok {
+				return handler(ctx, req)
+			}
+			return nil, status.Error(codes.Internal, "kvserver: invalid admin auth configuration")
 		}
 	}
-	expected := sha256.Sum256([]byte(token))
+	return newKVAdminInterceptor(policy, nil)
+}
+
+// newKVAdminInterceptor enforces authentication, RBAC and audit on
+// kvAdminMethods. Authentication accepts a configured Bearer token or a
+// role-mapped Common Name from a verified mTLS client certificate. Data-plane,
+// read-only and Raft RPCs pass through untouched.
+//
+// Every protected attempt is audited, including denials and handler errors.
+// The token itself is never logged: audit records carry the role (or mTLS CN)
+// and the method/range/outcome only.
+func newKVAdminInterceptor(policy *rbac.Policy, auditLog *audit.Logger) grpc.UnaryServerInterceptor {
+	if policy == nil || !policy.Enabled() {
+		return kvAdminPassThrough
+	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if _, ok := kvAdminMethods[info.FullMethod]; !ok {
 			return handler(ctx, req)
 		}
-		presented, ok := adminBearerToken(ctx)
+		permission, ok := rbac.KVPermission(info.FullMethod)
 		if !ok {
-			return nil, status.Error(codes.Unauthenticated, "kvserver: admin token required")
+			// Fail closed if a method was added to the protected set without a
+			// permission classification.
+			_ = auditLog.Record(audit.Event{
+				Method:     info.FullMethod,
+				Range:      audit.RequestRange(req),
+				Result:     audit.ResultDenied,
+				ErrorClass: audit.ErrorClassPermissionDenied,
+			})
+			return nil, status.Error(codes.PermissionDenied, "kvserver: admin method has no RBAC classification")
 		}
-		got := sha256.Sum256(presented)
-		if subtle.ConstantTimeCompare(got[:], expected[:]) != 1 {
-			return nil, status.Error(codes.Unauthenticated, "kvserver: invalid admin token")
+
+		identity, err := policy.Authenticate(ctx)
+		if err != nil {
+			_ = auditLog.Record(audit.Event{
+				Method:     info.FullMethod,
+				Range:      audit.RequestRange(req),
+				Result:     audit.ResultDenied,
+				ErrorClass: audit.ErrorClassUnauthenticated,
+			})
+			return nil, kvAdminAuthError(err)
 		}
-		return handler(ctx, req)
+		if err := policy.Authorize(identity.Role, permission); err != nil {
+			_ = auditLog.Record(kvAuditEvent(identity, info.FullMethod, req,
+				audit.ResultDenied, audit.ErrorClassPermissionDenied))
+			return nil, status.Errorf(codes.PermissionDenied,
+				"kvserver: role %q may not perform %q", identity.Role, permission)
+		}
+
+		resp, err := handler(ctx, req)
+		result, class := audit.Outcome(resp, err)
+		_ = auditLog.Record(kvAuditEvent(identity, info.FullMethod, req, result, class))
+		return resp, err
 	}
 }
 
-// adminBearerToken extracts the token from an "authorization: Bearer <token>"
-// incoming metadata entry. The scheme is case-insensitive per RFC 6750 and the
-// token itself is compared verbatim. Multiple authorization entries are
-// accepted when any of them carries a well-formed Bearer credential.
+// kvAdminAuthError maps an RBAC authentication error to the historical gRPC
+// messages, so existing clients and tests see the same codes. It never echoes
+// the presented credential.
+func kvAdminAuthError(err error) error {
+	if errors.Is(err, rbac.ErrInvalidToken) {
+		return status.Error(codes.Unauthenticated, "kvserver: invalid admin token")
+	}
+	return status.Error(codes.Unauthenticated, "kvserver: admin token required")
+}
+
+func kvAuditEvent(identity rbac.Identity, method string, req any, result, class string) audit.Event {
+	return audit.Event{
+		Principal:  identity.Principal,
+		Role:       string(identity.Role),
+		Method:     method,
+		Range:      audit.RequestRange(req),
+		Result:     result,
+		ErrorClass: class,
+		Auth:       string(identity.Source),
+	}
+}
+
+func kvAdminPassThrough(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	return handler(ctx, req)
+}
+
+// buildKVAdminPolicy merges the legacy AdminToken (always admin) with the
+// token/role and mTLS CN/role maps, validates the configuration and returns a
+// disabled policy when no credential is configured.
+//
+// Fail-fast rules:
+//   - a role value that is not admin/operator/read-only is an error;
+//   - AdminMTLSRoles requires TLS.Server.ClientCAFile (mTLS), because a CN is
+//     only trustworthy when the transport verified the client certificate;
+//   - an audit log path requires at least one credential, otherwise the
+//     operator would believe audit is active while auth is not.
+func buildKVAdminPolicy(cfg Config) (*rbac.Policy, error) {
+	tokens := make(map[string]string, len(cfg.AdminTokenRoles)+1)
+	for token, role := range cfg.AdminTokenRoles {
+		tokens[token] = role
+	}
+	if cfg.AdminToken != "" {
+		if role, ok := tokens[cfg.AdminToken]; ok {
+			parsed, valid := rbac.ParseRole(role)
+			if !valid || parsed != rbac.RoleAdmin {
+				return nil, errors.New("kvserver: AdminToken is also listed in AdminTokenRoles with a non-admin role")
+			}
+		}
+		tokens[cfg.AdminToken] = string(rbac.RoleAdmin)
+	}
+	if len(cfg.AdminMTLSRoles) > 0 && cfg.TLS.Server.ClientCAFile == "" {
+		return nil, errors.New("kvserver: AdminMTLSRoles requires TLS.Server.ClientCAFile (mTLS)")
+	}
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: tokens, CommonNames: cfg.AdminMTLSRoles})
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: admin RBAC: %w", err)
+	}
+	if cfg.AuditLogPath != "" && !policy.Enabled() {
+		return nil, errors.New("kvserver: AuditLogPath requires at least one admin token or mTLS role")
+	}
+	return policy, nil
+}
+
+// openKVAdminAudit opens the append-only JSONL audit file when configured. A nil
+// logger means audit is disabled.
+func openKVAdminAudit(cfg Config) (*audit.Logger, error) {
+	if cfg.AuditLogPath == "" {
+		return nil, nil
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	l, err := audit.Open(cfg.AuditLogPath, audit.Options{
+		Sync: cfg.AuditLogSync,
+		OnError: func(err error) {
+			logger.Error("admin audit write failed", "error", err)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: admin audit: %w", err)
+	}
+	return l, nil
+}
+
+// adminBearerToken is retained for callers and tests that need the raw Bearer
+// parsing helper; it never logs the returned bytes.
 func adminBearerToken(ctx context.Context) ([]byte, bool) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, false
-	}
-	for _, value := range md.Get(adminTokenMetadataKey) {
-		scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
-		if !ok || !strings.EqualFold(scheme, adminTokenScheme) {
-			continue
-		}
-		token = strings.TrimSpace(token)
-		if token == "" {
-			continue
-		}
-		return []byte(token), true
-	}
-	return nil, false
+	return rbac.BearerToken(ctx)
 }
 
 // WithAdminToken returns a child context carrying token as an
-// "authorization: Bearer <token>" outgoing credential. It is the per-call
-// escape hatch for callers that cannot add a dial option (for example a future
-// metaserver fan-out that receives a token at request time). An empty token
-// leaves ctx unchanged.
+// "authorization: Bearer <token>" outgoing credential. An empty token leaves
+// ctx unchanged.
 func WithAdminToken(ctx context.Context, token string) context.Context {
 	if token == "" {
 		return ctx
@@ -137,17 +224,15 @@ func WithAdminToken(ctx context.Context, token string) context.Context {
 // AdminTokenDialOption returns a gRPC dial option that attaches token to
 // outbound KVService admin RPCs made through the resulting ClientConn. Only the
 // methods in kvAdminMethods receive the credential; data-plane, read-only and
-// Raft RPCs are untouched. It exists so a future metaserver fan-out can enable
-// admin auth in its dial helper with one option. An empty token adds a
-// pass-through interceptor.
+// Raft RPCs are untouched. An empty token adds a pass-through interceptor.
 func AdminTokenDialOption(token string) grpc.DialOption {
 	return grpc.WithChainUnaryInterceptor(adminTokenClientInterceptor(token))
 }
 
-// adminTokenClientInterceptor is the client-side counterpart of
-// adminAuthUnaryInterceptor. It only decorates outbound contexts for KV admin
-// methods, so a single ClientConn can serve authenticated admin calls and
-// unauthenticated data-plane calls.
+// adminTokenClientInterceptor is the client-side counterpart of the admin auth
+// interceptor. It only decorates outbound contexts for KV admin methods, so a
+// single ClientConn can serve authenticated admin calls and unauthenticated
+// data-plane calls.
 func adminTokenClientInterceptor(token string) grpc.UnaryClientInterceptor {
 	if token == "" {
 		return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {

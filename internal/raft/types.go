@@ -371,6 +371,11 @@ type SnapshotTransport interface {
 // pieces and sends sequential offsets; the final request has Done set and an
 // empty Data at offset == total payload size. Size and CRC32 describe the whole
 // payload and are repeated on every chunk (zero means not supplied).
+//
+// ChunkCRC32 is the IEEE CRC-32 of Data and lets the receiver reject a
+// corrupted chunk before staging it. Zero means the sender did not supply it
+// (legacy sender, or the empty final Done chunk), so the receiver falls back
+// to the total CRC32 check at the end.
 type InstallSnapshotChunkRequest struct {
 	Term         uint64
 	LeaderID     string
@@ -381,6 +386,7 @@ type InstallSnapshotChunkRequest struct {
 	Done         bool
 	Size         int64
 	CRC32        uint32
+	ChunkCRC32   uint32
 	// Membership is the snapshot's optional membership envelope. Leaders repeat
 	// it on every chunk (including the final Done marker) so the receiver can
 	// validate that all chunks belong to the same snapshot; nil means the

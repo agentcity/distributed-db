@@ -37,10 +37,26 @@ type BackupConfig struct {
 	Scanner SnapshotScanner
 
 	// RequireLockAwareScan rejects a backup that would fall back to the
-	// best-effort Txn.Scan path (Scanner == nil). Set it when the caller needs
-	// the documented lock-aware guarantee; the backup then fails closed if no
-	// SnapshotScanner is configured.
+	// best-effort Txn.Scan path (Scanner == nil), or that has no effective
+	// BackupBarrier. Set it when the caller needs the documented lock-aware and
+	// applied-commit guarantees; the backup then fails closed with
+	// ErrBackupBarrierUnavailable instead of publishing a snapshot that may
+	// miss a commit at or below its TSO.
 	RequireLockAwareScan bool
+
+	// Barrier waits for commits with commitTS <= the backup TSO to become
+	// visible before the first range is scanned. It is optional unless
+	// RequireLockAwareScan is set. A SnapshotScanner that also implements
+	// BackupBarrier (StoreScanner does) is used implicitly when this field is
+	// nil.
+	//
+	// The wait runs after the snapshot TSO has been obtained and before any
+	// Scan, so a commit registered with its lease before that point cannot be
+	// missed. A commit whose timestamp was allocated but whose lease was not
+	// yet acquired can still be missed; the allocator must hold an
+	// mvcc.CommitLease across allocation and apply to close that window.
+	// A WaitApplied error aborts the attempt and removes the staging directory.
+	Barrier BackupBarrier
 
 	// LockRetryAttempts bounds how many complete scan attempts are made when a
 	// blocking lock is observed. Zero selects 3. The budget is deliberately
@@ -70,6 +86,20 @@ type chunkLimits struct {
 // carries that TSO.
 type snapshotScanFunc func(ctx context.Context, start, end []byte, ts uint64, limit int) ([]v2client.KV, error)
 
+// effectiveBarrier returns the configured barrier, or a SnapshotScanner that
+// also implements BackupBarrier (StoreScanner). RemoteScanner implements only
+// SnapshotScanner, so a strict remote backup without an explicit barrier fails
+// closed in Backup rather than downgrading.
+func (cfg BackupConfig) effectiveBarrier() BackupBarrier {
+	if cfg.Barrier != nil {
+		return cfg.Barrier
+	}
+	if b, ok := cfg.Scanner.(BackupBarrier); ok {
+		return b
+	}
+	return nil
+}
+
 // lockAuditFunc inspects the rows just read for a blocking lock. It is nil for
 // a lock-aware scanner, which already audited the whole requested interval.
 type lockAuditFunc func(ctx context.Context, rows []v2client.KV) error
@@ -93,11 +123,17 @@ type lockAuditFunc func(ctx context.Context, rows []v2client.KV) error
 //
 // The remaining TSO gap is a commit allocated at or below the snapshot TSO
 // whose atomic batch has not reached the engine yet. That is especially
-// relevant for 1PC commits, which never install a lock. A remote client cannot
-// close this gap alone: it needs the commit-lease/apply barrier described in
-// docs/adr/0006-pitr.md. The default v2client path also cannot enumerate locks
-// on keys that have never been committed; see BackupConfig.Scanner. Do not
-// describe the result as PITR or as a zero-RPO backup.
+// relevant for 1PC commits, which never install a lock. BackupConfig.Barrier
+// closes the apply window: Backup obtains the snapshot TSO, calls
+// WaitApplied(TSO) and only then scans. StoreScanner supplies that barrier
+// implicitly through mvcc.Store.WaitApplied; RequireLockAwareScan fails closed
+// with ErrBackupBarrierUnavailable when neither an explicit barrier nor a
+// barrier-capable scanner is configured. The allocation window (a commitTS
+// allocated but its lease not yet acquired) still requires the allocator to
+// hold an mvcc.CommitLease across allocation and apply. The default v2client
+// path also cannot enumerate locks on keys that have never been committed; see
+// BackupConfig.Scanner. Do not describe the result as PITR or as a zero-RPO
+// backup.
 func Backup(ctx context.Context, cfg BackupConfig) (*Manifest, error) {
 	if cfg.Client == nil {
 		return nil, errors.New("backup: Client is required")
@@ -110,6 +146,10 @@ func Backup(ctx context.Context, cfg BackupConfig) (*Manifest, error) {
 	}
 	if cfg.RequireLockAwareScan && cfg.Scanner == nil {
 		return nil, errors.New("backup: RequireLockAwareScan is set but no SnapshotScanner was supplied")
+	}
+	barrier := cfg.effectiveBarrier()
+	if cfg.RequireLockAwareScan && barrier == nil {
+		return nil, fmt.Errorf("%w: RequireLockAwareScan is set and neither BackupBarrier nor a barrier-capable SnapshotScanner was supplied", ErrBackupBarrierUnavailable)
 	}
 	limits, err := normalizeLimits(cfg.ChunkKeys, cfg.ChunkBytes)
 	if err != nil {
@@ -135,7 +175,7 @@ func Backup(ctx context.Context, cfg BackupConfig) (*Manifest, error) {
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		m, err := backupAttempt(ctx, cfg, out, parent, limits)
+		m, err := backupAttempt(ctx, cfg, barrier, out, parent, limits)
 		if err == nil {
 			return m, nil
 		}
@@ -169,7 +209,7 @@ func Backup(ctx context.Context, cfg BackupConfig) (*Manifest, error) {
 
 // backupAttempt runs one complete scan at one TSO. On any error the staging
 // directory is removed, so a lock retry never inherits partial chunks.
-func backupAttempt(ctx context.Context, cfg BackupConfig, out, parent string, limits chunkLimits) (*Manifest, error) {
+func backupAttempt(ctx context.Context, cfg BackupConfig, barrier BackupBarrier, out, parent string, limits chunkLimits) (*Manifest, error) {
 	staging, err := os.MkdirTemp(parent, "."+filepath.Base(out)+".tmp-")
 	if err != nil {
 		return nil, fmt.Errorf("backup: create staging directory: %w", err)
@@ -215,6 +255,16 @@ func backupAttempt(ctx context.Context, cfg BackupConfig, out, parent string, li
 		ChunkKeys:     limits.keys,
 		ChunkBytes:    limits.bytes,
 		Ranges:        ranges,
+	}
+
+	// Wait for every registered commit at or below the snapshot TSO to become
+	// visible before the first scan. This closes the 1PC gap that a lock-aware
+	// scan alone cannot see: 1PC installs no lock, so a commit could be at or
+	// below the snapshot TSO while its engine batch has not applied yet.
+	if barrier != nil {
+		if err := barrier.WaitApplied(ctx, m.SnapshotTS); err != nil {
+			return nil, fmt.Errorf("backup: wait for applied commits through tso %d: %w", m.SnapshotTS, err)
+		}
 	}
 
 	scan := snapshotScanFunc(func(ctx context.Context, start, end []byte, _ uint64, limit int) ([]v2client.KV, error) {

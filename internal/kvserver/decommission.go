@@ -37,12 +37,43 @@ package kvserver
 // between the Raft removal and the map update converges. The updater must
 // itself be idempotent for the same reason.
 //
-// A concrete DecommissionControl can be built over the existing KVService
-// RPCs: Status -> KVService.Status, TransferLeadership -> KVService.TransferLeader,
-// PromoteLearner -> KVService.PromoteReplica and RemoveVoter ->
-// KVService.RemoveVoter. That wiring is intentionally left outside this file
-// so the orchestration stays testable without a network and so metaserver
-// remains the sole owner of the range map.
+// A concrete DecommissionControl is supplied by kvctl's `decommission`
+// command, which maps Status -> KVService.Status, TransferLeadership ->
+// KVService.TransferLeader, PromoteLearner -> KVService.PromoteReplica and
+// RemoveVoter -> KVService.RemoveVoter, and publishes the final voter set
+// through MetaService.SetRanges. The seam stays in this file so the
+// orchestration remains testable without a network and metaserver remains the
+// sole owner of the range map.
+//
+// # Remaining RPC gaps
+//
+// The current KVService surface cannot express everything this orchestrator
+// would like to do. These gaps are deliberately left visible rather than
+// papered over:
+//
+//   - StatusResponse has no log last_index. The kvctl adapter derives
+//     LastIndex from max(commit_index, last_applied), so the raw last-index lag
+//     check is effectively disabled for RPC-driven decommission; the
+//     applied-lag check (leader commit index vs target last_applied) still
+//     gates learner promotion.
+//   - There is no RemoveLearner RPC (see the learner-target section above).
+//   - The final meta update only publishes voters. The meta.Range descriptor
+//     has no learner field, so non-target learners are not represented in the
+//     range map.
+//   - The kvctl adapter propagates the new range version to every remaining
+//     voter before calling SetRanges, so a remaining voter that is down fails
+//     the final step even when quorum is healthy. It also reads the map
+//     before writing, so a concurrent unrelated map change is rejected rather
+//     than overwritten; retry after the change settles.
+//   - The removed target's local Raft group and data directory are not stopped
+//     by this orchestrator. The target is no longer a voter and cannot affect
+//     quorum, but an operator must stop or wipe it separately before reuse.
+//   - There is no persisted decommission intent/progress and no placement
+//     policy: this is a single caller-driven range operation, not a whole-node
+//     decommission.
+//   - Without joint consensus (see the top section), at most one membership
+//     change may be in flight for a range, and the safety checks are derived
+//     from one voter set.
 
 import (
 	"context"
@@ -787,17 +818,32 @@ func (d *Decommissioner) transferAway(ctx context.Context, req DecommissionReque
 		}
 		lastErr = errors.Join(lastErr, fmt.Errorf("%s: %w", candidate, err))
 
-		// ErrNotLeader means leadership already moved; confirm instead of
-		// trying another candidate.
+		// ErrNotLeader means leadership already moved. Confirm with the
+		// bounded leader-discovery loop instead of a single snapshot: a
+		// transfer deliberately creates a short leaderless window, and under
+		// load the election can take longer than one 50ms poll.
 		if errors.Is(err, raft.ErrNotLeader) {
-			current, ierr := d.inspect(ctx, req)
+			current, ierr := d.inspectUntilLeader(ctx, req)
 			if ierr == nil && current.leader != req.Target {
 				return nil
+			}
+			if ierr != nil {
+				lastErr = errors.Join(lastErr,
+					fmt.Errorf("confirm leadership after %s: %w", candidate, ierr))
 			}
 		}
 		if err := ctx.Err(); err != nil {
 			return decommissionContextError(ctx)
 		}
+	}
+	// A transfer can report an error after the old leader has already stepped
+	// down. Re-check the final view once before declaring failure; the caller
+	// re-runs preflight and verifies membership anyway.
+	if current, ierr := d.inspectUntilLeader(ctx, req); ierr == nil && current.leader != req.Target {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return decommissionContextError(ctx)
 	}
 	return fmt.Errorf("%w: target %s: %w", ErrDecommissionTransfer, req.Target, lastErr)
 }

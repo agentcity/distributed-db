@@ -84,6 +84,7 @@ type Backend interface {
 	MergeRanges(ctx context.Context, leftID, rightID uint64) error
 	MetaLeader(ctx context.Context) (string, uint64, error)
 	Backup(ctx context.Context, opts BackupOptions) (BackupResult, error)
+	Decommission(ctx context.Context, opts DecommissionOptions) (DecommissionResult, error)
 }
 
 // Config is the resolved global CLI configuration.
@@ -102,11 +103,14 @@ type Config struct {
 	TLSKey        string
 	TLSServerName string
 
-	// AdminToken is sent as a Bearer credential on meta admin RPCs (split,
-	// merge). It is required when the meta server enforces
-	// metaserver.Config.AdminToken; read-only commands (ranges, status) and
-	// data commands never carry it. Empty means the server check is disabled
-	// (development) or the command does not need it.
+	// AdminToken is sent as a Bearer credential on meta admin RPCs
+	// (SetRanges/SplitRange/MergeRanges) and on the KV admin RPCs driven by
+	// decommission (TransferLeader/PromoteReplica/RemoveVoter/
+	// UpdateRangeEpoch). It is required when the meta or KV server enforces
+	// its Config.AdminToken; read-only commands (ranges, status) and data
+	// commands never carry it. Empty means the server check is disabled
+	// (development) or the command does not need it. The token is never
+	// printed.
 	AdminToken string
 }
 
@@ -142,14 +146,15 @@ Commands:
   status                    show meta leader, term and range counts (meta only)
   split <range-id> <key>    split a range at key (meta only)
   merge <left-id> <right-id>  merge two adjacent ranges (meta only)
+  decommission -range <id> -target <addr>  remove one replica from a range safely
   backup -out DIR           logical backup (flags: -chunk-keys -chunk-bytes)
   version                   print version
   help                      this help
 
 Global flags:
   -meta ADDR                meta/TSO gRPC address (env KVCTL_META; default 127.0.0.1:9090)
-  -nodes A,B                KV node gRPC addresses (env KVCTL_NODES; required for data)
-  -timeout D                per-command timeout (default 10s; backup 10m)
+  -nodes A,B                KV node gRPC addresses (env KVCTL_NODES; required for data/decommission)
+  -timeout D                per-command timeout (default 10s; backup 10m; decommission 2m)
   -format table|json|raw    output format (default table)
   -hex                      treat keys/values as hex on input and output
   -quiet                    suppress success messages
@@ -157,12 +162,14 @@ Global flags:
   -tls-cert FILE            PEM client certificate for mTLS
   -tls-key FILE             PEM client private key (with -tls-cert)
   -tls-server-name NAME     expected server name for certificate verification
-  -admin-token TOKEN        Bearer token for meta admin RPCs (env KVCTL_ADMIN_TOKEN)
+  -admin-token TOKEN        Bearer token for meta/KV admin RPCs (env KVCTL_ADMIN_TOKEN; never printed)
 
   ranges and status are read-only and never send the admin token. init-ranges,
-  split and merge are admin RPCs; when the meta server was started with
-  -admin-token, pass -admin-token or set KVCTL_ADMIN_TOKEN. The token is never
-  printed.
+  split, merge and decommission are admin operations; when the meta or KV
+  server was started with -admin-token, pass -admin-token or set
+  KVCTL_ADMIN_TOKEN. decommission sends it on TransferLeader, PromoteReplica,
+  RemoveVoter, UpdateRangeEpoch and SetRanges; Status stays read-only. The
+  token is never printed.
 
   init-ranges is a one-time, fail-closed bootstrap for a FRESH meta whose
   single range has no replicas. It sets range 1's replicas to -replicas (or
@@ -174,6 +181,16 @@ Global flags:
   ranges, status, init-ranges, split and merge only need -meta. get, put,
   delete, scan, txn, shell, ping and backup also require -nodes. Backup
   defaults to a 10m timeout; raise -timeout for very large data sets.
+
+  decommission requires both -meta and -nodes: it reads the range map from
+  meta, then drives Status/TransferLeader/PromoteReplica/RemoveVoter directly
+  on the KV replicas and publishes the resulting voter set with SetRanges.
+  -target is the replica address to remove; -replicas optionally overrides
+  -nodes as the replica hint. It is idempotent: a target that is already absent
+  is reported as already_removed and the range map is re-checked. If both meta
+  and KV admin auth are enabled, the one -admin-token must be valid on both.
+  Use -catch-up-timeout/-step-timeout only to tune the bounded waits. The
+  command defaults to a 2m timeout.
 
 Examples:
   kvctl -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put user:1 alice
@@ -187,6 +204,8 @@ Examples:
   kvctl -meta 127.0.0.1:9090 status
   kvctl -meta 127.0.0.1:9090 split 1 m
   kvctl -meta 127.0.0.1:9090 merge 2 3
+  kvctl -meta 127.0.0.1:9090 -nodes 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 \
+    -admin-token "$KVCTL_ADMIN_TOKEN" decommission -range 1 -target 127.0.0.1:7003
   kvctl -nodes ... backup -out ./backup
 `
 
@@ -227,7 +246,8 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 	tlsKey := fs.String("tls-key", "", "PEM client key for mTLS")
 	tlsServerName := fs.String("tls-server-name", "", "expected server name")
 	adminToken := fs.String("admin-token", envOr("KVCTL_ADMIN_TOKEN", ""),
-		"Bearer token for meta admin RPCs (SetRanges/SplitRange/MergeRanges)")
+		"Bearer token for meta admin RPCs (SetRanges/SplitRange/MergeRanges) "+
+			"and KV admin RPCs driven by decommission")
 	fs.Usage = func() { fmt.Fprint(r.errOut(), usageText) }
 
 	if err := fs.Parse(args); err != nil {
@@ -278,6 +298,11 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		// A backup of more than a handful of keys easily exceeds the
 		// interactive default. Keep a bound, but make it generous.
 		cfg.Timeout = 10 * time.Minute
+	}
+	if cmd == "decommission" && !timeoutSet {
+		// Catch-up and leadership transfer are bounded inside the
+		// orchestrator; the interactive 10s default is too short for them.
+		cfg.Timeout = 2 * time.Minute
 	}
 	switch cfg.Format {
 	case "table", "json", "raw":
@@ -402,6 +427,9 @@ func (r *Runner) execute(ctx context.Context, b Backend, cfg Config, cmd string,
 
 	case "merge":
 		return r.executeMerge(ctx, b, cfg, args)
+
+	case "decommission":
+		return r.executeDecommission(ctx, b, cfg, args)
 
 	case "backup":
 		return r.executeBackup(ctx, b, cfg, args)
@@ -831,6 +859,128 @@ func (r *Runner) executeMerge(ctx context.Context, b Backend, cfg Config, args [
 	return 0
 }
 
+type decommissionJSON struct {
+	Status         string   `json:"status"`
+	RangeID        uint64   `json:"range_id"`
+	Target         string   `json:"target"`
+	Leader         string   `json:"leader"`
+	Voters         []string `json:"voters"`
+	Learners       []string `json:"learners"`
+	Transferred    bool     `json:"transferred"`
+	Promoted       bool     `json:"promoted"`
+	AlreadyRemoved bool     `json:"already_removed"`
+	LagEntries     uint64   `json:"lag_entries"`
+}
+
+// executeDecommission removes one replica from a range. Parsing and output live
+// here; the RPC adapter and meta range-map publication live in decommission.go.
+func (r *Runner) executeDecommission(ctx context.Context, b Backend, cfg Config, args []string) int {
+	fs := flag.NewFlagSet("decommission", flag.ContinueOnError)
+	fs.SetOutput(r.errOut())
+	rangeID := fs.Uint64("range", 0, "range ID to change")
+	target := fs.String("target", "", "replica address to remove")
+	replicasFlag := fs.String("replicas", "",
+		"comma-separated replica addresses (default: -nodes)")
+	catchUp := fs.Duration("catch-up-timeout", 0,
+		"learner catch-up bound (0 uses the library default)")
+	step := fs.Duration("step-timeout", 0,
+		"per-step bound (0 uses the library default)")
+	poll := fs.Duration("poll-interval", 0,
+		"status poll interval (0 uses the library default)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		return r.usage("decommission takes no positional arguments")
+	}
+	if cfg.Format == "raw" {
+		return r.usage("decommission: -format raw is not supported; use table or json")
+	}
+	if *rangeID == 0 {
+		return r.usage("decommission requires -range <id> (greater than zero)")
+	}
+	targetAddr := strings.TrimSpace(*target)
+	if targetAddr == "" {
+		return r.usage("decommission requires -target <replica-address>")
+	}
+	if *catchUp < 0 || *step < 0 || *poll < 0 {
+		return r.usage("decommission: timeouts and poll interval must be >= 0")
+	}
+	replicas := splitList(*replicasFlag)
+	if len(replicas) == 0 {
+		replicas = append([]string(nil), cfg.Nodes...)
+	}
+	if len(replicas) == 0 {
+		return r.usage("decommission requires -replicas or -nodes (comma-separated KV addresses)")
+	}
+	// The target must be reachable even if the caller forgot to list it.
+	if !containsString(replicas, targetAddr) {
+		replicas = append(replicas, targetAddr)
+	}
+
+	result, err := b.Decommission(ctx, DecommissionOptions{
+		RangeID:        *rangeID,
+		Target:         targetAddr,
+		Replicas:       replicas,
+		CatchUpTimeout: *catchUp,
+		StepTimeout:    *step,
+		PollInterval:   *poll,
+	})
+	if err != nil {
+		return r.fail("decommission", err)
+	}
+	return r.printDecommission(cfg, result)
+}
+
+func (r *Runner) printDecommission(cfg Config, result DecommissionResult) int {
+	voters := result.Voters
+	if voters == nil {
+		voters = []string{}
+	}
+	learners := result.Learners
+	if learners == nil {
+		learners = []string{}
+	}
+	if cfg.Format == "json" {
+		return r.writeJSON(decommissionJSON{
+			Status:         "ok",
+			RangeID:        result.RangeID,
+			Target:         result.Target,
+			Leader:         result.Leader,
+			Voters:         voters,
+			Learners:       learners,
+			Transferred:    result.Transferred,
+			Promoted:       result.Promoted,
+			AlreadyRemoved: result.AlreadyRemoved,
+			LagEntries:     result.LagEntries,
+		})
+	}
+	if cfg.Quiet {
+		return 0
+	}
+	if result.AlreadyRemoved {
+		fmt.Fprintf(r.out(), "range %d: %s already decommissioned; leader=%s voters=%s\n",
+			result.RangeID, result.Target, result.Leader, strings.Join(voters, ","))
+		return 0
+	}
+	fmt.Fprintf(r.out(), "range %d: decommissioned %s; leader=%s voters=%s",
+		result.RangeID, result.Target, result.Leader, strings.Join(voters, ","))
+	if len(learners) > 0 {
+		fmt.Fprintf(r.out(), " learners=%s", strings.Join(learners, ","))
+	}
+	if result.Transferred {
+		fmt.Fprint(r.out(), " leadership_transferred=true")
+	}
+	if result.Promoted {
+		fmt.Fprint(r.out(), " learner_promoted=true")
+	}
+	fmt.Fprintln(r.out())
+	return 0
+}
+
 type backupJSON struct {
 	Dir        string `json:"dir"`
 	SnapshotTS uint64 `json:"snapshot_ts"`
@@ -1187,7 +1337,7 @@ func sameReplicaSet(a, b []string) bool {
 // adminCommand reports whether cmd is an administrative command that is not
 // available in the interactive shell.
 func adminCommand(cmd string) bool {
-	return metaOnlyCommand(cmd) || cmd == "backup"
+	return metaOnlyCommand(cmd) || cmd == "backup" || cmd == "decommission"
 }
 
 func parseRangeID(s string) (uint64, error) {

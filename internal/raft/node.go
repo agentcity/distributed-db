@@ -1239,8 +1239,11 @@ func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	}
 	// Elections use the latest configuration in the log, including a config
 	// entry that is present but not yet applied (see electoralConfigLocked).
+	// A candidate may belong to either voter set while joint (C_old or C_new);
+	// the candidate still needs majorities of both sets to win, so this is the
+	// standard joint-consensus election rule.
 	electorate := n.electoralConfigLocked()
-	if !configNewVoter(electorate, req.CandidateID) || !configVotingMember(electorate, n.cfg.ID) {
+	if !configVotingMember(electorate, req.CandidateID) || !configVotingMember(electorate, n.cfg.ID) {
 		return &RequestVoteResponse{Term: n.term, VoteGranted: false}, nil
 	}
 	lastIndex := n.lastIndexLocked()

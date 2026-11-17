@@ -297,10 +297,15 @@ func (n *Node) sendInstallSnapshotChunks(
 		}
 		if isDone {
 			req.Done = true
+			// The final Done marker is always empty, so its chunk checksum is
+			// zero by definition.
 		} else {
 			// Copy the chunk: a transport is allowed to retain the request
-			// after the call, and buf is reused for the next chunk.
+			// after the call, and buf is reused for the next chunk. Compute the
+			// checksum over exactly the bytes this request carries, including
+			// when pending was trimmed after a partial acceptance.
 			req.Data = append([]byte(nil), pending...)
+			req.ChunkCRC32 = crc32.ChecksumIEEE(pending)
 		}
 
 		resp, rpcErr := n.callSnapshotChunk(leaderCtx, tr, peer, req)
@@ -615,6 +620,13 @@ func (n *Node) finishSnapshotInstall(peer string, term, snapIndex, lastIndex uin
 // only when the Done chunk has been received and its total size and CRC32
 // match; the temporary file is removed after every terminal outcome.
 //
+// When the request carries ChunkCRC32, it is verified before the bytes are
+// written: a mismatch rejects the chunk and leaves the partial upload (and
+// its file) untouched, so the leader can resume from NextOffset. A zero
+// ChunkCRC32 means the sender did not supply one; such chunks, including every
+// chunk from a legacy sender, are staged and checked by the total CRC32 at the
+// end.
+//
 // Term and leader handling match HandleInstallSnapshot. Duplicate chunks are
 // detected by offset and content: an immediate retry of the last accepted
 // chunk succeeds without writing it twice. A chunk beyond the current offset
@@ -690,6 +702,25 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 	}
 	if len(req.Data) == 0 && !req.Done {
 		return n.rejectSnapshotChunk(term, "empty non-final chunk")
+	}
+	// Verify the per-chunk checksum before touching any staged state or
+	// writing to the temporary file. A zero checksum means the sender did not
+	// supply one (legacy sender, or the empty Done marker); the total CRC32
+	// remains the end-to-end check for those uploads. Rejecting here leaves an
+	// existing partial upload intact, so the leader can resume from its last
+	// acknowledged offset.
+	if req.ChunkCRC32 != 0 {
+		if got := crc32.ChecksumIEEE(req.Data); got != req.ChunkCRC32 {
+			message := fmt.Sprintf("chunk CRC32 mismatch at offset %d: got %08x, want %08x", req.Offset, got, req.ChunkCRC32)
+			// Report the offset already staged for this snapshot so the leader
+			// can resume instead of restarting the upload. The staged file is
+			// not touched.
+			if recv := n.snapshotRecv[req.LeaderID]; recv != nil &&
+				recv.index == req.Index && recv.snapshotTerm == req.SnapshotTerm {
+				return n.rejectSnapshotChunkAt(term, recv.offset, message)
+			}
+			return n.rejectSnapshotChunk(term, message)
+		}
 	}
 	reqMembership, err := normalizeSnapshotMembership(req.Membership)
 	if err != nil {
