@@ -29,7 +29,8 @@ Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd; mobile — scaffold):
 - [Edgehash](docs/tracks/edgehash.md) — встроенный read-only edge-компонент;
   `cmd/edgehash` — опциональная сборка, не отдельный продукт.
 
-Быстрые входы: [SQL за 5 минут](docs/quickstart/sql-5-minutes.md) и
+Быстрые входы: [Docker за 2 минуты](docs/quickstart/docker-2-minutes.md),
+[SQL за 5 минут](docs/quickstart/sql-5-minutes.md) и
 [edgehash за 10 минут](docs/quickstart/edgehash-10-minutes.md).
 
 ## Что внутри
@@ -211,8 +212,12 @@ E2E: `go test -race ./test -run TestSQLP0OnKV -v`.
 
 ## Быстрый старт (Docker, 2 шарда × 3 реплики)
 
+> Актуальный Docker-старт v2 (demo: 1 meta + 1 KV + SQL; cluster: 3 meta +
+> 3 KV) — в [docker-2-minutes.md](docs/quickstart/docker-2-minutes.md).
+> Раздел ниже описывает legacy v1 и запускается из `docker-compose.v1.yml`.
+
 ```bash
-make compose-up          # docker compose up -d --build
+docker compose -f docker-compose.v1.yml up -d --build
 make smoke               # PUT/GET/DELETE через координатор
 # или:
 curl -u admin:admin -X PUT --data-binary 'hello' http://127.0.0.1:8080/v1/kv/foo

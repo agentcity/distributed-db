@@ -117,12 +117,17 @@ curl -s http://127.0.0.1:8080/metrics | head
 ### 3.4 Docker-демо
 
 ```bash
-make compose-up     # 2 шарда × 3 реплики
-make smoke
-make compose-down   # удалит volume'ы
+make compose-up        # v2 demo: 1 meta + 1 KV + SQL
+make compose-down      # удалит volume'ы
+
+make compose-cluster-up    # 3 meta + 3 KV + SQL
+make compose-cluster-down
 ```
 
-Логин по умолчанию `admin/admin`; переопределяется `DB_AUTH_USER/DB_AUTH_PASS`.
+Production-шаблон — Helm, не compose. Подробности: [DOCKER.md](DOCKER.md),
+быстрый старт: [docker-2-minutes.md](quickstart/docker-2-minutes.md).
+
+Legacy v1 остаётся отдельно: `docker compose -f docker-compose.v1.yml up -d`.
 
 ### 3.5 Остановка
 

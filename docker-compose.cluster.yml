@@ -1,0 +1,303 @@
+# =============================================================================
+# distributed-db v2 — 3-node Docker Compose cluster
+# =============================================================================
+#
+# Three replicated meta/TSO nodes, three Multi-Raft KV nodes and the SQL HTTP
+# gateway. This demonstrates the v2 replication and range-bootstrap paths on a
+# SINGLE Docker host. It is not an HA or production deployment:
+#
+#   * every container runs on the same host; host loss loses the whole cluster;
+#   * plaintext gRPC/HTTP; no TLS material is generated or mounted;
+#   * named volumes are host-local and are not backed up;
+#   * `restart: unless-stopped` restarts containers, it is not a failover
+#     guarantee, and Docker does not restart an "unhealthy" container by itself;
+#   * the healthchecks below are listener-level only because kv2 exposes no
+#     health service; the bootstrap job is the readiness gate for leadership
+#     and the range map.
+#
+# Start:
+#   docker compose -f docker-compose.cluster.yml --profile cluster up -d
+#   docker compose -f docker-compose.cluster.yml --profile cluster logs -f bootstrap
+#   curl -s -X POST localhost:8080/v1/sql \
+#     -d '{"sql":"CREATE TABLE demo (id INT PRIMARY KEY, name TEXT)"}'
+#   docker compose -f docker-compose.cluster.yml --profile cluster down -v
+#
+# Optional PostgreSQL wire gateway (profile `pgsrv`):
+#   docker compose -f docker-compose.cluster.yml \
+#     --profile cluster --profile pgsrv up -d
+#   psql "host=127.0.0.1 port=5432 dbname=demo"   # no auth in this demo
+#
+# The bootstrap job waits for a meta leader across all three meta addresses,
+# then runs:
+#   kvctl -meta <leader>:9090 init-ranges -replicas kv-1:7001,kv-2:7001,kv-3:7001
+# and verifies the resulting range map. It is idempotent: a second run with the
+# same replica set only reports already_initialized.
+#
+# Image: ${DB_IMAGE:-distributed-db:local}. `build: .` is only used when
+# --build is passed (or the image is missing); an existing local image is used
+# as-is otherwise. Configure ports/tokens via .env.compose.example.
+# =============================================================================
+
+name: distributed-db-cluster
+
+x-kv2-service: &kv2-service
+  image: ${DB_IMAGE:-distributed-db:local}
+  build:
+    context: .
+  init: true
+  restart: unless-stopped
+  user: "10001:10001"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-bootstrap-service: &bootstrap-service
+  <<: *kv2-service
+  restart: "no"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  volumes:
+    - ./scripts/compose-bootstrap.sh:/usr/local/bin/compose-bootstrap.sh:ro
+  entrypoint: ["/bin/sh", "/usr/local/bin/compose-bootstrap.sh"]
+
+services:
+  # ---- meta/TSO group ------------------------------------------------------
+  # The service name is the stable DNS name and the Raft node ID. Each node
+  # lists the other two as -meta-peers; the service name resolves to the
+  # container address on the compose network.
+  meta-1:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/kv2"]
+    command:
+      - "-mode=meta"
+      - "-addr=:9090"
+      - "-meta-id=meta-1:9090"
+      - "-meta-peers=meta-2:9090,meta-3:9090"
+      - "-meta-data-dir=/data/meta"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    ports:
+      - "${DB_META_PORT:-9090}:9090"
+    volumes:
+      - meta1-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "9090"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 20s
+
+  meta-2:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/kv2"]
+    command:
+      - "-mode=meta"
+      - "-addr=:9090"
+      - "-meta-id=meta-2:9090"
+      - "-meta-peers=meta-1:9090,meta-3:9090"
+      - "-meta-data-dir=/data/meta"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    volumes:
+      - meta2-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "9090"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 20s
+
+  meta-3:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/kv2"]
+    command:
+      - "-mode=meta"
+      - "-addr=:9090"
+      - "-meta-id=meta-3:9090"
+      - "-meta-peers=meta-1:9090,meta-2:9090"
+      - "-meta-data-dir=/data/meta"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    volumes:
+      - meta3-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "9090"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 20s
+
+  # ---- KV Multi-Raft group -------------------------------------------------
+  # Node ID is the stable service DNS name, never the container IP. The peer
+  # list excludes the local node. The bootstrap job later publishes the same
+  # three addresses as range 1's replicas.
+  kv-1:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/kv2"]
+    command:
+      - "-mode=node"
+      - "-id=kv-1:7001"
+      - "-raft-addr=:7001"
+      - "-peers=kv-2:7001,kv-3:7001"
+      - "-data-dir=/data"
+      - "-durability=${DB_DURABILITY:-sync}"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    ports:
+      - "${DB_KV_PORT:-7001}:7001"
+    volumes:
+      - kv1-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "7001"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 30s
+
+  kv-2:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/kv2"]
+    command:
+      - "-mode=node"
+      - "-id=kv-2:7001"
+      - "-raft-addr=:7001"
+      - "-peers=kv-1:7001,kv-3:7001"
+      - "-data-dir=/data"
+      - "-durability=${DB_DURABILITY:-sync}"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    volumes:
+      - kv2-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "7001"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 30s
+
+  kv-3:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/kv2"]
+    command:
+      - "-mode=node"
+      - "-id=kv-3:7001"
+      - "-raft-addr=:7001"
+      - "-peers=kv-1:7001,kv-2:7001"
+      - "-data-dir=/data"
+      - "-durability=${DB_DURABILITY:-sync}"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    volumes:
+      - kv3-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "7001"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 30s
+
+  # ---- one-shot range-map bootstrap --------------------------------------
+  bootstrap:
+    <<: *bootstrap-service
+    profiles: ["cluster"]
+    environment:
+      # All meta addresses are probed: a kvctl status call to a follower fails
+      # closed, so the script discovers the current leader and writes there.
+      META_ADDRS: "meta-1:9090,meta-2:9090,meta-3:9090"
+      META_REPLICAS: "3"
+      KV_REPLICAS: "kv-1:7001,kv-2:7001,kv-3:7001"
+      WAIT_TIMEOUT: "${DB_BOOTSTRAP_WAIT_TIMEOUT:-180}"
+      WAIT_INTERVAL: "${DB_BOOTSTRAP_WAIT_INTERVAL:-2}"
+      INIT_ATTEMPTS: "${DB_BOOTSTRAP_INIT_ATTEMPTS:-3}"
+      VERIFY_ATTEMPTS: "${DB_BOOTSTRAP_VERIFY_ATTEMPTS:-10}"
+      KVCTL_TIMEOUT: "${DB_BOOTSTRAP_KVCTL_TIMEOUT:-10s}"
+      KVCTL_ADMIN_TOKEN: "${DB_ADMIN_TOKEN:-}"
+    depends_on:
+      meta-1:
+        condition: service_healthy
+      meta-2:
+        condition: service_healthy
+      meta-3:
+        condition: service_healthy
+      kv-1:
+        condition: service_healthy
+      kv-2:
+        condition: service_healthy
+      kv-3:
+        condition: service_healthy
+
+  # ---- SQL over HTTP -------------------------------------------------------
+  sqlsrv:
+    <<: *kv2-service
+    profiles: ["cluster"]
+    entrypoint: ["/app/sqlsrv"]
+    command:
+      - "-http-addr=:8080"
+      - "-meta=meta-1:9090"
+      - "-nodes=kv-1:7001,kv-2:7001,kv-3:7001"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    ports:
+      - "${DB_SQL_PORT:-8080}:8080"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+  # ---- optional PostgreSQL wire gateway -----------------------------------
+  # Enable with --profile cluster --profile pgsrv. The listener is plaintext
+  # and unauthenticated in this demo; pgsrv requires TLS before it will accept
+  # -auth-user/-auth-password, and no TLS material is mounted here.
+  pgsrv:
+    <<: *kv2-service
+    profiles: ["pgsrv"]
+    entrypoint: ["/app/pgsrv"]
+    command:
+      - "-addr=:5432"
+      - "-metrics-addr=:9187"
+      - "-meta=meta-1:9090"
+      - "-nodes=kv-1:7001,kv-2:7001,kv-3:7001"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
+    ports:
+      - "${DB_PG_PORT:-5432}:5432"
+      - "${DB_PG_METRICS_PORT:-9187}:9187"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9187/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+volumes:
+  meta1-data:
+  meta2-data:
+  meta3-data:
+  kv1-data:
+  kv2-data:
+  kv3-data:

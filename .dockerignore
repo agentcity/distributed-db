@@ -1,8 +1,10 @@
 .git
 .github
+.gitignore
 .idea
 data
 bin
+
 # Local sandbox/build caches are not part of the source tree. They can be
 # several GB and would otherwise be sent as build context.
 .gocache
@@ -11,10 +13,32 @@ bin
 .tmp-go
 .tmp-bin
 .tmp-verify
+.tmp-*
 .docker-buildx
-*.md
-**/*.md
-.DS_Store
-**/.DS_Store
+
+# Release/build output: OCI archives, coverage, logs and local artifacts must
+# not leak into the image build context.
+artifacts
+dist
+*.tar
+*.oci.tar
 *.out
 coverage.*
+*.log
+
+# Docs are not read by the Dockerfile (only cmd/ + go.mod/go.sum are built).
+*.md
+**/*.md
+
+# Never ship local credentials or private keys in the build context. The image
+# obtains its TLS material from the orchestrator at runtime.
+.env
+.env.*
+*.pem
+*.key
+*.crt
+id_rsa
+id_ed25519
+
+.DS_Store
+**/.DS_Store

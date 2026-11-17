@@ -1,0 +1,221 @@
+# Legacy v1 stack (cmd/db coordinator + node, 2 shards x 3 replicas).
+#
+# This file is preserved for the old v1 binaries. It is NOT the v2 demo:
+#   * v2 demo (1 meta + 1 KV + SQL):  docker compose --profile demo up -d
+#   * v2 3-node cluster:              docker compose -f docker-compose.cluster.yml \
+#                                       --profile cluster up -d
+# The v1 stack uses the legacy HTTP coordinator on :8080 and is unrelated to
+# the v2 meta/KV/sqlsrv ports in docker-compose.yml.
+#
+# Demo cluster: 2 shards x 3 replicas + coordinator.
+#
+# The credentials below are for local demos only. Override them with
+# DB_AUTH_USER / DB_AUTH_PASS in the environment for anything shared.
+x-node-common: &node-common
+  build: .
+  image: distributed-db:local
+  restart: unless-stopped
+  environment:
+    DB_AUTH_USER: ${DB_AUTH_USER:-admin}
+    DB_AUTH_PASS: ${DB_AUTH_PASS:-admin}
+  networks:
+    - db
+
+services:
+  node1:
+    <<: *node-common
+    command:
+      - node
+      - -id=node1:7001
+      - -shard=shard-1
+      - -raft-addr=:7001
+      - -http-addr=:8001
+      - -peers=node2:7001,node3:7001
+      - -data-dir=/data
+      - -coordinator=coordinator:9090
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8001:8001"
+      - "7001:7001"
+    volumes:
+      - node1-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  node2:
+    <<: *node-common
+    command:
+      - node
+      - -id=node2:7001
+      - -shard=shard-1
+      - -raft-addr=:7001
+      - -http-addr=:8001
+      - -peers=node1:7001,node3:7001
+      - -data-dir=/data
+      - -coordinator=coordinator:9090
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8002:8001"
+      - "7002:7001"
+    volumes:
+      - node2-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  node3:
+    <<: *node-common
+    command:
+      - node
+      - -id=node3:7001
+      - -shard=shard-1
+      - -raft-addr=:7001
+      - -http-addr=:8001
+      - -peers=node1:7001,node2:7001
+      - -data-dir=/data
+      - -coordinator=coordinator:9090
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8003:8001"
+      - "7003:7001"
+    volumes:
+      - node3-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  node4:
+    <<: *node-common
+    command:
+      - node
+      - -id=node4:7001
+      - -shard=shard-2
+      - -raft-addr=:7001
+      - -http-addr=:8001
+      - -peers=node5:7001,node6:7001
+      - -data-dir=/data
+      - -coordinator=coordinator:9090
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8004:8001"
+      - "7004:7001"
+    volumes:
+      - node4-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  node5:
+    <<: *node-common
+    command:
+      - node
+      - -id=node5:7001
+      - -shard=shard-2
+      - -raft-addr=:7001
+      - -http-addr=:8001
+      - -peers=node4:7001,node6:7001
+      - -data-dir=/data
+      - -coordinator=coordinator:9090
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8005:8001"
+      - "7005:7001"
+    volumes:
+      - node5-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  node6:
+    <<: *node-common
+    command:
+      - node
+      - -id=node6:7001
+      - -shard=shard-2
+      - -raft-addr=:7001
+      - -http-addr=:8001
+      - -peers=node4:7001,node5:7001
+      - -data-dir=/data
+      - -coordinator=coordinator:9090
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8006:8001"
+      - "7006:7001"
+    volumes:
+      - node6-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  coordinator:
+    build: .
+    image: distributed-db:local
+    restart: unless-stopped
+    command:
+      - coordinator
+      - -http-addr=:8080
+      - -grpc-addr=:9090
+      - -shards=shard-1=node1:7001,node2:7001,node3:7001;shard-2=node4:7001,node5:7001,node6:7001
+      - -auth-user=${DB_AUTH_USER:-admin}
+      - -auth-pass=${DB_AUTH_PASS:-admin}
+      - -log-format=json
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    networks:
+      - db
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+      node4:
+        condition: service_healthy
+      node5:
+        condition: service_healthy
+      node6:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+networks:
+  db:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
+  node6-data:

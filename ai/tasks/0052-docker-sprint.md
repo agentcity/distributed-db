@@ -14,10 +14,18 @@ scope: {backend: true, console: false, mobile: false}
 3. Bootstrap range-map в Compose.
 4. Docs «поднял за 2 минуты».
 
-## Критерии
+## Результат
 
-- [ ] Образ собирается/публикуется multi-arch (или dry-run при отсутствии registry).
-- [ ] `docker compose config` для demo/cluster.
-- [ ] Demo SQL запрос работает.
-- [ ] Cluster: 3 meta + 3 KV, bootstrap, write/read.
-- [ ] Docs проверены по фактическим флагам.
+- [x] Multi-arch: OCI `linux/amd64,linux/arm64`, 85 MB; publish dry-run.
+- [x] `docker-compose.yml` demo + `docker-compose.cluster.yml` 3 meta/3 KV.
+- [x] Bootstrap `kvctl init-ranges` + meta leader wait + idempotency.
+- [x] Demo SQL и cluster 3/3 + 2/3 SQL write/read.
+- [x] Docs: DOCKER.md, docker-2-minutes.md.
+- [x] Plain `docker build` works; compose smoke pass.
+
+## Gaps
+
+- Registry publish не выполнен (нет auth/registry); multi-arch OCI проверен.
+- `kvctl ranges` LEADER пуст: meta descriptor не заполняет leader.
+- TLS/mTLS, pgsrv, failover, Linux/NVMe performance не в этом прогоне.
+- v1 compose сохранён как docker-compose.v1.yml.

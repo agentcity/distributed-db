@@ -17,13 +17,22 @@ DOCKER ?= docker
 PLATFORM ?=
 IMAGE ?= $(IMAGE_REPOSITORY):$(IMAGE_TAG)
 
+# Multi-arch knobs. `image-multiarch` writes an offline OCI archive (no
+# registry needed); `image-multiarch-push` publishes a multi-platform index
+# and requires an authenticated `docker login`.
+PLATFORMS ?= linux/amd64,linux/arm64
+OCI_DEST ?= /tmp/$(subst :,_,$(subst /,_,$(IMAGE_REPOSITORY)))-$(IMAGE_TAG)-multiarch.oci.tar
+BUILDER ?=
+BUILDX_AUTO_CREATE ?= 1
+PULL ?= 0
+
 # --- Helm validation ---------------------------------------------------------
 HELM ?= helm
 CHART_DIR ?= deploy/helm/distributed-db
 RELEASE ?= distributed-db
 NAMESPACE ?= distributed-db
 
-.PHONY: all build build-cli test test-short vet fmt proto compose-up compose-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean image image-push helm-lint helm-template release-check
+.PHONY: all build build-cli test test-short vet fmt proto compose-up compose-down compose-cluster-up compose-cluster-down smoke chaos-nightly run-coordinator run-node1 run-node2 run-node3 dev clean image image-push image-multiarch image-multiarch-push test-image helm-lint helm-template release-check
 
 all: build
 
@@ -55,10 +64,16 @@ proto:
 		proto/db.proto
 
 compose-up:
-	docker compose up -d --build
+	docker compose --profile demo up -d --build
 
 compose-down:
-	docker compose down -v
+	docker compose --profile demo down -v
+
+compose-cluster-up:
+	docker compose -f docker-compose.cluster.yml --profile cluster up -d --build
+
+compose-cluster-down:
+	docker compose -f docker-compose.cluster.yml --profile cluster down -v
 
 smoke:
 	./scripts/smoke.sh
@@ -94,6 +109,47 @@ image-push:
 	PLATFORM="$(PLATFORM)" \
 	PUSH=1 \
 	./scripts/build-image.sh
+
+# Build a real multi-platform image index for PLATFORMS (default amd64+arm64)
+# and write it to a local OCI archive. Needs Docker buildx but no registry
+# login and no push: useful offline and in CI without credentials.
+image-multiarch:
+	IMAGE_REPOSITORY="$(IMAGE_REPOSITORY)" \
+	IMAGE_TAG="$(IMAGE_TAG)" \
+	VERSION="$(VERSION)" \
+	REVISION="$(REVISION)" \
+	DOCKER="$(DOCKER)" \
+	MULTIARCH=1 \
+	PLATFORMS="$(PLATFORMS)" \
+	OUTPUT=oci \
+	OCI_DEST="$(OCI_DEST)" \
+	BUILDER="$(BUILDER)" \
+	BUILDX_AUTO_CREATE="$(BUILDX_AUTO_CREATE)" \
+	PULL="$(PULL)" \
+	./scripts/build-image.sh
+	@echo "multiarch OCI archive: $(OCI_DEST)"
+
+# Build and push the multi-platform image index in one buildx invocation.
+# Requires `docker login` for IMAGE_REPOSITORY; the script never stores or
+# logs credentials and verifies the pushed manifest with imagetools.
+image-multiarch-push:
+	IMAGE_REPOSITORY="$(IMAGE_REPOSITORY)" \
+	IMAGE_TAG="$(IMAGE_TAG)" \
+	VERSION="$(VERSION)" \
+	REVISION="$(REVISION)" \
+	DOCKER="$(DOCKER)" \
+	MULTIARCH=1 \
+	PUSH=1 \
+	PLATFORMS="$(PLATFORMS)" \
+	BUILDER="$(BUILDER)" \
+	BUILDX_AUTO_CREATE="$(BUILDX_AUTO_CREATE)" \
+	PULL="$(PULL)" \
+	./scripts/build-image.sh
+
+# Shell-only self-test for the image build script (no registry, no image
+# build by default). Set MULTIARCH_REAL=1 to also run a real OCI build.
+test-image:
+	./scripts/test-build-image.sh
 
 # --- Helm validation ---------------------------------------------------------
 # Render the default values and parse every document as YAML. Fails before the

@@ -11,7 +11,8 @@
 - [Edgehash](tracks/edgehash.md) — встроенный компонент; `cmd/edgehash` —
   опциональная сборка, не отдельный продукт.
 
-Быстрые входы: [SQL 5 минут](quickstart/sql-5-minutes.md) и
+Быстрые входы: [Docker 2 минуты](quickstart/docker-2-minutes.md),
+[SQL 5 минут](quickstart/sql-5-minutes.md) и
 [edgehash 10 минут](quickstart/edgehash-10-minutes.md).
 
 Цель — два продукта в одном репозитории:

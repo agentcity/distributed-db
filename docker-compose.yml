@@ -1,212 +1,173 @@
-# Demo cluster: 2 shards x 3 replicas + coordinator.
+# =============================================================================
+# distributed-db v2 — local Docker Compose demo
+# =============================================================================
 #
-# The credentials below are for local demos only. Override them with
-# DB_AUTH_USER / DB_AUTH_PASS in the environment for anything shared.
-x-node-common: &node-common
-  build: .
-  image: distributed-db:local
+# One meta (TSO + range map), one Multi-Raft KV node and the SQL HTTP gateway.
+# This is a DEVELOPMENT DEMO on a single Docker host, not a highly available
+# or production deployment:
+#
+#   * plaintext gRPC/HTTP; no TLS material is generated or mounted;
+#   * a single meta and a single KV node means no fault tolerance at all;
+#   * named volumes live on one host and are not backed up;
+#   * `restart: unless-stopped` restarts containers, it does not survive host
+#     loss and is not a failover mechanism.
+#
+# The three-node Raft/replication demo is in docker-compose.cluster.yml.
+#
+# Quick start:
+#   docker compose --profile demo up -d
+#   docker compose --profile demo logs -f bootstrap   # wait for "bootstrap complete"
+#   curl -s -X POST localhost:8080/v1/sql \
+#     -d '{"sql":"SELECT * FROM users"}'
+#   docker compose --profile demo down -v            # -v also deletes the demo data
+#
+# Reproducing the range-map bootstrap by hand (exact flags from `kvctl help`):
+#   docker compose --profile demo exec meta-1 /app/kvctl \
+#     -meta meta-1:9090 init-ranges -replicas kv-1:7001
+#   docker compose --profile demo exec meta-1 /app/kvctl -meta meta-1:9090 ranges
+#
+# Image: ${DB_IMAGE:-distributed-db:local}. `build: .` is attached to the
+# services so a fresh checkout works with `docker compose --profile demo build`;
+# an existing local image is used as-is unless --build is passed.
+#
+# Configuration comes from the environment or a local `.env` file; see
+# .env.compose.example. The admin token is optional and empty by default
+# (development): DB_ADMIN_TOKEN. It is passed to kv2 as a command-line flag
+# because kv2 has no environment-only form (documented in the Dockerfile/Helm
+# chart too), so set it only on a trusted host.
+# =============================================================================
+
+name: distributed-db-demo
+
+x-kv2-service: &kv2-service
+  image: ${DB_IMAGE:-distributed-db:local}
+  build:
+    context: .
+  init: true
   restart: unless-stopped
-  environment:
-    DB_AUTH_USER: ${DB_AUTH_USER:-admin}
-    DB_AUTH_PASS: ${DB_AUTH_PASS:-admin}
-  networks:
-    - db
+  user: "10001:10001"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# One-shot bootstrap. It waits for a meta leader, calls kvctl init-ranges with
+# the KV replica set, then verifies the range map. It is idempotent: running it
+# again with the same replica set is a no-op.
+x-bootstrap-service: &bootstrap-service
+  <<: *kv2-service
+  restart: "no"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  volumes:
+    - ./scripts/compose-bootstrap.sh:/usr/local/bin/compose-bootstrap.sh:ro
+  entrypoint: ["/bin/sh", "/usr/local/bin/compose-bootstrap.sh"]
 
 services:
-  node1:
-    <<: *node-common
+  # Meta/TSO + authoritative range map. Standalone in the demo (no peers).
+  meta-1:
+    <<: *kv2-service
+    profiles: ["demo"]
+    entrypoint: ["/app/kv2"]
     command:
-      - node
-      - -id=node1:7001
-      - -shard=shard-1
-      - -raft-addr=:7001
-      - -http-addr=:8001
-      - -peers=node2:7001,node3:7001
-      - -data-dir=/data
-      - -coordinator=coordinator:9090
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
+      - "-mode=meta"
+      - "-addr=:9090"
+      - "-meta-id=meta-1:9090"
+      - "-meta-data-dir=/data/meta"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
     ports:
-      - "8001:8001"
-      - "7001:7001"
+      - "${DB_META_PORT:-9090}:9090"
     volumes:
-      - node1-data:/data
+      - demo-meta-data:/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      # TCP listener only: kv2 exposes no HTTP/gRPC health service. The
+      # bootstrap job performs the real readiness check (meta leader + range
+      # map) before SQL is allowed to start.
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "9090"]
       interval: 5s
-      timeout: 2s
-      retries: 10
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    stop_grace_period: 20s
 
-  node2:
-    <<: *node-common
+  # Multi-Raft KV data node. It starts its own single-voter Raft group; the
+  # bootstrap job publishes that replica set to meta.
+  kv-1:
+    <<: *kv2-service
+    profiles: ["demo"]
+    entrypoint: ["/app/kv2"]
     command:
-      - node
-      - -id=node2:7001
-      - -shard=shard-1
-      - -raft-addr=:7001
-      - -http-addr=:8001
-      - -peers=node1:7001,node3:7001
-      - -data-dir=/data
-      - -coordinator=coordinator:9090
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
+      - "-mode=node"
+      - "-id=kv-1:7001"
+      - "-raft-addr=:7001"
+      - "-data-dir=/data"
+      - "-durability=${DB_DURABILITY:-sync}"
+      - "-admin-token=${DB_ADMIN_TOKEN:-}"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
     ports:
-      - "8002:8001"
-      - "7002:7001"
+      - "${DB_KV_PORT:-7001}:7001"
     volumes:
-      - node2-data:/data
+      - demo-kv-data:/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "7001"]
       interval: 5s
-      timeout: 2s
-      retries: 10
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    stop_grace_period: 30s
 
-  node3:
-    <<: *node-common
+  # SQL-over-HTTP gateway. /healthz is public; /v1/sql is unauthenticated here
+  # because the demo listener is plaintext and sqlsrv refuses -auth-token
+  # without TLS. Do not expose this listener beyond localhost in production.
+  sqlsrv:
+    <<: *kv2-service
+    profiles: ["demo"]
+    entrypoint: ["/app/sqlsrv"]
     command:
-      - node
-      - -id=node3:7001
-      - -shard=shard-1
-      - -raft-addr=:7001
-      - -http-addr=:8001
-      - -peers=node1:7001,node2:7001
-      - -data-dir=/data
-      - -coordinator=coordinator:9090
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
+      - "-http-addr=:8080"
+      - "-meta=meta-1:9090"
+      - "-nodes=kv-1:7001"
+      - "-log-level=${DB_LOG_LEVEL:-info}"
     ports:
-      - "8003:8001"
-      - "7003:7001"
-    volumes:
-      - node3-data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 10
-
-  node4:
-    <<: *node-common
-    command:
-      - node
-      - -id=node4:7001
-      - -shard=shard-2
-      - -raft-addr=:7001
-      - -http-addr=:8001
-      - -peers=node5:7001,node6:7001
-      - -data-dir=/data
-      - -coordinator=coordinator:9090
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
-    ports:
-      - "8004:8001"
-      - "7004:7001"
-    volumes:
-      - node4-data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 10
-
-  node5:
-    <<: *node-common
-    command:
-      - node
-      - -id=node5:7001
-      - -shard=shard-2
-      - -raft-addr=:7001
-      - -http-addr=:8001
-      - -peers=node4:7001,node6:7001
-      - -data-dir=/data
-      - -coordinator=coordinator:9090
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
-    ports:
-      - "8005:8001"
-      - "7005:7001"
-    volumes:
-      - node5-data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 10
-
-  node6:
-    <<: *node-common
-    command:
-      - node
-      - -id=node6:7001
-      - -shard=shard-2
-      - -raft-addr=:7001
-      - -http-addr=:8001
-      - -peers=node4:7001,node5:7001
-      - -data-dir=/data
-      - -coordinator=coordinator:9090
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
-    ports:
-      - "8006:8001"
-      - "7006:7001"
-    volumes:
-      - node6-data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 10
-
-  coordinator:
-    build: .
-    image: distributed-db:local
-    restart: unless-stopped
-    command:
-      - coordinator
-      - -http-addr=:8080
-      - -grpc-addr=:9090
-      - -shards=shard-1=node1:7001,node2:7001,node3:7001;shard-2=node4:7001,node5:7001,node6:7001
-      - -auth-user=${DB_AUTH_USER:-admin}
-      - -auth-pass=${DB_AUTH_PASS:-admin}
-      - -log-format=json
-    ports:
-      - "8080:8080"
-      - "9090:9090"
-    networks:
-      - db
+      - "${DB_SQL_PORT:-8080}:8080"
     depends_on:
-      node1:
-        condition: service_healthy
-      node2:
-        condition: service_healthy
-      node3:
-        condition: service_healthy
-      node4:
-        condition: service_healthy
-      node5:
-        condition: service_healthy
-      node6:
-        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 5s
-      timeout: 2s
-      retries: 10
+      timeout: 3s
+      retries: 24
+      start_period: 5s
 
-networks:
-  db:
-    driver: bridge
+  bootstrap:
+    <<: *bootstrap-service
+    profiles: ["demo"]
+    environment:
+      META_ADDRS: "meta-1:9090"
+      META_REPLICAS: "1"
+      KV_REPLICAS: "kv-1:7001"
+      WAIT_TIMEOUT: "${DB_BOOTSTRAP_WAIT_TIMEOUT:-180}"
+      WAIT_INTERVAL: "${DB_BOOTSTRAP_WAIT_INTERVAL:-2}"
+      INIT_ATTEMPTS: "${DB_BOOTSTRAP_INIT_ATTEMPTS:-3}"
+      VERIFY_ATTEMPTS: "${DB_BOOTSTRAP_VERIFY_ATTEMPTS:-10}"
+      KVCTL_TIMEOUT: "${DB_BOOTSTRAP_KVCTL_TIMEOUT:-10s}"
+      # The token, when set, reaches kvctl through the environment only. It is
+      # never passed as an argv element and never logged by the script.
+      KVCTL_ADMIN_TOKEN: "${DB_ADMIN_TOKEN:-}"
+    depends_on:
+      meta-1:
+        condition: service_healthy
+      kv-1:
+        condition: service_healthy
 
 volumes:
-  node1-data:
-  node2-data:
-  node3-data:
-  node4-data:
-  node5-data:
-  node6-data:
+  demo-meta-data:
+  demo-kv-data:

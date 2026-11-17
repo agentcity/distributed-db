@@ -308,7 +308,7 @@
   {
     "id": "0052",
     "title": "Sprint 2 — Docker multi-arch и Compose",
-    "status": "in_progress",
+    "status": "done",
     "file": "0052-docker-sprint.md"
   }
 ]

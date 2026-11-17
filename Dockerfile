@@ -8,12 +8,12 @@
 #   /app/sqlsrv    SQL-over-HTTPS gateway
 #   /app/pgsrv     PostgreSQL wire-protocol gateway
 #   /app/kvctl     terminal client, range admin and backup client
-#   /app/kvbackup  logical backup/restore/verify CLI (plaintext only)
+#   /app/kvbackup  logical backup/restore/verify CLI (TLS/admin-token capable)
 #   /app/edgehash  immutable edge hash-set builder/server/client
-#   /app/db        legacy v1 coordinator/node (kept for docker-compose.yml)
+#   /app/db        legacy v1 coordinator/node (kept for docker-compose.v1.yml)
 #
 # The legacy /app/db binary remains the default ENTRYPOINT so the existing
-# docker-compose.yml keeps working unchanged. The Helm chart always overrides
+# docker-compose.v1.yml keeps working unchanged. The Helm chart always overrides
 # the command and executes one of the explicit paths above; operators running
 # the image directly should do the same, e.g.:
 #
@@ -28,14 +28,28 @@
 # binaries independent of the checkout path and of the local git state. The
 # VERSION/REVISION build args are metadata only (labels); they do not change
 # the compiled code.
+#
+# Multi-arch: the build stage is not pinned with --platform. Classic
+# `docker build` (and some Docker/buildx combinations) leave BUILDPLATFORM
+# empty, which makes `FROM --platform=$BUILDPLATFORM` a parse error. Instead the
+# stage runs on the target platform and the Go toolchain cross-compiles with
+# the explicit TARGETOS/TARGETARCH values that BuildKit passes per platform;
+# CGO_ENABLED=0 makes those binaries self-contained. A native build with no
+# platform arguments falls back to the Go toolchain's own GOOS/GOARCH, which is
+# exactly the platform the classic builder is running on.
 
 ARG GO_VERSION=1.23
 
 # ---- build stage -----------------------------------------------------------
 FROM golang:${GO_VERSION}-bookworm AS build
 
-ARG TARGETOS=linux
+# BuildKit fills these in from --platform. Redeclaring them without a value
+# keeps the automatic values. When they are absent (classic builder), they are
+# derived from TARGETPLATFORM or, for a plain native build, from `go env`.
+ARG TARGETOS
 ARG TARGETARCH
+ARG TARGETVARIANT
+ARG TARGETPLATFORM
 ARG VERSION=dev
 ARG REVISION=unknown
 
@@ -54,11 +68,26 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     set -eu; \
-    : "${TARGETARCH:=$(go env GOARCH)}"; \
+    target_os=${TARGETOS:-}; \
+    target_arch=${TARGETARCH:-}; \
+    if [ -z "$target_arch" ] && [ -n "${TARGETPLATFORM:-}" ]; then \
+      target_arch=${TARGETPLATFORM#*/}; \
+      target_arch=${target_arch%%/*}; \
+    fi; \
+    if [ -z "$target_os" ] && [ -n "${TARGETPLATFORM:-}" ]; then \
+      target_os=${TARGETPLATFORM%%/*}; \
+    fi; \
+    if [ -z "$target_os" ]; then target_os=$(go env GOOS); fi; \
+    if [ -z "$target_arch" ]; then target_arch=$(go env GOARCH); fi; \
+    if [ -z "$target_os" ] || [ -z "$target_arch" ]; then \
+      echo "error: cannot determine target platform (TARGETOS/TARGETARCH empty and go env failed)" >&2; \
+      exit 1; \
+    fi; \
+    echo "build platform=$(go env GOOS)/$(go env GOARCH) target=${target_os}/${target_arch} variant=${TARGETVARIANT:-none}"; \
     mkdir -p /out/bin; \
     for cmd in db kv2 sqlsrv pgsrv kvctl kvbackup edgehash; do \
-      echo "building ./cmd/$cmd for ${TARGETOS:-linux}/$TARGETARCH"; \
-      CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$TARGETARCH" \
+      echo "building ./cmd/$cmd for ${target_os}/${target_arch}"; \
+      CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" \
         go build -trimpath -buildvcs=false -ldflags "-s -w" \
           -o "/out/bin/$cmd" "./cmd/$cmd"; \
     done; \
