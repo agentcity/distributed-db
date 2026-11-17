@@ -274,5 +274,11 @@
     "title": "Multi-range fan-out benchmark",
     "status": "done",
     "file": "0046-multi-range-fanout.md"
+  },
+  {
+    "id": "0047",
+    "title": "Linux fsync comparison",
+    "status": "done",
+    "file": "0047-linux-bench.md"
   }
 ]
