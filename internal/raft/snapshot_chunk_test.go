@@ -778,7 +778,8 @@ func TestInstallSnapshotChunkResumesAfterLostResponse(t *testing.T) {
 	c.net.heal(lagging)
 
 	eventually(t, c.timeout, "follower restores the snapshot after a lost chunk response", func() bool {
-		return c.sms[lagging].appliedIndex() >= snap.Index
+		stored, err := c.stores[lagging].LoadSnapshot()
+		return err == nil && stored.Index >= snap.Index
 	})
 	if got, ok := c.sms[lagging].get("resume-lost"); !ok || !bytes.Equal(got, payload) {
 		t.Fatalf("follower restored value = %d bytes, ok=%v; want %d bytes", len(got), ok, len(payload))
@@ -878,7 +879,8 @@ func TestInstallSnapshotChunkResumesAcrossAttempts(t *testing.T) {
 		return false
 	})
 	eventually(t, c.timeout, "follower restores the snapshot after a later retry round", func() bool {
-		return c.sms[lagging].appliedIndex() >= snap.Index
+		stored, err := c.stores[lagging].LoadSnapshot()
+		return err == nil && stored.Index >= snap.Index
 	})
 
 	reqs := tr.chunkRequests(lagging)

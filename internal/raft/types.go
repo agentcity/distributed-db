@@ -11,6 +11,23 @@
 // count towards a quorum. Voter/learner sets are persisted through the optional
 // MembershipStore capability (FileStore implements it) and are also rebuilt
 // deterministically by replaying config entries.
+//
+// The current membership is also embedded in every snapshot, together with a
+// monotonically increasing config epoch. A node that was partitioned while
+// membership changed may have to install a snapshot after its log prefix was
+// compacted; the membership in that snapshot is authoritative, so the node
+// cannot keep a stale voter set that no longer exists in the committed log.
+// Snapshots written by older versions carry no membership: loading one falls
+// back to the persisted MembershipStore record or the static Config. Restoring
+// a snapshot whose membership config epoch is lower than this node's is
+// rejected as stale.
+//
+// Remaining G2 gap: this is not joint consensus. A change is still one
+// single-server step with overlapping majorities, and there is no intermediate
+// joint configuration that tolerates a crash between the old and new voter
+// sets. Snapshot metadata makes membership recoverable after compaction, but it
+// does not add the C_old,new safety guarantees that joint consensus provides;
+// operators must still avoid changing membership while quorum is at risk.
 package raft
 
 import (
@@ -80,6 +97,10 @@ type Status struct {
 	Voters      []string
 	Learners    []string
 	Learner     bool // the local node is currently a learner
+	// ConfigEpoch is the version of the voter/learner configuration. It starts
+	// at 1 and increases with every effective membership change; a value of 0
+	// only appears on a zero Status.
+	ConfigEpoch uint64
 }
 
 // RequestVoteRequest is sent by a candidate to its peers.
@@ -155,13 +176,37 @@ type StateMachine interface {
 	Apply(entry model.Entry) error
 }
 
+// SnapshotMembership is the Raft voter/learner configuration captured in a
+// snapshot. ConfigEpoch is the monotonically increasing version of that
+// configuration (it starts at 1 and advances with each effective membership
+// change). A nil *SnapshotMembership means the snapshot predates membership
+// metadata; an empty/nil Voters slice inside a non-nil value is corrupt and is
+// rejected.
+//
+// Voters includes the node that produced the snapshot when it was a voter.
+// Learners are non-voting members. Both slices are sorted and de-duplicated
+// when a snapshot is created or validated.
+type SnapshotMembership struct {
+	Voters      []string `json:"voters"`
+	Learners    []string `json:"learners,omitempty"`
+	ConfigEpoch uint64   `json:"config_epoch"`
+}
+
 // Snapshot is a compact image of the state machine at Index. Term is the term
 // of the log entry at Index, which lets Raft compare the snapshot with a
 // follower's log during InstallSnapshot.
+//
+// Membership is the Raft voter/learner configuration in effect when the
+// snapshot was taken, with the config epoch that produced it. It is nil only
+// for a snapshot written by an older version (or by a caller that does not know
+// the membership); installing such a snapshot keeps the node's current
+// membership. A transport that forwards a Snapshot must preserve Membership:
+// dropping it silently downgrades the install to the legacy fallback.
 type Snapshot struct {
-	Index uint64
-	Term  uint64
-	Data  []byte
+	Index      uint64
+	Term       uint64
+	Data       []byte
+	Membership *SnapshotMembership
 }
 
 // SnapshotMeta describes snapshot data stored by a SnapshotStreamStore. It is
@@ -174,12 +219,16 @@ type Snapshot struct {
 // OpenSnapshot rather than opening it directly. For FileStore it is the data
 // path relative to the store directory (for example
 // "snapshot/data-42.bin").
+//
+// Membership carries the same optional membership envelope as Snapshot. It is
+// nil for metadata written before membership was added to snapshots.
 type SnapshotMeta struct {
-	Index uint64
-	Term  uint64
-	Size  int64
-	CRC32 uint32
-	File  string
+	Index      uint64
+	Term       uint64
+	Size       int64
+	CRC32      uint32
+	File       string
+	Membership *SnapshotMembership
 }
 
 // Snapshotter is the optional StateMachine capability used by Node.Snapshot.
@@ -252,6 +301,22 @@ type SnapshotStreamStore interface {
 	OpenSnapshot() (SnapshotMeta, io.ReadCloser, error)
 }
 
+// SnapshotMembershipStreamStore is the optional extension of
+// SnapshotStreamStore used to persist the membership envelope together with a
+// streamed snapshot. Node uses it when available so that SnapshotToStore and
+// the streaming restore path keep membership durable; a store that only
+// implements SnapshotStreamStore still works, but the snapshot it writes
+// carries no membership (equivalent to a legacy snapshot). FileStore implements
+// this interface.
+//
+// SaveSnapshotFromReaderWithMembership must obey the same atomicity and
+// newer-snapshot rules as SaveSnapshotFromReader. A nil membership stores a
+// legacy snapshot without membership metadata.
+type SnapshotMembershipStreamStore interface {
+	SnapshotStreamStore
+	SaveSnapshotFromReaderWithMembership(index, term uint64, membership *SnapshotMembership, r io.Reader) error
+}
+
 // InstallSnapshotRequest is sent by a leader whose follower is missing a
 // compacted log prefix.
 type InstallSnapshotRequest struct {
@@ -291,6 +356,11 @@ type InstallSnapshotChunkRequest struct {
 	Done         bool
 	Size         int64
 	CRC32        uint32
+	// Membership is the snapshot's optional membership envelope. Leaders repeat
+	// it on every chunk (including the final Done marker) so the receiver can
+	// validate that all chunks belong to the same snapshot; nil means the
+	// snapshot is legacy/unknown and the receiver keeps its current membership.
+	Membership *SnapshotMembership
 }
 
 // InstallSnapshotChunkResponse is the reply to one chunk. Term is the
@@ -344,6 +414,21 @@ type LogStore interface {
 type MembershipStore interface {
 	SaveMembership(voters, learners []string) error
 	LoadMembership() (voters, learners []string, err error)
+}
+
+// MembershipEpochStore is the optional extension of MembershipStore that also
+// persists the membership config epoch. Node uses it when available so an
+// installed snapshot's epoch survives a restart; a store that only implements
+// MembershipStore still works, and an epoch of 0 is then normalized to the
+// initial epoch (1). FileStore implements this interface.
+//
+// LoadMembershipEpoch returns nil, nil, 0, nil when no membership has ever been
+// saved. A record written by an older version has epoch 0 and is reported as
+// such.
+type MembershipEpochStore interface {
+	MembershipStore
+	SaveMembershipEpoch(voters, learners []string, epoch uint64) error
+	LoadMembershipEpoch() (voters, learners []string, epoch uint64, err error)
 }
 
 // BatchAppender is the optional LogStore capability used for group commit. A
@@ -403,6 +488,15 @@ var (
 	// ErrConfigChangeInProgress is returned when a membership change is
 	// already being applied. Changes are strictly one server at a time.
 	ErrConfigChangeInProgress = errors.New("raft: membership change already in progress")
+	// ErrInvalidSnapshotMembership is returned when a snapshot carries a
+	// membership envelope that is structurally invalid (no voters, an empty
+	// id, duplicates, a voter that is also a learner, or no config epoch).
+	ErrInvalidSnapshotMembership = errors.New("raft: invalid snapshot membership")
+	// ErrStaleSnapshotMembership is returned when a snapshot's membership
+	// config epoch is older than this node's current epoch. A committed
+	// snapshot can never legitimately be older than the configuration this
+	// node has already applied; accepting it could resurrect removed voters.
+	ErrStaleSnapshotMembership = errors.New("raft: stale snapshot membership")
 )
 
 // errLostQuorum classifies a proposal that was accepted while this node was
@@ -448,5 +542,48 @@ func cloneSnapshot(s Snapshot) Snapshot {
 	if s.Data != nil {
 		c.Data = append([]byte(nil), s.Data...)
 	}
+	c.Membership = cloneMembership(s.Membership)
 	return c
+}
+
+// cloneMembership returns a deep copy of a snapshot membership envelope. A nil
+// envelope stays nil so callers can distinguish a legacy snapshot from an empty
+// (invalid) configuration.
+func cloneMembership(m *SnapshotMembership) *SnapshotMembership {
+	if m == nil {
+		return nil
+	}
+	c := &SnapshotMembership{ConfigEpoch: m.ConfigEpoch}
+	if m.Voters != nil {
+		c.Voters = append([]string(nil), m.Voters...)
+	}
+	if m.Learners != nil {
+		c.Learners = append([]string(nil), m.Learners...)
+	}
+	return c
+}
+
+// equalStrings reports whether two sorted string slices are identical. A nil
+// slice and an empty slice are considered equal.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// membershipEqual reports whether two membership envelopes are semantically
+// identical. Both nil envelopes are equal; nil and non-nil are not.
+func membershipEqual(a, b *SnapshotMembership) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.ConfigEpoch == b.ConfigEpoch &&
+		equalStrings(a.Voters, b.Voters) &&
+		equalStrings(a.Learners, b.Learners)
 }

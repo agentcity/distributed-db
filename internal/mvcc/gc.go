@@ -228,6 +228,44 @@ func (s *Store) GCWithStats(safePoint uint64) (GCStats, error) {
 	return stats, s.applyDeletes(deletes)
 }
 
+// OldestLockStartTS returns the smallest startTS among all lock records and
+// whether any lock exists. It is the conservative cap a caller should apply to
+// a GC safe point: a transaction that has written a lock may still commit or
+// roll back later, and its startTS is a lower bound on versions it can still
+// need. Locks are never deleted by GC; expired locks are counted too, because
+// until the lock resolver finishes them this store cannot prove the
+// transaction is gone.
+//
+// The scan is O(number of locks) and is intended for periodic maintenance,
+// not the read path.
+func (s *Store) OldestLockStartTS() (uint64, bool, error) {
+	it, err := s.engine.NewIter([]byte{lockCF}, []byte{lockCF + 1})
+	if err != nil {
+		return 0, false, err
+	}
+	defer it.Close()
+
+	var (
+		oldest uint64
+		found  bool
+	)
+	for it.Valid() {
+		rec, err := decodeLock(it.Value())
+		if err != nil {
+			return 0, false, fmt.Errorf("mvcc: decode lock while scanning GC bound: %w", err)
+		}
+		if !found || rec.startTS < oldest {
+			oldest = rec.startTS
+			found = true
+		}
+		it.Next()
+	}
+	if err := it.Error(); err != nil {
+		return 0, false, err
+	}
+	return oldest, found, nil
+}
+
 // latestRealWriteAtOrBefore returns the newest put/delete record for key with a
 // commitTS <= maxVersion.
 func (s *Store) latestRealWriteAtOrBefore(key []byte, maxVersion uint64) (writeRecord, uint64, bool, error) {

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -354,7 +355,7 @@ func TestSnapshotToStoreStreamsAndPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSnapshot: %v", err)
 	}
-	if gotMeta != meta {
+	if !reflect.DeepEqual(gotMeta, meta) {
 		t.Fatalf("stored meta = %+v, want %+v", gotMeta, meta)
 	}
 	data, err := io.ReadAll(rc)

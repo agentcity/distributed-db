@@ -45,20 +45,27 @@ type walRecord struct {
 	Entries   []model.Entry `json:"entries,omitempty"`
 	FromIndex uint64        `json:"from_index,omitempty"`
 	// Membership records. Voters includes the local node; Learners are
-	// non-voting members. They are written by SaveMembership.
-	Voters   []string `json:"voters,omitempty"`
-	Learners []string `json:"learners,omitempty"`
+	// non-voting members. ConfigEpoch is the membership version; 0 marks a
+	// record written by an older version (normalized to epoch 1 on load).
+	Voters      []string `json:"voters,omitempty"`
+	Learners    []string `json:"learners,omitempty"`
+	ConfigEpoch uint64   `json:"config_epoch,omitempty"`
 }
 
 // snapshotMeta is the durable description of the current snapshot. The data
 // file is versioned by index so a crash between writing the data and the meta
 // leaves the previous meta pointing at an untouched file.
+//
+// Membership is the optional Raft membership envelope. It is absent from
+// metadata written by older versions, which must keep loading as legacy
+// snapshots.
 type snapshotMeta struct {
-	Index    uint64 `json:"index"`
-	Term     uint64 `json:"term"`
-	DataFile string `json:"data_file"`
-	Size     int64  `json:"size"`
-	CRC32    uint32 `json:"crc32"`
+	Index      uint64              `json:"index"`
+	Term       uint64              `json:"term"`
+	DataFile   string              `json:"data_file"`
+	Size       int64               `json:"size"`
+	CRC32      uint32              `json:"crc32"`
+	Membership *SnapshotMembership `json:"membership,omitempty"`
 }
 
 // FileStore is an append-only WAL LogStore. Every mutation is fsynced before
@@ -78,8 +85,10 @@ type FileStore struct {
 	entries  []model.Entry
 	// voters and learners are the last persisted Raft membership. A nil
 	// voters slice means no membership record has ever been written.
-	voters   []string
-	learners []string
+	// configEpoch is the persisted membership version (0 for a legacy record).
+	voters      []string
+	learners    []string
+	configEpoch uint64
 	// prefix is the highest index removed by TruncatePrefix. Entries are
 	// contiguous from prefix+1 (or empty).
 	prefix   uint64
@@ -89,11 +98,14 @@ type FileStore struct {
 var errStoreClosed = errors.New("raft: log store closed")
 
 // FileStore implements the base LogStore and the optional group-commit
-// BatchAppender and streaming SnapshotStreamStore capabilities.
+// BatchAppender, streaming SnapshotStreamStore, membership and snapshot
+// membership capabilities.
 var (
-	_ BatchAppender       = (*FileStore)(nil)
-	_ SnapshotStreamStore = (*FileStore)(nil)
-	_ MembershipStore     = (*FileStore)(nil)
+	_ BatchAppender                 = (*FileStore)(nil)
+	_ SnapshotStreamStore           = (*FileStore)(nil)
+	_ SnapshotMembershipStreamStore = (*FileStore)(nil)
+	_ MembershipStore               = (*FileStore)(nil)
+	_ MembershipEpochStore          = (*FileStore)(nil)
 )
 
 // NewFileStore opens (creating if needed) the WAL in dir and replays it. A
@@ -238,12 +250,15 @@ func (s *FileStore) applyRecord(rec walRecord) error {
 		}
 	case "membership":
 		// A legacy WAL has no membership record and keeps working: the node
-		// then initializes from its static configuration.
+		// then initializes from its static configuration. A record without a
+		// config epoch was written by an older version; epoch 0 is normalized
+		// to the initial epoch (1) by the node.
 		if len(rec.Voters) == 0 {
 			return errors.New("raft: WAL membership record has no voters")
 		}
 		s.voters = append([]string(nil), rec.Voters...)
 		s.learners = append([]string(nil), rec.Learners...)
+		s.configEpoch = rec.ConfigEpoch
 	default:
 		return fmt.Errorf("raft: unknown WAL record type %q", rec.Type)
 	}
@@ -320,7 +335,17 @@ func (s *FileStore) SaveMeta(term uint64, votedFor string) error {
 // must be non-empty and include the local node; callers validate that before
 // calling. The record is independent of the log, so membership survives a
 // restart even after the config entries that produced it were compacted.
+//
+// SaveMembership writes a legacy-compatible record with no config epoch; use
+// SaveMembershipEpoch to persist the epoch as well.
 func (s *FileStore) SaveMembership(voters, learners []string) error {
+	return s.SaveMembershipEpoch(voters, learners, 0)
+}
+
+// SaveMembershipEpoch durably records the voter/learner sets together with the
+// monotonic membership config epoch. An epoch of 0 is written as a legacy
+// record.
+func (s *FileStore) SaveMembershipEpoch(voters, learners []string, epoch uint64) error {
 	if len(voters) == 0 {
 		return errors.New("raft: membership must have at least one voter")
 	}
@@ -331,11 +356,12 @@ func (s *FileStore) SaveMembership(voters, learners []string) error {
 	}
 	v := append([]string(nil), voters...)
 	l := append([]string(nil), learners...)
-	if err := s.writeRecord(walRecord{Type: "membership", Voters: v, Learners: l}); err != nil {
+	if err := s.writeRecord(walRecord{Type: "membership", Voters: v, Learners: l, ConfigEpoch: epoch}); err != nil {
 		return err
 	}
 	s.voters = v
 	s.learners = l
+	s.configEpoch = epoch
 	return nil
 }
 
@@ -352,6 +378,21 @@ func (s *FileStore) LoadMembership() ([]string, []string, error) {
 		return nil, nil, nil
 	}
 	return append([]string(nil), s.voters...), append([]string(nil), s.learners...), nil
+}
+
+// LoadMembershipEpoch returns the persisted voter/learner sets and their config
+// epoch. A legacy record has epoch 0; a store with no record returns nil, nil,
+// 0, nil.
+func (s *FileStore) LoadMembershipEpoch() ([]string, []string, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, 0, errStoreClosed
+	}
+	if len(s.voters) == 0 {
+		return nil, nil, 0, nil
+	}
+	return append([]string(nil), s.voters...), append([]string(nil), s.learners...), s.configEpoch, nil
 }
 
 // Append durably appends contiguous entries. It is atomic with respect to the
@@ -440,32 +481,48 @@ func (s *FileStore) TruncatePrefix(index uint64) error {
 }
 
 // SaveSnapshot durably stores snapshot data and metadata under the store's
-// snapshot/ directory. Both files are written to temporaries, fsynced and
-// renamed; the meta file is the commit point, and its data file name is
-// versioned by index so a crash cannot pair new data with old metadata.
+// snapshot/ directory. The snapshot's optional membership envelope is stored in
+// the metadata, so a node that restarts from this snapshot recovers both the
+// data and the voter/learner configuration.
 func (s *FileStore) SaveSnapshot(snapshot Snapshot) error {
-	return s.SaveSnapshotFromReader(snapshot.Index, snapshot.Term, bytes.NewReader(snapshot.Data))
+	return s.SaveSnapshotFromReaderWithMembership(snapshot.Index, snapshot.Term, snapshot.Membership, bytes.NewReader(snapshot.Data))
 }
 
 // SaveSnapshotFromReader durably stores a snapshot whose payload is read from
-// r. The payload is streamed to a temporary file in snapshot/ while its size
-// and IEEE CRC-32 are computed, then fsynced and renamed into a data file
-// versioned by index. Only after that does the meta file get atomically
-// replaced, which is the commit point: a reader or write error, or a crash
-// before the meta rename, leaves the previous snapshot untouched.
+// r. It writes a legacy snapshot without membership metadata; use
+// SaveSnapshotFromReaderWithMembership to persist membership atomically with
+// the payload.
+func (s *FileStore) SaveSnapshotFromReader(index, term uint64, r io.Reader) error {
+	return s.SaveSnapshotFromReaderWithMembership(index, term, nil, r)
+}
+
+// SaveSnapshotFromReaderWithMembership durably stores a snapshot whose payload
+// is read from r, together with its optional membership envelope. The payload
+// is streamed to a temporary file in snapshot/ while its size and IEEE CRC-32
+// are computed, then fsynced and renamed into a data file versioned by index.
+// Only after that does the meta file get atomically replaced, which is the
+// commit point: a reader or write error, or a crash before the meta rename,
+// leaves the previous snapshot untouched.
 //
 // A snapshot that is not newer than the current one is ignored without
-// consuming r, mirroring SaveSnapshot. The data file and meta file are the
-// only persistent state; stale data and .tmp files are removed best-effort
-// after a successful commit. SaveSnapshotFromReader never holds the whole
-// payload in memory.
-func (s *FileStore) SaveSnapshotFromReader(index, term uint64, r io.Reader) error {
+// consuming r, mirroring SaveSnapshot. A membership envelope is validated
+// before anything is written, and a snapshot whose config epoch is older than
+// the stored snapshot's epoch is rejected rather than committing a stale
+// configuration. The data file and meta file are the only persistent state;
+// stale data and .tmp files are removed best-effort after a successful commit.
+// SaveSnapshotFromReaderWithMembership never holds the whole payload in memory.
+func (s *FileStore) SaveSnapshotFromReaderWithMembership(index, term uint64, membership *SnapshotMembership, r io.Reader) error {
 	if index == 0 {
 		return errors.New("raft: snapshot index must be positive")
 	}
 	if r == nil {
 		return errors.New("raft: nil snapshot reader")
 	}
+	normalized, err := normalizeSnapshotMembership(membership)
+	if err != nil {
+		return err
+	}
+	membership = normalized
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -473,6 +530,11 @@ func (s *FileStore) SaveSnapshotFromReader(index, term uint64, r io.Reader) erro
 	}
 	if index <= s.snapMeta.Index {
 		return nil
+	}
+	if membership != nil && s.snapMeta.Membership != nil &&
+		membership.ConfigEpoch < s.snapMeta.Membership.ConfigEpoch {
+		return fmt.Errorf("%w: snapshot epoch %d, stored epoch %d",
+			ErrStaleSnapshotMembership, membership.ConfigEpoch, s.snapMeta.Membership.ConfigEpoch)
 	}
 
 	dir, err := s.snapshotDirLocked()
@@ -518,11 +580,12 @@ func (s *FileStore) SaveSnapshotFromReader(index, term uint64, r io.Reader) erro
 	}
 
 	meta := snapshotMeta{
-		Index:    index,
-		Term:     term,
-		DataFile: dataName,
-		Size:     size,
-		CRC32:    hasher.Sum32(),
+		Index:      index,
+		Term:       term,
+		DataFile:   dataName,
+		Size:       size,
+		CRC32:      hasher.Sum32(),
+		Membership: cloneMembership(membership),
 	}
 	payload, err := json.Marshal(meta)
 	if err != nil {
@@ -563,11 +626,12 @@ func (s *FileStore) OpenSnapshot() (SnapshotMeta, io.ReadCloser, error) {
 		return SnapshotMeta{}, nil, nil
 	}
 	return SnapshotMeta{
-		Index: meta.Index,
-		Term:  meta.Term,
-		Size:  meta.Size,
-		CRC32: meta.CRC32,
-		File:  filepath.Join(snapshotDirName, meta.DataFile),
+		Index:      meta.Index,
+		Term:       meta.Term,
+		Size:       meta.Size,
+		CRC32:      meta.CRC32,
+		File:       filepath.Join(snapshotDirName, meta.DataFile),
+		Membership: cloneMembership(meta.Membership),
 	}, f, nil
 }
 
@@ -637,7 +701,12 @@ func (s *FileStore) loadSnapshotLocked() (Snapshot, error) {
 	if int64(len(data)) != meta.Size || crc32.ChecksumIEEE(data) != meta.CRC32 {
 		return Snapshot{}, fmt.Errorf("raft: snapshot data at index %d is corrupt", meta.Index)
 	}
-	return Snapshot{Index: meta.Index, Term: meta.Term, Data: data}, nil
+	return Snapshot{
+		Index:      meta.Index,
+		Term:       meta.Term,
+		Data:       data,
+		Membership: cloneMembership(meta.Membership),
+	}, nil
 }
 
 // openSnapshotLocked opens the data file described by the current metadata.
@@ -689,6 +758,11 @@ func readSnapshotMeta(dir string) (snapshotMeta, error) {
 	if meta.Size < 0 {
 		return snapshotMeta{}, fmt.Errorf("raft: invalid snapshot size %d", meta.Size)
 	}
+	normalized, err := normalizeSnapshotMembership(meta.Membership)
+	if err != nil {
+		return snapshotMeta{}, fmt.Errorf("raft: snapshot metadata: %w", err)
+	}
+	meta.Membership = normalized
 	return meta, nil
 }
 

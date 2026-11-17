@@ -31,6 +31,7 @@ func main() {
 	metaID := flag.String("meta-id", "", "meta node id, defaults to -addr")
 	metaPeers := flag.String("meta-peers", "", "comma-separated other meta gRPC addresses")
 	metaDataDir := flag.String("meta-data-dir", "./data/meta", "meta Raft WAL/snapshot directory")
+	adminToken := registerAdminTokenFlag(flag.CommandLine)
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
 	durability := flag.String("durability", kvserver.DurabilitySync,
 		`state-machine durability for -mode=node: "sync" (fsync every batch; production default) `+
@@ -55,13 +56,7 @@ func main() {
 		if metaIDVal == "" {
 			metaIDVal = *addr
 		}
-		metaCfg := metaserver.Config{
-			Addr: *addr, ID: metaIDVal, Peers: splitList(*metaPeers),
-			DataDir: *metaDataDir, Logger: log, TLS: tlsCfg,
-		}
-		if len(metaCfg.Peers) > 0 {
-			metaCfg.Replicated = true
-		}
+		metaCfg := metaServerConfig(*addr, metaIDVal, *metaDataDir, splitList(*metaPeers), log, tlsCfg, *adminToken)
 		srv, err := metaserver.New(metaCfg)
 		if err != nil {
 			fatal(err)
@@ -71,7 +66,8 @@ func main() {
 		if err := srv.Start(ctx); err != nil {
 			fatal(err)
 		}
-		log.Info("kv2 meta started", "addr", srv.Addr(), "tls", tlsCfg.Enabled(), "mtls", *tlsClientCA != "")
+		log.Info("kv2 meta started", "addr", srv.Addr(), "tls", tlsCfg.Enabled(),
+			"mtls", *tlsClientCA != "", "admin_auth", *adminToken != "")
 		<-ctx.Done()
 		_ = srv.Stop()
 
@@ -113,6 +109,29 @@ func main() {
 	default:
 		fatal(fmt.Errorf("unknown mode %q (want node or meta)", *mode))
 	}
+}
+
+// registerAdminTokenFlag registers the meta admin-token flag. It is split out
+// so a test can assert the flag name and parsing without starting a server.
+func registerAdminTokenFlag(fs *flag.FlagSet) *string {
+	return fs.String("admin-token", "",
+		"meta mode: Bearer token required on meta admin RPCs "+
+			"(SetRanges/SplitRange/MergeRanges); empty disables the check (development only)")
+}
+
+// metaServerConfig assembles the meta server configuration from flags. It is a
+// helper so tests can assert that -admin-token and the peer list are wired
+// into metaserver.Config without starting a listener.
+func metaServerConfig(addr, id, dataDir string, peers []string, log *slog.Logger, tlsCfg grpctls.Options, adminToken string) metaserver.Config {
+	cfg := metaserver.Config{
+		Addr: addr, ID: id, Peers: peers,
+		DataDir: dataDir, Logger: log, TLS: tlsCfg,
+		AdminToken: adminToken,
+	}
+	if len(cfg.Peers) > 0 {
+		cfg.Replicated = true
+	}
+	return cfg
 }
 
 // tlsOptions builds and validates the cluster TLS configuration from the

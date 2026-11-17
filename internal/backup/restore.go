@@ -122,6 +122,16 @@ type RestoreConfig struct {
 	// Check reads every restored key back at one TSO after writing and
 	// compares its value. It is slower but useful for one-off restores.
 	Check bool
+	// RequireEmpty rejects a target that already has any visible key before
+	// the first write. Use it to ensure an MVP restore goes into a dedicated,
+	// fenced target instead of mixing with live data (restore never deletes
+	// keys that are absent from the backup).
+	RequireEmpty bool
+	// VerifyHook runs after the manifest and every chunk checksum have been
+	// validated and before any write or range-map change. A non-nil error
+	// aborts the restore. It is the explicit place for an operator or restore
+	// drill to verify the manifest, plan or target identity.
+	VerifyHook func(context.Context, *VerifyReport) error
 }
 
 // RestoreReport summarizes a restore.
@@ -136,12 +146,14 @@ type RestoreReport struct {
 
 // Restore validates the whole backup first, ensures the target range layout is
 // compatible (or replaces it when EnsureRanges is set), then writes one
-// transaction per chunk. Verify runs before the first write, so a corrupt
-// backup never leaves a partially restored key space.
+// transaction per chunk. The manifest and every chunk checksum are verified
+// before the first write or range-map change, so a corrupt backup never leaves
+// a partially restored key space.
 //
 // Restore is idempotent for an unchanged backup: it overwrites the same keys
 // with the same values. It does not delete keys that are absent from the
-// backup and it is not an atomic, online operation.
+// backup and it is not an atomic, online operation. This is not PITR: there is
+// no replay to an arbitrary TSO and no atomic cluster cutover.
 func Restore(ctx context.Context, cfg RestoreConfig) (*RestoreReport, error) {
 	if cfg.Client == nil {
 		return nil, errors.New("backup: Client is required")
@@ -158,8 +170,14 @@ func Restore(ctx context.Context, cfg RestoreConfig) (*RestoreReport, error) {
 		return nil, err
 	}
 	// Full checksum pass before the first write.
-	if _, err := verifyLoaded(ctx, dir, m); err != nil {
+	verified, err := verifyLoaded(ctx, dir, m)
+	if err != nil {
 		return nil, err
+	}
+	if cfg.VerifyHook != nil {
+		if err := cfg.VerifyHook(ctx, verified); err != nil {
+			return nil, fmt.Errorf("restore: verification hook: %w", err)
+		}
 	}
 
 	target, err := cfg.Meta.ListRanges(ctx)
@@ -170,6 +188,13 @@ func Restore(ctx context.Context, cfg RestoreConfig) (*RestoreReport, error) {
 	sortRanges(target)
 	if err := validateRangeList(target); err != nil {
 		return nil, fmt.Errorf("%w: target range map: %v", ErrRangeMismatch, err)
+	}
+	if cfg.RequireEmpty {
+		// Check before SetRanges and before any key write, so an MVP restore
+		// cannot silently mix backup keys with pre-existing target data.
+		if err := requireEmptyTarget(ctx, cfg.Client, target); err != nil {
+			return nil, err
+		}
 	}
 	if !sameLayout(m.Ranges, target) {
 		if !cfg.EnsureRanges {
@@ -247,6 +272,28 @@ func Restore(ctx context.Context, cfg RestoreConfig) (*RestoreReport, error) {
 		report.Checked = true
 	}
 	return report, nil
+}
+
+// requireEmptyTarget rejects a restore target that already has a visible key.
+// It scans every current target range with limit 1 at one post-begin TSO. The
+// check is best effort: a concurrent writer or a lock-only key can still race
+// it, so the target must be fenced for a real restore drill.
+func requireEmptyTarget(ctx context.Context, client *v2client.Client, ranges []Range) error {
+	txn, err := client.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("restore: begin empty-target check: %w", err)
+	}
+	defer func() { _ = txn.Rollback(ctx) }()
+	for _, r := range ranges {
+		rows, err := txn.Scan(ctx, cloneBytes(r.Start), cloneBytes(r.End), 1)
+		if err != nil {
+			return fmt.Errorf("restore: scan target range %d for emptiness: %w", r.ID, err)
+		}
+		if len(rows) > 0 {
+			return fmt.Errorf("%w: key %q already exists in range %d", ErrTargetNotEmpty, rows[0].Key, r.ID)
+		}
+	}
+	return nil
 }
 
 // checkRestored reads every key back at one post-restore TSO.

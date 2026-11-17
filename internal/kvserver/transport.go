@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/pbconv"
 	"distributed-db/internal/raft"
 
 	"google.golang.org/grpc"
@@ -144,9 +145,10 @@ func (t *peerTransport) InstallSnapshot(ctx context.Context, peer string, req *r
 		Term:     req.Term,
 		LeaderId: req.LeaderID,
 		Snapshot: &pbv2.Snapshot{
-			Index: req.Snapshot.Index,
-			Term:  req.Snapshot.Term,
-			Data:  req.Snapshot.Data,
+			Index:      req.Snapshot.Index,
+			Term:       req.Snapshot.Term,
+			Data:       req.Snapshot.Data,
+			Membership: pbconv.SnapshotMembershipToPB(req.Snapshot.Membership),
 		},
 		RangeId: t.rangeID,
 	})
@@ -176,6 +178,7 @@ func (t *peerTransport) InstallSnapshotChunk(ctx context.Context, peer string, r
 		Done:         req.Done,
 		Size:         req.Size,
 		Crc32:        req.CRC32,
+		Membership:   pbconv.SnapshotMembershipToPB(req.Membership),
 	})
 	if err != nil {
 		return nil, err

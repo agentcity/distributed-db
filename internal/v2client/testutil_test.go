@@ -36,6 +36,8 @@ type fakeMeta struct {
 
 	listRangesFn  func() ([]*pbv2.RangeInfo, error)
 	listRangesN   int
+	setRangesFn   func(*pbv2.SetRangesRequest) (*pbv2.SetRangesResponse, error)
+	setRangesReqs []*pbv2.SetRangesRequest
 	splitRangeFn  func(*pbv2.MetaSplitRangeRequest) (*pbv2.MetaSplitRangeResponse, error)
 	splitRequests []*pbv2.MetaSplitRangeRequest
 	mergeRangesFn func(*pbv2.MetaMergeRangesRequest) (*pbv2.MetaMergeRangesResponse, error)
@@ -82,6 +84,12 @@ func (f *fakeMeta) setLeaderInfo(leader string, term uint64) {
 func (f *fakeMeta) setListRanges(fn func() ([]*pbv2.RangeInfo, error)) {
 	f.mu.Lock()
 	f.listRangesFn = fn
+	f.mu.Unlock()
+}
+
+func (f *fakeMeta) setSetRanges(fn func(*pbv2.SetRangesRequest) (*pbv2.SetRangesResponse, error)) {
+	f.mu.Lock()
+	f.setRangesFn = fn
 	f.mu.Unlock()
 }
 
@@ -189,6 +197,17 @@ func (f *fakeMeta) ListRanges(context.Context, *pbv2.ListRangesRequest, ...grpc.
 		return &pbv2.ListRangesResponse{Ranges: ranges}, nil
 	}
 	return &pbv2.ListRangesResponse{}, nil
+}
+
+func (f *fakeMeta) SetRanges(_ context.Context, req *pbv2.SetRangesRequest, _ ...grpc.CallOption) (*pbv2.SetRangesResponse, error) {
+	f.mu.Lock()
+	f.setRangesReqs = append(f.setRangesReqs, req)
+	fn := f.setRangesFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(req)
+	}
+	return &pbv2.SetRangesResponse{Success: true}, nil
 }
 
 func (f *fakeMeta) SplitRange(_ context.Context, req *pbv2.MetaSplitRangeRequest, _ ...grpc.CallOption) (*pbv2.MetaSplitRangeResponse, error) {

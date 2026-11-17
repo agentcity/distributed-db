@@ -356,6 +356,57 @@ func TestTLSConfigForwarded(t *testing.T) {
 	}
 }
 
+func TestAdminTokenFlagAndEnv(t *testing.T) {
+	t.Run("flag", func(t *testing.T) {
+		t.Setenv("KVCTL_ADMIN_TOKEN", "")
+		f := newFake()
+		run := runCLIArgs(t, f, "", "-meta", "m1", "-admin-token", "from-flag", "ranges")
+		if run.code != 0 {
+			t.Fatalf("ranges = code %d err %q", run.code, run.errOut)
+		}
+		if run.cfg.AdminToken != "from-flag" {
+			t.Fatalf("AdminToken = %q, want from-flag", run.cfg.AdminToken)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("KVCTL_ADMIN_TOKEN", "from-env")
+		f := newFake()
+		run := runCLIArgs(t, f, "", "-meta", "m1", "split", "1", "m")
+		if run.code != 0 {
+			t.Fatalf("split = code %d err %q", run.code, run.errOut)
+		}
+		if run.cfg.AdminToken != "from-env" {
+			t.Fatalf("AdminToken = %q, want from-env", run.cfg.AdminToken)
+		}
+	})
+
+	t.Run("flag overrides env", func(t *testing.T) {
+		t.Setenv("KVCTL_ADMIN_TOKEN", "from-env")
+		f := newFake()
+		run := runCLIArgs(t, f, "", "-meta", "m1", "-admin-token", "from-flag", "merge", "1", "2")
+		if run.code != 0 {
+			t.Fatalf("merge = code %d err %q", run.code, run.errOut)
+		}
+		if run.cfg.AdminToken != "from-flag" {
+			t.Fatalf("AdminToken = %q, want from-flag", run.cfg.AdminToken)
+		}
+	})
+}
+
+func TestAdminTokenNotPrinted(t *testing.T) {
+	const token = "super-secret-admin-token"
+	f := newFake()
+	f.splitErr = errors.New("meta: unauthenticated")
+	run := runCLIArgs(t, f, "", "-meta", "m1", "-admin-token", token, "split", "1", "m")
+	if run.code == 0 {
+		t.Fatal("split unexpectedly succeeded")
+	}
+	if strings.Contains(run.out, token) || strings.Contains(run.errOut, token) {
+		t.Fatalf("token leaked to output: out=%q err=%q", run.out, run.errOut)
+	}
+}
+
 func TestShell(t *testing.T) {
 	f := newFake()
 	code, out, _ := runCLI(t, f, "put a 1\nget a\nquit\n", "-nodes", "n1", "shell")

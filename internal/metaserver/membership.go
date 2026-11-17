@@ -34,6 +34,12 @@ const (
 //
 // The caller must be the meta leader. Changes are serialized by schedulerMu and
 // Raft enforces one server change at a time; there is no joint consensus.
+//
+// AddReplica is an in-process orchestration entry point, not a MetaService RPC,
+// so the meta admin-token interceptor does not gate it. The remote KVService
+// AddReplica RPC is served by kvserver and is outside this package; if these
+// orchestration APIs are ever exposed over the network they need their own
+// admin authentication.
 func (s *Server) AddReplica(ctx context.Context, rangeID uint64, target string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -125,6 +131,11 @@ func (s *Server) AddReplica(ctx context.Context, rangeID uint64, target string) 
 // be restarted as a live replica without going through AddReplica again; its
 // stale voter view can bump terms until it is re-added or its data directory is
 // removed by an operator. There is no placement/capacity decommission policy.
+//
+// RemoveReplica is an in-process orchestration entry point, not a MetaService
+// RPC, so the meta admin-token interceptor does not gate it. The remote
+// KVService RemoveReplica RPC is served by kvserver and is outside this
+// package.
 func (s *Server) RemoveReplica(ctx context.Context, rangeID uint64, target string) error {
 	if ctx == nil {
 		ctx = context.Background()

@@ -87,6 +87,50 @@ type Config struct {
 	// error through one SLO tracker.
 	Metrics *metrics.SLO
 
+	// LifecycleMetrics, when non-nil, receives the storage-lifecycle metrics:
+	// snapshot runs/errors/age, MVCC GC runs/deleted versions/safe point and
+	// the disk-full/free-space gauges. It is optional; logs are always written.
+	LifecycleMetrics *metrics.Registry
+
+	// Storage lifecycle. A completely zero lifecycle block selects
+	// production-safe defaults so a node that does not configure maintenance
+	// still compacts its Raft logs and collects old MVCC versions:
+	//
+	//   SnapshotInterval   DefaultSnapshotInterval (10m)
+	//   GCInterval         DefaultGCInterval (10m)
+	//   GCSafePointLag     DefaultGCSafePointLag (10m)
+	//   DiskCheckInterval  DefaultDiskCheckInterval (1s)
+	//   MinFreeDiskBytes   DefaultMinFreeDiskBytes (256 MiB)
+	//
+	// Setting any lifecycle field opts into explicit mode: a zero interval
+	// then disables that loop (tests/dev), and a negative interval is also
+	// treated as disabled. DisableBackgroundLifecycle disables all three loops
+	// outright; the initial disk probe still runs.
+	//
+	// SnapshotInterval controls the existing Raft Snapshot/SnapshotToStore path
+	// (persist the snapshot first, then truncate the log prefix). GCInterval
+	// controls MVCC GC. One server-level goroutine runs both, visiting ranges
+	// serially.
+	SnapshotInterval  time.Duration
+	GCInterval        time.Duration
+	GCSafePointLag    time.Duration
+	DiskCheckInterval time.Duration
+	MinFreeDiskBytes  int64
+
+	// DisableBackgroundLifecycle turns off the periodic snapshot, GC and disk
+	// loops. It exists for tests and short-lived tools; production should
+	// leave it false. An already-full disk is still detected at New/Start.
+	DisableBackgroundLifecycle bool
+
+	// GCSafePoint, when non-nil, supplies the MVCC GC safe point (a TSO
+	// timestamp). It is the production hook for a real TSO/GC coordinator and
+	// must return a conservative lower bound on the startTS of every
+	// transaction that may still read, advancing monotonically. Returning 0
+	// skips GC for that pass. When nil, the node uses the wall-clock lag
+	// fallback documented on serverLifecycle.safePoint, capped by the oldest
+	// live lock.
+	GCSafePoint func() uint64
+
 	// DurabilityMode selects how the state machine persists committed writes.
 	// Accepted values are case-sensitive:
 	//
@@ -185,7 +229,16 @@ type Server struct {
 	resolverCancel context.CancelFunc
 	locksResolved  atomic.Uint64
 
-	mu       sync.Mutex
+	// lifecycle owns the single background snapshot/GC/disk-probe goroutine.
+	// lifecycleCancel stops it and lifecycleDone is closed when it exits.
+	lifecycle       *serverLifecycle
+	lifecycleCancel context.CancelFunc
+	lifecycleDone   <-chan struct{}
+
+	// mu guards the lifecycle flags below and, via its read side, serializes
+	// background snapshot/GC work with split/merge/remove (which take the
+	// write side). It is not held by client reads or writes.
+	mu       sync.RWMutex
 	started  bool
 	stopped  bool
 	stopOnce sync.Once
@@ -222,6 +275,10 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 100 * time.Millisecond
 	}
+	// Resolve lifecycle defaults before opening storage. The disk guard needs
+	// the free-space floor from the first write, and the initial probe runs in
+	// New so an already-full disk is handled before Start.
+	lifecycleCfg := resolveLifecycleConfig(cfg)
 	// Resolve TLS before touching the filesystem so a half-configured
 	// certificate/key pair fails fast. When TLS is configured there is no
 	// plaintext fallback: either both server and peer credentials are built
@@ -259,10 +316,15 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("kvserver: open shared storage: %w", err)
 	}
 
+	// All ranges share this guarded engine. The wrapper is a no-op for reads
+	// and rejects writes with ErrDiskFull while the disk guard is tripped.
+	diskState := newDiskGuardState(cfg.DataDir, lifecycleCfg.minFreeDiskBytes, cfg.Logger)
+	guarded := newDiskGuardEngine(shared, diskState)
+
 	s := &Server{
 		cfg:        cfg,
 		log:        cfg.Logger.With("node", cfg.ID),
-		engine:     shared,
+		engine:     guarded,
 		syncWrites: syncWrites,
 		peerCreds:  peerCreds,
 		groups:     make(map[uint64]*rangeGroup, len(ranges)),
@@ -273,7 +335,7 @@ func New(cfg Config) (*Server, error) {
 		s.defaultID = ranges[0].ID
 	}
 	for _, rc := range ranges {
-		g, err := newRangeGroup(cfg, shared, rc, peerCreds)
+		g, err := newRangeGroup(cfg, guarded, rc, peerCreds)
 		if err != nil {
 			var errs []error
 			for _, id := range s.groupIDs {
@@ -287,6 +349,7 @@ func New(cfg Config) (*Server, error) {
 		s.groups[rc.ID] = g
 		s.groupIDs = append(s.groupIDs, rc.ID)
 	}
+	s.lifecycle = newServerLifecycle(s, lifecycleCfg, diskState)
 
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(16 << 20),
@@ -297,6 +360,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	if s.cfg.Metrics != nil {
 		opts = append(opts, grpc.ChainUnaryInterceptor(s.metricsInterceptor))
+	}
+	// Reject mutating KV RPCs with a clear ResourceExhausted status while
+	// storage is full. Reads keep working. The interceptor is cheap: one
+	// atomic load per unary RPC.
+	if s.lifecycle != nil {
+		opts = append(opts, grpc.ChainUnaryInterceptor(s.diskGuardUnaryInterceptor))
 	}
 	s.grpcSrv = grpc.NewServer(opts...)
 	pbv2.RegisterKVServiceServer(s.grpcSrv, &kvService{s: s})
@@ -349,12 +418,28 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	resolverCtx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		cancel()
+		return errors.New("kvserver: stopped")
+	}
 	s.resolverCancel = cancel
+	if s.lifecycle != nil && s.lifecycle.enabled() {
+		lifecycleCtx, lifecycleCancel := context.WithCancel(ctx)
+		s.lifecycleCancel = lifecycleCancel
+		s.lifecycleDone = s.lifecycle.start(lifecycleCtx)
+	}
 	s.mu.Unlock()
 	go s.resolveLocksLoop(resolverCtx)
+	var snapshotInterval, gcInterval time.Duration
+	if s.lifecycle != nil {
+		snapshotInterval = s.lifecycle.cfg.snapshotInterval
+		gcInterval = s.lifecycle.cfg.gcInterval
+	}
 	s.log.Info("kvserver started",
 		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID,
-		"sync_writes", s.syncWrites, "tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "")
+		"sync_writes", s.syncWrites, "tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
+		"snapshot_interval", snapshotInterval, "gc_interval", gcInterval)
 	return nil
 }
 
@@ -375,11 +460,16 @@ func (s *Server) stop(ctx context.Context) error {
 	}
 	s.stopped = true
 	cancel := s.resolverCancel
+	lifecycleCancel := s.lifecycleCancel
+	lifecycleDone := s.lifecycleDone
 	grpcSrv := s.grpcSrv
 	lis := s.lis
 	engine := s.engine
 	s.engine = nil
 	s.mu.Unlock()
+	if lifecycleCancel != nil {
+		lifecycleCancel()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -403,6 +493,16 @@ func (s *Server) stop(ctx context.Context) error {
 	}
 	if lis != nil {
 		_ = lis.Close()
+	}
+
+	// Wait for the single lifecycle goroutine before stopping groups or
+	// closing storage. The loop takes Server.mu's read lock per operation, so
+	// once it has exited no snapshot/GC can race shutdown. Waiting is
+	// unconditional: closing storage under an in-flight snapshot/GC would be
+	// the race this loop is meant to avoid. Cancellation is observed between
+	// ranges and between ticks.
+	if lifecycleDone != nil {
+		<-lifecycleDone
 	}
 
 	var errs []error

@@ -1,9 +1,54 @@
 package main
 
 import (
+	"flag"
 	"strings"
 	"testing"
+
+	"distributed-db/internal/grpctls"
 )
+
+func TestAdminTokenFlagIsWired(t *testing.T) {
+	fs := flag.NewFlagSet("kv2-test", flag.ContinueOnError)
+	token := registerAdminTokenFlag(fs)
+	if err := fs.Parse([]string{"-admin-token", "s3cret"}); err != nil {
+		t.Fatalf("parse -admin-token: %v", err)
+	}
+	if *token != "s3cret" {
+		t.Fatalf("parsed admin token = %q, want s3cret", *token)
+	}
+}
+
+func TestAdminTokenFlagDefaultsToEmpty(t *testing.T) {
+	fs := flag.NewFlagSet("kv2-test", flag.ContinueOnError)
+	token := registerAdminTokenFlag(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *token != "" {
+		t.Fatalf("default admin token = %q, want empty (dev-disabled)", *token)
+	}
+}
+
+func TestMetaServerConfigWiresAdminToken(t *testing.T) {
+	cfg := metaServerConfig(":9090", "meta-1", "./data/meta", nil, nil, grpctls.Options{}, "s3cret")
+	if cfg.AdminToken != "s3cret" {
+		t.Fatalf("AdminToken = %q, want s3cret", cfg.AdminToken)
+	}
+	if cfg.Replicated {
+		t.Fatal("standalone meta config unexpectedly enabled replication")
+	}
+}
+
+func TestMetaServerConfigPeersEnableReplication(t *testing.T) {
+	cfg := metaServerConfig(":9090", "meta-1", "./data/meta", []string{"m2:9090"}, nil, grpctls.Options{}, "")
+	if !cfg.Replicated {
+		t.Fatal("peer list did not enable replicated mode")
+	}
+	if cfg.AdminToken != "" {
+		t.Fatalf("AdminToken = %q, want empty dev default", cfg.AdminToken)
+	}
+}
 
 func TestTLSOptionsEmptyIsPlaintext(t *testing.T) {
 	opts, err := tlsOptions("", "", "", "", "")

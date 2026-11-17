@@ -214,6 +214,10 @@ type Client struct {
 	closed  bool
 
 	addrs []string
+	// adminToken is sent as a Bearer credential on meta admin RPCs only. It
+	// is empty when the meta server has the check disabled (development) or
+	// when the client only performs read-only/data work.
+	adminToken string
 	// transportCreds is the credentials used for KV node connections. It is
 	// nil only for a Client built directly by tests, which keeps the plaintext
 	// default; New/NewWithOptions/NewWithTLS always set it.
@@ -275,6 +279,15 @@ type Options struct {
 	// addition to the transport credentials. They are useful for keepalive
 	// settings and test interceptors.
 	DialOptions []grpc.DialOption
+	// AdminToken is sent as "authorization: Bearer <token>" on meta admin
+	// RPCs (SetRanges, SplitRange, MergeRanges). It is required when the meta
+	// server runs with metaserver.Config.AdminToken set and is empty for
+	// development clusters with the check disabled.
+	//
+	// Only admin RPCs carry the token; data-plane operations and the
+	// read-only meta RPCs (ListRanges, GetRange, AllocTS, Leader) never send
+	// it. The token is not included in errors or logs.
+	AdminToken string
 }
 
 // New connects to the meta service and one or more KV nodes over plaintext. It
@@ -295,11 +308,12 @@ func NewWithDialOptions(metaAddr string, addrs []string, opts ...grpc.DialOption
 	if len(addrs) == 0 {
 		return nil, errors.New("v2client: at least one node address is required")
 	}
-	return newClient(metaAddr, addrs, nil, opts...)
+	return newClient(metaAddr, addrs, nil, "", opts...)
 }
 
 // NewWithOptions is New with explicit transport options. When opts.TLS is set,
-// both meta and KV connections use it.
+// both meta and KV connections use it. opts.AdminToken, when set, is sent only
+// on meta admin RPCs.
 func NewWithOptions(metaAddr string, addrs []string, opts Options) (*Client, error) {
 	if metaAddr == "" {
 		return nil, errors.New("v2client: meta address is required")
@@ -307,7 +321,7 @@ func NewWithOptions(metaAddr string, addrs []string, opts Options) (*Client, err
 	if len(addrs) == 0 {
 		return nil, errors.New("v2client: at least one node address is required")
 	}
-	return newClient(metaAddr, addrs, opts.TLS, opts.DialOptions...)
+	return newClient(metaAddr, addrs, opts.TLS, opts.AdminToken, opts.DialOptions...)
 }
 
 // NewWithTLS is New with TLS/mTLS enabled for both meta and KV connections.
@@ -320,7 +334,7 @@ func NewWithTLS(metaAddr string, addrs []string, clientTLS *grpctls.ClientOption
 	if len(addrs) == 0 {
 		return nil, errors.New("v2client: at least one node address is required")
 	}
-	return newClient(metaAddr, addrs, clientTLS)
+	return newClient(metaAddr, addrs, clientTLS, "")
 }
 
 // NewMetaOnly connects only to the meta service over plaintext. It is intended
@@ -329,17 +343,28 @@ func NewWithTLS(metaAddr string, addrs []string, clientTLS *grpctls.ClientOption
 // node address is needed. Data operations are intended for a client created
 // with New.
 func NewMetaOnly(metaAddr string) (*Client, error) {
-	return newClient(metaAddr, nil, nil)
+	return newClient(metaAddr, nil, nil, "")
 }
 
 // NewMetaOnlyWithTLS is NewMetaOnly with TLS/mTLS for the meta connection.
 func NewMetaOnlyWithTLS(metaAddr string, clientTLS *grpctls.ClientOptions) (*Client, error) {
-	return newClient(metaAddr, nil, clientTLS)
+	return newClient(metaAddr, nil, clientTLS, "")
+}
+
+// NewMetaOnlyWithOptions is NewMetaOnly with explicit TLS, dial and admin-token
+// options. Administrative tools that run against a meta server with
+// Config.AdminToken set should use this constructor so that SetRanges,
+// SplitRange and MergeRanges carry the Bearer credential.
+func NewMetaOnlyWithOptions(metaAddr string, opts Options) (*Client, error) {
+	if metaAddr == "" {
+		return nil, errors.New("v2client: meta address is required")
+	}
+	return newClient(metaAddr, nil, opts.TLS, opts.AdminToken, opts.DialOptions...)
 }
 
 // newClient builds a Client. clientTLS nil means plaintext; a non-nil value is
 // validated and used for every meta and KV dial.
-func newClient(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions, opts ...grpc.DialOption) (*Client, error) {
+func newClient(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions, adminToken string, opts ...grpc.DialOption) (*Client, error) {
 	if metaAddr == "" {
 		return nil, errors.New("v2client: meta address is required")
 	}
@@ -358,10 +383,11 @@ func newClient(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions
 	}
 	mc := pbv2.NewMetaServiceClient(cc)
 	return &Client{
-		meta:      mc,
-		metaAddr:  metaAddr,
-		metaSeeds: []string{metaAddr},
-		metaPool:  map[string]*metaEntry{metaAddr: {cc: cc, mc: mc}},
+		adminToken: adminToken,
+		meta:       mc,
+		metaAddr:   metaAddr,
+		metaSeeds:  []string{metaAddr},
+		metaPool:   map[string]*metaEntry{metaAddr: {cc: cc, mc: mc}},
 		metaDial: func(addr string) (*grpc.ClientConn, metaAPI, error) {
 			return dialMeta(addr, metaOpts...)
 		},

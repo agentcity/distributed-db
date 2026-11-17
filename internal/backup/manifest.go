@@ -7,6 +7,39 @@
 // The format is deliberately self-contained: it records the meta range
 // descriptors and the TSO at which every range was scanned. Restore can
 // therefore validate the target's range layout before writing anything.
+//
+// # Snapshot consistency
+//
+// A backup is a cut at one TSO, not a long-running history. It is consistent
+// only when the scan is lock-aware: mvcc.Store.ScanForBackup reads the lock
+// column before the write column from one engine snapshot and fails with
+// ErrLocked if a lock with startTS <= the snapshot TSO exists. Because a commit
+// installs its data/write records and removes the lock in one atomic batch, a
+// key is either visibly locked (the backup aborts and retries) or visibly
+// committed in that same snapshot, so a committed value at or below the TSO
+// cannot be silently omitted. Backup applies a bounded retry budget around that
+// abort; a persistent lock becomes a clear error.
+//
+// The default v2client path cannot enumerate the lock column: it can only
+// probe the locks of keys returned by Txn.Scan through CheckTxnStatus. Supply
+// BackupConfig.Scanner (for example StoreScanner for an in-process store) to
+// get the full lock-aware guarantee, and set RequireLockAwareScan to reject
+// the fallback. Wiring a server-side lock-scan RPC is the remaining production
+// step. Independently, a commit allocated at or below the snapshot TSO whose
+// atomic write batch has not applied yet (notably 1PC) needs the
+// commit-lease/apply barrier from docs/adr/0006-pitr.md; a TSO alone does not
+// close that gap.
+//
+// # Point-in-time scope
+//
+// This package is not PITR. It has no continuous Raft-log archive, no global
+// checkpoint or safe point, no restore-to-an-arbitrary-TSO, no meta/TSO
+// archive, no encryption/retention policy, and no atomic cluster cutover.
+// Restore is a best-effort logical import into an existing target: it
+// overwrites keys present in the backup and does not delete keys absent from
+// it, so it is idempotent for an unchanged backup only. Use RequireEmpty, a
+// dedicated/fenced target cluster and the VerifyHook for an MVP restore drill;
+// see docs/adr/0006-pitr.md for the remaining PITR design.
 package backup
 
 import (
@@ -48,6 +81,9 @@ var (
 	// ErrRangeMismatch is returned when the target range layout does not match
 	// the layout recorded in the manifest.
 	ErrRangeMismatch = errors.New("backup: range layout mismatch")
+	// ErrTargetNotEmpty is returned by Restore with RequireEmpty when the
+	// target already has a visible key.
+	ErrTargetNotEmpty = errors.New("backup: restore target is not empty")
 )
 
 // Range is one meta range descriptor captured at backup time.

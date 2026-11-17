@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 
 	"distributed-db/internal/mvcc"
 	"distributed-db/internal/raft"
@@ -37,8 +36,23 @@ type rangeGroup struct {
 	sm         *stateMachine
 	batcher    *commitBatcher
 
-	// frozen blocks client writes while split/merge copies data.
-	frozen   atomic.Bool
+	// adminMu serialises split/merge administration for this range. It is
+	// held for the whole operation (prepare, copy, clear) so a retry cannot
+	// clear a freeze another in-flight operation still depends on or copy the
+	// same records twice.
+	adminMu sync.Mutex
+
+	// mergedAway records range IDs this group absorbed, so a retry after the
+	// right group has been removed is recognised as already finished. It is
+	// protected by adminMu.
+	mergedAway map[uint64]struct{}
+
+	// splitCopyHook and mergeCopyHook are test seams for fault injection. They
+	// are nil in production. A hook that returns an error makes the copy fail
+	// exactly as a storage error would, after the range is frozen.
+	splitCopyHook func(batch int) error
+	mergeCopyHook func(batch int) error
+
 	stopOnce sync.Once
 	stopErr  error
 }
@@ -84,7 +98,16 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig, peerCreds 
 	}
 
 	store := mvcc.New(engine)
-	sm := &stateMachine{store: store, engine: engine}
+	// Start the freeze generation one below the persisted range epoch. A
+	// successful split/merge increments the epoch, so this is the generation
+	// clients used before the barrier; replaying the prepare raises it by one.
+	// Writes from before that prepare keep the baseline generation, while
+	// writes proposed during the freeze carry an older one and stay rejected.
+	gen := uint64(0)
+	if rc.Epoch > 0 {
+		gen = rc.Epoch - 1
+	}
+	sm := &stateMachine{store: store, engine: engine, freezeGen: gen}
 	tr := newPeerTransport(cfg.Logger, rc.ID, cfg.PeerAddrs, peerCreds)
 	node, err := raft.New(raft.Config{
 		ID:                 cfg.ID,
@@ -158,11 +181,23 @@ func (g *rangeGroup) stop() error {
 	return g.stopErr
 }
 
-// isFrozen reports whether client writes must be rejected. A replicated split
-// prepare freezes every replica; local split/merge uses the frozen flag.
+// isFrozen reports whether client writes must be rejected. A replicated
+// split/merge prepare freezes every replica; local operations install the same
+// state through freezeSplit/freezeMerge.
 func (g *rangeGroup) isFrozen() bool {
-	left, right := g.sm.mergePrepared()
-	return g.frozen.Load() || len(g.sm.splitPrepared()) > 0 || left != 0 || right != 0
+	_, frozen := g.sm.writeTicket()
+	return frozen
+}
+
+// writeTicket returns the generation a new write must carry, or ErrRangeFrozen
+// when a split/merge barrier is active. Capturing the generation before the
+// proposal is what lets Apply reject a write that raced the prepare.
+func (g *rangeGroup) writeTicket() (uint64, error) {
+	gen, frozen := g.sm.writeTicket()
+	if frozen {
+		return 0, ErrRangeFrozen
+	}
+	return gen, nil
 }
 
 func (g *rangeGroup) containsKey(key []byte) bool {

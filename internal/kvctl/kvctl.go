@@ -100,6 +100,13 @@ type Config struct {
 	TLSCert       string
 	TLSKey        string
 	TLSServerName string
+
+	// AdminToken is sent as a Bearer credential on meta admin RPCs (split,
+	// merge). It is required when the meta server enforces
+	// metaserver.Config.AdminToken; read-only commands (ranges, status) and
+	// data commands never carry it. Empty means the server check is disabled
+	// (development) or the command does not need it.
+	AdminToken string
 }
 
 // Runner executes one kvctl invocation. Open creates a backend; tests replace
@@ -148,6 +155,11 @@ Global flags:
   -tls-cert FILE            PEM client certificate for mTLS
   -tls-key FILE             PEM client private key (with -tls-cert)
   -tls-server-name NAME     expected server name for certificate verification
+  -admin-token TOKEN        Bearer token for meta admin RPCs (env KVCTL_ADMIN_TOKEN)
+
+  ranges and status are read-only and never send the admin token. split and
+  merge are admin RPCs; when the meta server was started with -admin-token,
+  pass -admin-token or set KVCTL_ADMIN_TOKEN. The token is never printed.
 
   ranges, status, split and merge only need -meta. get, put, delete, scan,
   txn, shell, ping and backup also require -nodes. Backup defaults to a 10m
@@ -202,6 +214,8 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 	tlsCert := fs.String("tls-cert", "", "PEM client cert for mTLS")
 	tlsKey := fs.String("tls-key", "", "PEM client key for mTLS")
 	tlsServerName := fs.String("tls-server-name", "", "expected server name")
+	adminToken := fs.String("admin-token", envOr("KVCTL_ADMIN_TOKEN", ""),
+		"Bearer token for meta admin RPCs (SetRanges/SplitRange/MergeRanges)")
 	fs.Usage = func() { fmt.Fprint(r.errOut(), usageText) }
 
 	if err := fs.Parse(args); err != nil {
@@ -242,6 +256,7 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		TLSCert:       *tlsCert,
 		TLSKey:        *tlsKey,
 		TLSServerName: *tlsServerName,
+		AdminToken:    *adminToken,
 	}
 	if cfg.Timeout <= 0 {
 		fmt.Fprintln(r.errOut(), "kvctl: -timeout must be > 0")

@@ -16,6 +16,7 @@ import (
 	"distributed-db/internal/model"
 	"distributed-db/internal/mvcc"
 	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/pbconv"
 	"distributed-db/internal/raft"
 	"distributed-db/internal/storage"
 )
@@ -28,19 +29,37 @@ type applyCommand struct {
 	Primary   []byte          `json:"primary,omitempty"`
 	Mutations []mvcc.Mutation `json:"mutations,omitempty"`
 	Keys      [][]byte        `json:"keys,omitempty"`
+	// Gen is the freeze generation observed when the command was proposed.
+	// Apply rejects a command whose generation is stale, which closes the
+	// race where a write is appended to the Raft log after a split/merge
+	// prepare but was accepted (and possibly acknowledged) before it.
+	Gen uint64 `json:"gen,omitempty"`
 }
 
 // stateMachine applies committed Raft commands to MVCC. Exactly one goroutine
-// calls Apply (Raft's apply loop), so no extra mutex is needed.
+// calls Apply (Raft's apply loop), so no extra mutex is needed for the data
+// itself.
 type stateMachine struct {
 	store       *mvcc.Store
 	engine      storage.Engine
 	lastApplied atomic.Uint64
 
+	// applyGate serialises mutating applies with freeze barriers. Mutating
+	// commands hold it for reading; a local split/merge freeze holds it for
+	// writing while the freeze generation is recorded. A distributed prepare
+	// arrives as a Raft entry and takes the same write lock in Apply, so
+	// after it returns no mutation that passed the pre-freeze check can still
+	// be in flight.
+	applyGate sync.RWMutex
+
 	splitMu    sync.RWMutex
 	splitKey   []byte
 	mergeLeft  uint64
 	mergeRight uint64
+	// freezeGen increments once per freeze barrier and is stamped into every
+	// write proposal. It is initialised from the range epoch so a restart
+	// does not forget an epoch already published through the range map.
+	freezeGen uint64
 
 	// batchResults holds the per-command outcome of recently applied
 	// CommandTxnBatch entries until the proposing batcher consumes it.
@@ -48,9 +67,116 @@ type stateMachine struct {
 }
 
 func (m *stateMachine) Apply(entry model.Entry) error {
-	err := m.apply(entry)
+	var err error
+	switch entry.Type {
+	case model.CommandPrewrite, model.CommandCommit, model.CommandPrewriteCommit,
+		model.CommandTxnBatch, model.CommandRollback:
+		m.applyGate.RLock()
+		err = m.apply(entry)
+		m.applyGate.RUnlock()
+	case model.CommandSplitPrepare, model.CommandMergePrepare:
+		m.applyGate.Lock()
+		err = m.apply(entry)
+		m.applyGate.Unlock()
+	default:
+		err = m.apply(entry)
+	}
 	m.lastApplied.Store(entry.Index)
 	return err
+}
+
+// checkWrite rejects a transactional command that was proposed before a
+// freeze barrier but applied after it. Both conditions matter: the frozen
+// state catches commands appended after an active prepare, while the
+// generation catches commands appended during the freeze but applied after a
+// failed operation cleared it again.
+func (m *stateMachine) checkWrite(cmd applyCommand) error {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	if len(m.splitKey) > 0 || m.mergeLeft != 0 || m.mergeRight != 0 {
+		return fmt.Errorf("%w: write applied after split/merge prepare", ErrRangeFrozen)
+	}
+	if cmd.Gen != m.freezeGen {
+		return fmt.Errorf("%w: write generation %d, range generation %d",
+			ErrRangeFrozen, cmd.Gen, m.freezeGen)
+	}
+	return nil
+}
+
+// writeTicket returns the generation a new write must stamp and whether the
+// range is currently frozen. The read is atomic with respect to prepare
+// applies: a caller that observes a writable generation is guaranteed that a
+// later prepare raises the generation, so its proposal is rejected at apply
+// time if it loses the race.
+func (m *stateMachine) writeTicket() (uint64, bool) {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	frozen := len(m.splitKey) > 0 || m.mergeLeft != 0 || m.mergeRight != 0
+	return m.freezeGen, frozen
+}
+
+// prepareSplit records a split freeze barrier. It is idempotent for a retry of
+// the same split key and returns an error for a conflicting split/merge. The
+// caller must hold applyGate for writing or be the apply loop.
+func (m *stateMachine) prepareSplit(key []byte) error {
+	if len(key) == 0 {
+		return fmt.Errorf("%w: split key is empty", ErrRangeFrozen)
+	}
+	m.splitMu.Lock()
+	defer m.splitMu.Unlock()
+	if m.mergeLeft != 0 || m.mergeRight != 0 {
+		return fmt.Errorf("%w: merge %d/%d is already prepared",
+			ErrRangeFrozen, m.mergeLeft, m.mergeRight)
+	}
+	if len(m.splitKey) > 0 {
+		if bytes.Equal(m.splitKey, key) {
+			return nil // Retry of the same prepare: do not double-freeze.
+		}
+		return fmt.Errorf("%w: split key %q is already prepared", ErrRangeFrozen, m.splitKey)
+	}
+	m.splitKey = append([]byte(nil), key...)
+	m.freezeGen++
+	return nil
+}
+
+// prepareMerge records a merge freeze barrier on one of the two participating
+// ranges. It is idempotent for a retry of the same pair.
+func (m *stateMachine) prepareMerge(left, right uint64) error {
+	if left == 0 || right == 0 || left == right {
+		return fmt.Errorf("%w: invalid merge pair %d/%d", ErrRangeFrozen, left, right)
+	}
+	m.splitMu.Lock()
+	defer m.splitMu.Unlock()
+	if len(m.splitKey) > 0 {
+		return fmt.Errorf("%w: split key %q is already prepared", ErrRangeFrozen, m.splitKey)
+	}
+	if m.mergeLeft != 0 || m.mergeRight != 0 {
+		if m.mergeLeft == left && m.mergeRight == right {
+			return nil // Retry of the same prepare: do not double-freeze.
+		}
+		return fmt.Errorf("%w: merge %d/%d is already prepared",
+			ErrRangeFrozen, m.mergeLeft, m.mergeRight)
+	}
+	m.mergeLeft, m.mergeRight = left, right
+	m.freezeGen++
+	return nil
+}
+
+// freezeSplit installs a local split barrier. Unlike a replicated prepare it
+// only freezes this host, matching the host-local contract of Server.SplitRange.
+// Holding the write side of applyGate guarantees that no earlier write is
+// still mutating the store when the copy starts.
+func (m *stateMachine) freezeSplit(key []byte) error {
+	m.applyGate.Lock()
+	defer m.applyGate.Unlock()
+	return m.prepareSplit(key)
+}
+
+// freezeMerge installs a local merge barrier on this host.
+func (m *stateMachine) freezeMerge(left, right uint64) error {
+	m.applyGate.Lock()
+	defer m.applyGate.Unlock()
+	return m.prepareMerge(left, right)
 }
 
 func (m *stateMachine) apply(entry model.Entry) error {
@@ -62,17 +188,26 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode prewrite: %w", err)
 		}
+		if err := m.checkWrite(cmd); err != nil {
+			return err
+		}
 		return m.store.Prewrite(cmd.Mutations, cmd.Primary, cmd.StartTS)
 	case model.CommandCommit:
 		var cmd applyCommand
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode commit: %w", err)
 		}
+		if err := m.checkWrite(cmd); err != nil {
+			return err
+		}
 		return m.store.Commit(cmd.Keys, cmd.StartTS, cmd.CommitTS)
 	case model.CommandPrewriteCommit:
 		var cmd applyCommand
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode prewrite_commit: %w", err)
+		}
+		if err := m.checkWrite(cmd); err != nil {
+			return err
 		}
 		return m.applyOne(cmd)
 	case model.CommandTxnBatch:
@@ -87,24 +222,40 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		// failures: apply every command in order and let the batcher report
 		// each error to its own waiter. Returning an error here would fail
 		// the whole Raft entry for all transactions.
-		commands := make([]mvcc.SingleCommand, len(batch.Commands))
+		errs := make([]error, len(batch.Commands))
+		accepted := make([]int, 0, len(batch.Commands))
+		commands := make([]mvcc.SingleCommand, 0, len(batch.Commands))
 		for i, cmd := range batch.Commands {
-			commands[i] = mvcc.SingleCommand{
+			if err := m.checkWrite(cmd); err != nil {
+				errs[i] = err
+				continue
+			}
+			accepted = append(accepted, i)
+			commands = append(commands, mvcc.SingleCommand{
 				Mutations: cmd.Mutations,
 				Primary:   cmd.Primary,
 				StartTS:   cmd.StartTS,
 				CommitTS:  cmd.CommitTS,
+			})
+		}
+		// One Pebble batch/fsync for all accepted commands. Per-command
+		// conflicts (and stale-generation rejections) remain individual
+		// outcomes.
+		storeErrs := m.store.CommitSingles(commands)
+		for j, err := range storeErrs {
+			if j < len(accepted) {
+				errs[accepted[j]] = err
 			}
 		}
-		// One Pebble batch/fsync for the whole Raft entry. Per-command
-		// conflicts remain individual outcomes.
-		errs := m.store.CommitSingles(commands)
 		m.batchResults.put(batch.ID, errs)
 		return nil
 	case model.CommandRollback:
 		var cmd applyCommand
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode rollback: %w", err)
+		}
+		if err := m.checkWrite(cmd); err != nil {
+			return err
 		}
 		return m.store.Rollback(cmd.Keys, cmd.StartTS)
 	case model.CommandSplitPrepare:
@@ -114,10 +265,7 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode split prepare: %w", err)
 		}
-		m.splitMu.Lock()
-		m.splitKey = append([]byte(nil), cmd.SplitKey...)
-		m.splitMu.Unlock()
-		return nil
+		return m.prepareSplit(cmd.SplitKey)
 	case model.CommandMergePrepare:
 		var cmd struct {
 			Left  uint64 `json:"left"`
@@ -126,10 +274,7 @@ func (m *stateMachine) apply(entry model.Entry) error {
 		if err := json.Unmarshal(entry.Value, &cmd); err != nil {
 			return fmt.Errorf("kvserver: decode merge prepare: %w", err)
 		}
-		m.splitMu.Lock()
-		m.mergeLeft, m.mergeRight = cmd.Left, cmd.Right
-		m.splitMu.Unlock()
-		return nil
+		return m.prepareMerge(cmd.Left, cmd.Right)
 	default:
 		return fmt.Errorf("kvserver: unknown command type %q", entry.Type)
 	}
@@ -150,6 +295,9 @@ func (m *stateMachine) splitPrepared() []byte {
 	return append([]byte(nil), m.splitKey...)
 }
 
+// clearSplit removes the split freeze marker. It is idempotent and does not
+// change the freeze generation, so a write that was proposed during the freeze
+// but applies later is still rejected by checkWrite.
 func (m *stateMachine) clearSplit() {
 	m.splitMu.Lock()
 	m.splitKey = nil
@@ -162,8 +310,20 @@ func (m *stateMachine) mergePrepared() (uint64, uint64) {
 	return m.mergeLeft, m.mergeRight
 }
 
+// clearMerge removes the merge freeze marker from one range. It is idempotent
+// and leaves the generation untouched for the same reason as clearSplit.
 func (m *stateMachine) clearMerge() {
 	m.splitMu.Lock()
+	m.mergeLeft, m.mergeRight = 0, 0
+	m.splitMu.Unlock()
+}
+
+// clearFreeze removes both split and merge markers. Admin retries and conflict
+// paths use it so a failed or stale prepare can never permanently freeze a
+// range.
+func (m *stateMachine) clearFreeze() {
+	m.splitMu.Lock()
+	m.splitKey = nil
 	m.mergeLeft, m.mergeRight = 0, 0
 	m.splitMu.Unlock()
 }
@@ -289,8 +449,9 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	if g.isFrozen() {
-		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	gen, err := g.writeTicket()
+	if err != nil {
+		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	// The primary may live in another range for a cross-range transaction;
 	// each participant only needs the primary pointer, not the primary key.
@@ -298,6 +459,7 @@ func (k *kvService) Prewrite(ctx context.Context, req *pbv2.PrewriteRequest) (*p
 		StartTS:   req.GetStartTs(),
 		Primary:   req.GetPrimary(),
 		Mutations: mutations,
+		Gen:       gen,
 	})
 	if err != nil {
 		return &pbv2.PrewriteResponse{Leader: g.node.Leader(), Error: "encode"}, nil
@@ -330,12 +492,14 @@ func (k *kvService) CommitSingle(ctx context.Context, req *pbv2.CommitSingleRequ
 	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	if g.isFrozen() {
-		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	gen, err := g.writeTicket()
+	if err != nil {
+		return &pbv2.CommitSingleResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	cmd := applyCommand{
 		StartTS: req.GetStartTs(), CommitTS: req.GetCommitTs(),
 		Primary: req.GetPrimary(), Mutations: mutations, Keys: keys,
+		Gen: gen,
 	}
 	// Dedicated batchers coalesce concurrent 1PC commits into one Raft entry;
 	// each waiter still receives its own transaction's result.
@@ -353,13 +517,15 @@ func (k *kvService) Commit(ctx context.Context, req *pbv2.CommitRequest) (*pbv2.
 	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	if g.isFrozen() {
-		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	gen, err := g.writeTicket()
+	if err != nil {
+		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS:  req.GetStartTs(),
 		CommitTS: req.GetCommitTs(),
 		Keys:     req.GetKeys(),
+		Gen:      gen,
 	})
 	if err != nil {
 		return &pbv2.CommitResponse{Leader: g.node.Leader(), Error: "encode"}, nil
@@ -378,12 +544,14 @@ func (k *kvService) Rollback(ctx context.Context, req *pbv2.RollbackRequest) (*p
 	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	if g.isFrozen() {
-		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	gen, err := g.writeTicket()
+	if err != nil {
+		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS: req.GetStartTs(),
 		Keys:    req.GetKeys(),
+		Gen:     gen,
 	})
 	if err != nil {
 		return &pbv2.RollbackResponse{Leader: g.node.Leader(), Error: "encode"}, nil
@@ -432,11 +600,13 @@ func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockReques
 	if err := k.s.checkEpoch(ctx, g); err != nil {
 		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
-	if g.isFrozen() {
-		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(ErrRangeFrozen)}, nil
+	gen, err := g.writeTicket()
+	if err != nil {
+		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: opError(err)}, nil
 	}
 	payload, err := encodeCommand(applyCommand{
 		StartTS: req.GetStartTs(), CommitTS: req.GetCommitTs(), Keys: req.GetKeys(),
+		Gen: gen,
 	})
 	if err != nil {
 		return &pbv2.ResolveLockResponse{Leader: g.node.Leader(), Error: "encode"}, nil
@@ -452,14 +622,15 @@ func (k *kvService) ResolveLock(ctx context.Context, req *pbv2.ResolveLockReques
 }
 
 func (g *rangeGroup) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbackKey []byte) error {
-	if g.isFrozen() {
-		return ErrRangeFrozen
+	gen, err := g.writeTicket()
+	if err != nil {
+		return err
 	}
 	keys := st.Keys
 	if len(keys) == 0 {
 		keys = [][]byte{fallbackKey}
 	}
-	payload, err := encodeCommand(applyCommand{StartTS: st.LockTS, CommitTS: st.CommitTS, Keys: keys})
+	payload, err := encodeCommand(applyCommand{StartTS: st.LockTS, CommitTS: st.CommitTS, Keys: keys, Gen: gen})
 	if err != nil {
 		return err
 	}
@@ -476,20 +647,39 @@ func (g *rangeGroup) resolveLock(ctx context.Context, st mvcc.TxnStatus, fallbac
 // slice and creates the new Raft group. Meta is updated by the coordinator
 // after all replicas succeed.
 func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest) (*pbv2.SplitRangeResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	g, err := k.s.groupForID(req.GetRangeId())
 	if err != nil {
+		return &pbv2.SplitRangeResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+	}
+	g.adminMu.Lock()
+	defer g.adminMu.Unlock()
+	// The range may have been merged away while this call waited.
+	if g, err = k.s.groupForID(req.GetRangeId()); err != nil {
 		return &pbv2.SplitRangeResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
 	leader := g.node.Leader()
 	if req.GetNewRangeId() == 0 || len(req.GetSplitKey()) == 0 {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: "bad split request"}, nil
 	}
+	// A retry after a successful split is idempotent: no prepare is needed and
+	// no records are copied again.
+	if existing := k.s.hostedGroup(req.GetNewRangeId()); existing != nil {
+		g.sm.clearFreeze()
+		if bytes.Equal(existing.cfg.Start, req.GetSplitKey()) {
+			return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
+		}
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: "split range id already in use"}, nil
+	}
 	if err := k.s.acceptEpoch(g, req.GetEpoch()); err != nil {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
 	}
-	if _, ok := k.s.groups[req.GetNewRangeId()]; ok {
-		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
-	}
+
+	// From here on the range may become frozen by our prepare. Every return
+	// path, including a timeout or a failed proposal, must clear it.
+	defer g.sm.clearFreeze()
 	if g.node.IsLeader() {
 		payload, err := json.Marshal(struct {
 			SplitKey []byte `json:"split_key"`
@@ -516,14 +706,15 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 
 	k.s.mu.Lock()
 	defer k.s.mu.Unlock()
-	if _, ok := k.s.groups[req.GetNewRangeId()]; ok {
-		g.sm.clearSplit()
+	if k.s.stopped {
+		return &pbv2.SplitRangeResponse{Leader: leader, Error: "stopped"}, nil
+	}
+	if existing := k.s.hostedGroup(req.GetNewRangeId()); existing != nil {
 		return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
 	}
 	if _, err := k.s.splitLocalLocked(g, req.GetSplitKey(), req.GetNewRangeId(), false); err != nil {
 		return &pbv2.SplitRangeResponse{Leader: leader, Error: opError(err)}, nil
 	}
-	g.sm.clearSplit()
 	return &pbv2.SplitRangeResponse{Success: true, Leader: leader}, nil
 }
 
@@ -531,21 +722,46 @@ func (k *kvService) SplitRange(ctx context.Context, req *pbv2.SplitRangeRequest)
 // groups replicate a prepare command; every replica then moves the right half
 // into the left group and stops the right Raft group.
 func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesRequest) (*pbv2.MergeRangesResponse, error) {
-	left, err := k.s.groupForID(req.GetLeftRangeId())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if req.GetLeftRangeId() == req.GetRightRangeId() {
+		left, err := k.s.groupForID(req.GetLeftRangeId())
+		if err != nil {
+			return &pbv2.MergeRangesResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
+		}
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "same range"}, nil
+	}
+	// Lock both ranges for the whole operation in ascending ID order. Unlike
+	// a process-wide merge lock, per-range locks still let independent
+	// replicas in this process propose their prepares concurrently, which the
+	// distributed prepare handshake requires.
+	left, right, unlock, err := k.s.lockRangePair(req.GetLeftRangeId(), req.GetRightRangeId())
 	if err != nil {
 		return &pbv2.MergeRangesResponse{Leader: k.s.defaultLeader(), Error: opError(err)}, nil
 	}
-	right, err := k.s.groupForID(req.GetRightRangeId())
-	if err != nil {
-		// A partial merge may already have stopped the right group on this
-		// replica. If the left end covers the requested right end, the local
-		// merge is complete and the retry is idempotent.
-		if errors.Is(err, ErrRangeNotFound) && len(req.GetRightEnd()) > 0 && bytes.Equal(left.cfg.End, req.GetRightEnd()) {
+	defer unlock()
+	if right == nil {
+		// A retry may arrive after the merge already finished: the right group
+		// is gone and the left end covers the requested right end (or the left
+		// group recorded the absorption). Clear any leftover freeze and report
+		// success idempotently.
+		left.sm.clearFreeze()
+		done := len(req.GetRightEnd()) > 0 && bytes.Equal(left.cfg.End, req.GetRightEnd())
+		if left.merged(req.GetRightRangeId()) {
+			done = true
+		}
+		if done {
 			return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
 		}
-		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
+		return &pbv2.MergeRangesResponse{
+			Leader: left.node.Leader(),
+			Error:  opError(fmt.Errorf("%w: right id %d", ErrRangeNotFound, req.GetRightRangeId())),
+		}, nil
 	}
 	if len(req.GetRightEnd()) > 0 && !bytes.Equal(right.cfg.End, req.GetRightEnd()) {
+		left.sm.clearFreeze()
+		right.sm.clearFreeze()
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "right end mismatch"}, nil
 	}
 	if left == right {
@@ -561,6 +777,14 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	if err != nil {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "encode"}, nil
 	}
+
+	// Every path after this point may leave either range frozen. Always clear
+	// both markers on return, including prepare timeouts, copy failures and
+	// stop failures, so no range stays permanently frozen.
+	defer func() {
+		left.sm.clearFreeze()
+		right.sm.clearFreeze()
+	}()
 	if left.node.IsLeader() {
 		if err := proposeWhileLeader(ctx, left, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
 			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
@@ -568,7 +792,7 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 	}
 	if right.node.IsLeader() {
 		if err := proposeWhileLeader(ctx, right, model.Entry{Type: model.CommandMergePrepare, Value: payload}); err != nil {
-			return &pbv2.MergeRangesResponse{Leader: right.node.Leader(), Error: opError(err)}, nil
+			return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 		}
 	}
 
@@ -597,14 +821,20 @@ func (k *kvService) MergeRanges(ctx context.Context, req *pbv2.MergeRangesReques
 
 	k.s.mu.Lock()
 	defer k.s.mu.Unlock()
-	if _, ok := k.s.groups[right.cfg.ID]; !ok {
-		left.sm.clearMerge()
-		return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
+	if k.s.stopped {
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "stopped"}, nil
+	}
+	if k.s.hostedGroup(left.cfg.ID) != left || k.s.hostedGroup(right.cfg.ID) != right {
+		// Membership removed one side while this RPC waited for s.mu. Report
+		// the idempotent case when the left group already covers the right end.
+		if k.s.hostedGroup(left.cfg.ID) == left && left.merged(right.cfg.ID) {
+			return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
+		}
+		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: "range disappeared during merge"}, nil
 	}
 	if _, err := k.s.mergeLocalLocked(left, right); err != nil {
 		return &pbv2.MergeRangesResponse{Leader: left.node.Leader(), Error: opError(err)}, nil
 	}
-	left.sm.clearMerge()
 	return &pbv2.MergeRangesResponse{Success: true, Leader: left.node.Leader()}, nil
 }
 
@@ -760,9 +990,10 @@ func (r *raftService) InstallSnapshot(ctx context.Context, req *pbv2.InstallSnap
 		Term:     req.GetTerm(),
 		LeaderID: req.GetLeaderId(),
 		Snapshot: raft.Snapshot{
-			Index: req.GetSnapshot().GetIndex(),
-			Term:  req.GetSnapshot().GetTerm(),
-			Data:  req.GetSnapshot().GetData(),
+			Index:      req.GetSnapshot().GetIndex(),
+			Term:       req.GetSnapshot().GetTerm(),
+			Data:       req.GetSnapshot().GetData(),
+			Membership: pbconv.SnapshotMembershipFromPB(req.GetSnapshot().GetMembership()),
 		},
 	})
 	if err != nil {
@@ -798,6 +1029,7 @@ func (r *raftService) InstallSnapshotChunk(ctx context.Context, req *pbv2.Instal
 		Done:         req.GetDone(),
 		Size:         req.GetSize(),
 		CRC32:        req.GetCrc32(),
+		Membership:   pbconv.SnapshotMembershipFromPB(req.GetMembership()),
 	})
 	if err != nil {
 		return nil, err

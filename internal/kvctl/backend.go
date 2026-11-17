@@ -24,18 +24,13 @@ func openV2Backend(_ context.Context, cfg Config) (Backend, error) {
 			return nil, err
 		}
 	}
+	// The admin token is only attached to meta admin RPCs by v2client; ranges
+	// and status stay read-only and work without it.
+	opts := v2client.Options{TLS: tls, AdminToken: cfg.AdminToken}
 	if len(cfg.Nodes) == 0 {
-		if tls != nil {
-			c, err = v2client.NewMetaOnlyWithTLS(cfg.Meta, tls)
-		} else {
-			c, err = v2client.NewMetaOnly(cfg.Meta)
-		}
+		c, err = v2client.NewMetaOnlyWithOptions(cfg.Meta, opts)
 	} else {
-		if tls != nil {
-			c, err = v2client.NewWithTLS(cfg.Meta, cfg.Nodes, tls)
-		} else {
-			c, err = v2client.New(cfg.Meta, cfg.Nodes)
-		}
+		c, err = v2client.NewWithOptions(cfg.Meta, cfg.Nodes, opts)
 	}
 	if err != nil {
 		return nil, err
@@ -164,6 +159,10 @@ func (b *v2Backend) MetaLeader(ctx context.Context) (string, uint64, error) {
 	return b.client.MetaLeader(ctx)
 }
 
+// Backup reads the range map through internal/backup's own meta connection.
+// It is read-only (ListRanges), so it does not need the admin token. Restore is
+// the operation that calls SetRanges; it lives in internal/backup and its
+// separate MetaClient does not accept an admin token yet (known gap).
 func (b *v2Backend) Backup(ctx context.Context, opts BackupOptions) (BackupResult, error) {
 	meta, err := backup.OpenMeta([]string{b.cfg.Meta})
 	if err != nil {

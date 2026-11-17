@@ -54,10 +54,13 @@ type snapshotChunkRecv struct {
 	size         int64
 	crc32        uint32
 	offset       uint64
-	file         *os.File
-	path         string
-	crc          hash.Hash32
-	updated      time.Time
+	// membership is the optional snapshot membership envelope repeated by the
+	// leader. It is validated on every chunk and installed with the snapshot.
+	membership *SnapshotMembership
+	file       *os.File
+	path       string
+	crc        hash.Hash32
+	updated    time.Time
 
 	// lastOffset/lastData/lastDone describe the most recently accepted chunk so
 	// an immediate retry of it (the response was lost) is idempotent.
@@ -231,6 +234,14 @@ func (n *Node) sendInstallSnapshotChunks(
 	var pending []byte // bytes of the chunk currently being retried
 	eof := false
 	failures := 0
+	// Repeat the membership envelope on every chunk so the receiver validates
+	// that the whole upload belongs to one snapshot and can install the
+	// configuration when the final chunk arrives. Fall back to the leader's
+	// in-memory snapshot when the store cannot persist membership metadata.
+	chunkMembership := cloneMembership(meta.Membership)
+	if chunkMembership == nil {
+		chunkMembership = cloneMembership(snap.Membership)
+	}
 
 	for {
 		if !n.isLeaderFor(term) {
@@ -282,6 +293,7 @@ func (n *Node) sendInstallSnapshotChunks(
 			Offset:       offset,
 			Size:         meta.Size,
 			CRC32:        meta.CRC32,
+			Membership:   chunkMembership,
 		}
 		if isDone {
 			req.Done = true
@@ -679,6 +691,10 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 	if len(req.Data) == 0 && !req.Done {
 		return n.rejectSnapshotChunk(term, "empty non-final chunk")
 	}
+	reqMembership, err := normalizeSnapshotMembership(req.Membership)
+	if err != nil {
+		return n.rejectSnapshotChunk(term, err.Error())
+	}
 	if upToDate {
 		// The snapshot was already installed (or covered by commit); this also
 		// makes a retried final chunk idempotent. Report the final size so a
@@ -729,6 +745,7 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 			snapshotTerm: req.SnapshotTerm,
 			size:         req.Size,
 			crc32:        req.CRC32,
+			membership:   cloneMembership(reqMembership),
 			file:         file,
 			path:         file.Name(),
 			crc:          crc32.NewIEEE(),
@@ -744,6 +761,14 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 	}
 	if recv.crc32 == 0 {
 		recv.crc32 = req.CRC32
+	}
+	if reqMembership != nil {
+		if recv.membership == nil {
+			recv.membership = cloneMembership(reqMembership)
+		} else if !membershipEqual(recv.membership, reqMembership) {
+			n.dropSnapshotChunkLocked(req.LeaderID)
+			return n.rejectSnapshotChunk(term, "snapshot membership changed during upload")
+		}
 	}
 	if req.Size != 0 && recv.size != req.Size {
 		n.dropSnapshotChunkLocked(req.LeaderID)
@@ -819,10 +844,11 @@ func (n *Node) finishSnapshotChunk(recv *snapshotChunkRecv) (*InstallSnapshotChu
 	}
 
 	meta := SnapshotMeta{
-		Index: recv.index,
-		Term:  recv.snapshotTerm,
-		Size:  int64(recv.offset),
-		CRC32: recv.crc.Sum32(),
+		Index:      recv.index,
+		Term:       recv.snapshotTerm,
+		Size:       int64(recv.offset),
+		CRC32:      recv.crc.Sum32(),
+		Membership: cloneMembership(recv.membership),
 	}
 	if err := n.RestoreSnapshotStream(meta, recv.file); err != nil {
 		return nil, err

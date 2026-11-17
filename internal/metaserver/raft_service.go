@@ -6,6 +6,7 @@ import (
 
 	"distributed-db/internal/model"
 	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/pbconv"
 	"distributed-db/internal/raft"
 )
 
@@ -81,7 +82,8 @@ func (r *raftService) InstallSnapshot(ctx context.Context, req *pbv2.InstallSnap
 		Term: req.GetTerm(), LeaderID: req.GetLeaderId(),
 		Snapshot: raft.Snapshot{
 			Index: req.GetSnapshot().GetIndex(), Term: req.GetSnapshot().GetTerm(),
-			Data: req.GetSnapshot().GetData(),
+			Data:       req.GetSnapshot().GetData(),
+			Membership: pbconv.SnapshotMembershipFromPB(req.GetSnapshot().GetMembership()),
 		},
 	})
 	if err != nil {

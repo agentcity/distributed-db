@@ -68,6 +68,9 @@ type Node struct {
 	// this node when it is a voter. cfg.Peers is only the bootstrap input.
 	voters   []string
 	learners map[string]bool
+	// configEpoch is the monotonic version of voters/learners. It is embedded
+	// in snapshots and persisted with membership when the store supports it.
+	configEpoch uint64
 	// configInFlight gates membership changes to one server at a time.
 	configInFlight bool
 	nextIndex      map[string]uint64
@@ -162,17 +165,15 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	voters, learners, err := initMembership(cfg, store)
+	voters, learners, configEpoch, err := initMembership(cfg, store, snap.Membership)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.ForceLearner {
 		// Re-adding a range to a node with an old data directory: overwrite
 		// the stale on-disk membership before the node can campaign.
-		if ms, ok := store.(MembershipStore); ok {
-			if err := ms.SaveMembership(voters, learners); err != nil {
-				return nil, fmt.Errorf("raft: persist forced learner membership: %w", err)
-			}
+		if err := saveMembership(store, voters, learners, configEpoch); err != nil {
+			return nil, fmt.Errorf("raft: persist forced learner membership: %w", err)
 		}
 	}
 	learnerSet := make(map[string]bool, len(learners))
@@ -195,6 +196,7 @@ func New(cfg Config, store LogStore, sm StateMachine, tr Transport) (*Node, erro
 		votes:                make(map[string]bool),
 		voters:               voters,
 		learners:             learnerSet,
+		configEpoch:          configEpoch,
 		nextIndex:            make(map[string]uint64),
 		matchIndex:           make(map[string]uint64),
 		lastAck:              make(map[string]time.Time),
@@ -234,7 +236,7 @@ func loadAndRestoreSnapshot(store LogStore, sm StateMachine) (Snapshot, error) {
 			if err := rc.Close(); err != nil {
 				return Snapshot{}, fmt.Errorf("raft: close snapshot stream: %w", err)
 			}
-			return Snapshot{Index: meta.Index, Term: meta.Term}, nil
+			return Snapshot{Index: meta.Index, Term: meta.Term, Membership: meta.Membership}, nil
 		}
 	}
 
@@ -260,7 +262,7 @@ func loadAndRestoreSnapshot(store LogStore, sm StateMachine) (Snapshot, error) {
 		if rc != nil {
 			_ = rc.Close()
 		}
-		return Snapshot{Index: meta.Index, Term: meta.Term}, nil
+		return Snapshot{Index: meta.Index, Term: meta.Term, Membership: meta.Membership}, nil
 	}
 	return Snapshot{}, nil
 }
@@ -535,6 +537,7 @@ func (n *Node) Status() Status {
 		Voters:      append([]string(nil), n.voters...),
 		Learners:    n.learnerListLocked(),
 		Learner:     n.isLearnerLocked(n.cfg.ID),
+		ConfigEpoch: n.configEpoch,
 	}
 }
 
@@ -587,13 +590,24 @@ func (n *Node) Snapshot() (Snapshot, error) {
 		n.mu.Unlock()
 		return Snapshot{}, fmt.Errorf("raft: snapshot index %d outside log [%d,%d]", index, n.snapshot.Index, n.lastIndexLocked())
 	}
+	// Config entries are Raft state and are never delivered to the state
+	// machine, so its applied index can lag lastApplied. Extend the snapshot
+	// through a contiguous run of config entries so the membership envelope
+	// covers exactly the configuration the snapshot claims to include.
+	index = n.snapshotIndexLocked(index)
 	if index <= n.snapshot.Index {
 		// Nothing new has been applied since the last snapshot. A snapshot
 		// created by SnapshotToStore keeps only metadata in memory, so when the
 		// state machine still reports the same index, return the fresh data
 		// rather than a metadata-only copy.
 		if index == n.snapshot.Index && n.snapshot.Data == nil {
-			snap := Snapshot{Index: index, Term: n.snapshot.Term, Data: append([]byte(nil), data...)}
+			membership := cloneMembership(n.snapshot.Membership)
+			if membership == nil {
+				// Legacy or metadata-only snapshot: attach the membership this
+				// node currently knows so the returned envelope is complete.
+				membership = n.snapshotMembershipLocked()
+			}
+			snap := Snapshot{Index: index, Term: n.snapshot.Term, Data: append([]byte(nil), data...), Membership: membership}
 			n.mu.Unlock()
 			return snap, nil
 		}
@@ -606,7 +620,12 @@ func (n *Node) Snapshot() (Snapshot, error) {
 		n.mu.Unlock()
 		return Snapshot{}, fmt.Errorf("raft: no log entry at snapshot index %d", index)
 	}
-	snap := Snapshot{Index: index, Term: term, Data: append([]byte(nil), data...)}
+	snap := Snapshot{
+		Index:      index,
+		Term:       term,
+		Data:       append([]byte(nil), data...),
+		Membership: n.snapshotMembershipLocked(),
+	}
 
 	// Persist before the local log loses its prefix: a crash in between must
 	// leave a loadable state, never a truncated log without a snapshot.
@@ -673,6 +692,9 @@ func (n *Node) SnapshotToStore() (SnapshotMeta, error) {
 		n.mu.Unlock()
 		return currentSnapshotMeta(store)
 	}
+	// applyMu is held, so the membership cannot change while the state machine
+	// streams the payload; capture it now and embed it in the snapshot.
+	membership := n.snapshotMembershipLocked()
 	n.mu.Unlock()
 
 	scratch, err := n.createSnapshotScratch()
@@ -722,7 +744,7 @@ func (n *Node) SnapshotToStore() (SnapshotMeta, error) {
 
 	// Persist before the local log loses its prefix: a crash in between must
 	// leave a loadable state, never a truncated log without a snapshot.
-	if err := store.SaveSnapshotFromReader(index, term, scratch); err != nil {
+	if err := saveSnapshotFromReader(store, index, term, membership, scratch); err != nil {
 		return SnapshotMeta{}, fmt.Errorf("raft: persist streamed snapshot: %w", err)
 	}
 	meta, rc, err := store.OpenSnapshot()
@@ -756,8 +778,18 @@ func (n *Node) SnapshotToStore() (SnapshotMeta, error) {
 	} else {
 		n.entries = n.entries[index-n.snapshot.Index:]
 	}
-	n.snapshot = Snapshot{Index: index, Term: term}
+	n.snapshot = Snapshot{Index: index, Term: term, Membership: cloneMembership(membership)}
 	return meta, nil
+}
+
+// saveSnapshotFromReader persists a streamed snapshot together with its
+// membership envelope. Stores that implement only SnapshotStreamStore still
+// work; their snapshots then carry no membership (legacy behaviour).
+func saveSnapshotFromReader(store SnapshotStreamStore, index, term uint64, membership *SnapshotMembership, r io.Reader) error {
+	if sms, ok := store.(SnapshotMembershipStreamStore); ok {
+		return sms.SaveSnapshotFromReaderWithMembership(index, term, membership, r)
+	}
+	return store.SaveSnapshotFromReader(index, term, r)
 }
 
 // currentSnapshotMeta returns the metadata of the store's current snapshot
@@ -822,11 +854,21 @@ func (n *Node) createSnapshotTemp(pattern string) (*os.File, error) {
 
 // RestoreSnapshot installs a snapshot received from a leader. The state
 // machine is restored (when it implements SnapshotRestorer), the durable and
-// in-memory logs are truncated to the snapshot, and commit/applied advance to
-// its index.
+// in-memory logs are truncated to the snapshot, commit/applied advance to its
+// index, and the snapshot's membership (when present) replaces the local voter
+// and learner sets and is persisted through MembershipStore.
+//
+// A snapshot without membership metadata (a legacy snapshot) leaves the local
+// membership untouched. Corrupt membership is rejected before any state is
+// changed, and a membership whose config epoch is older than this node's is
+// rejected as stale rather than resurrecting removed voters.
 func (n *Node) RestoreSnapshot(s Snapshot) error {
 	if s.Index == 0 {
 		return errors.New("raft: snapshot index must be positive")
+	}
+	membership, err := normalizeSnapshotMembership(s.Membership)
+	if err != nil {
+		return err
 	}
 
 	n.applyMu.Lock()
@@ -842,6 +884,12 @@ func (n *Node) RestoreSnapshot(s Snapshot) error {
 		n.mu.Unlock()
 		return nil
 	}
+	if membership != nil && membership.ConfigEpoch < n.configEpoch {
+		localEpoch := n.configEpoch
+		n.mu.Unlock()
+		return fmt.Errorf("%w: snapshot epoch %d, local epoch %d",
+			ErrStaleSnapshotMembership, membership.ConfigEpoch, localEpoch)
+	}
 	// Keep a matching suffix: entries after the snapshot are still valid when
 	// this node's log agrees with the leader at the snapshot index.
 	keepSuffix := false
@@ -851,6 +899,7 @@ func (n *Node) RestoreSnapshot(s Snapshot) error {
 	n.mu.Unlock()
 
 	snap := cloneSnapshot(s)
+	snap.Membership = cloneMembership(membership)
 	if r, ok := n.sm.(SnapshotRestorer); ok {
 		if err := r.RestoreSnapshot(append([]byte(nil), snap.Data...)); err != nil {
 			return fmt.Errorf("raft: restore state machine: %w", err)
@@ -897,6 +946,12 @@ func (n *Node) RestoreSnapshot(s Snapshot) error {
 		n.lastApplied = snap.Index
 	}
 	n.applyCond.Broadcast()
+
+	// The snapshot is authoritative for membership: it wins over whatever this
+	// node had before, including a stale voter set it never saw change.
+	if err := n.applySnapshotMembershipLocked(membership); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -916,6 +971,11 @@ func (n *Node) RestoreSnapshot(s Snapshot) error {
 // The store must implement SnapshotStreamStore, otherwise
 // ErrSnapshotStreamUnsupported is returned before any data is consumed.
 //
+// meta.Membership is validated before the stream is consumed. When present it
+// becomes this node's voter/learner configuration (and is persisted through
+// MembershipStore) exactly as in RestoreSnapshot; a nil membership marks a
+// legacy snapshot and leaves the current configuration untouched.
+//
 // The stream is staged in a temporary file while Size and CRC32 are checked
 // (a zero Size or CRC32 means "not supplied" and is not enforced), then
 // restored into the state machine and persisted through the store. The caller
@@ -931,6 +991,10 @@ func (n *Node) RestoreSnapshotStream(meta SnapshotMeta, r io.Reader) error {
 	}
 	if r == nil {
 		return errors.New("raft: nil snapshot stream")
+	}
+	membership, err := normalizeSnapshotMembership(meta.Membership)
+	if err != nil {
+		return err
 	}
 	store, ok := n.store.(SnapshotStreamStore)
 	if !ok {
@@ -949,6 +1013,12 @@ func (n *Node) RestoreSnapshotStream(meta SnapshotMeta, r io.Reader) error {
 		// Already at least as up to date; snapshots are idempotent.
 		n.mu.Unlock()
 		return nil
+	}
+	if membership != nil && membership.ConfigEpoch < n.configEpoch {
+		localEpoch := n.configEpoch
+		n.mu.Unlock()
+		return fmt.Errorf("%w: snapshot epoch %d, local epoch %d",
+			ErrStaleSnapshotMembership, membership.ConfigEpoch, localEpoch)
 	}
 	n.mu.Unlock()
 
@@ -997,7 +1067,7 @@ func (n *Node) RestoreSnapshotStream(meta SnapshotMeta, r io.Reader) error {
 	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("raft: rewind snapshot scratch file: %w", err)
 	}
-	if err := store.SaveSnapshotFromReader(meta.Index, meta.Term, scratch); err != nil {
+	if err := saveSnapshotFromReader(store, meta.Index, meta.Term, membership, scratch); err != nil {
 		return fmt.Errorf("raft: persist installed snapshot: %w", err)
 	}
 
@@ -1032,7 +1102,7 @@ func (n *Node) RestoreSnapshotStream(meta SnapshotMeta, r io.Reader) error {
 		n.entries = nil
 		n.failPendingFromLocked(meta.Index+1, ErrNotLeader)
 	}
-	n.snapshot = Snapshot{Index: meta.Index, Term: meta.Term}
+	n.snapshot = Snapshot{Index: meta.Index, Term: meta.Term, Membership: cloneMembership(membership)}
 	if n.commitIndex < meta.Index {
 		n.commitIndex = meta.Index
 	}
@@ -1040,6 +1110,9 @@ func (n *Node) RestoreSnapshotStream(meta SnapshotMeta, r io.Reader) error {
 		n.lastApplied = meta.Index
 	}
 	n.applyCond.Broadcast()
+	if err := n.applySnapshotMembershipLocked(membership); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1947,6 +2020,30 @@ func (n *Node) majority() int {
 
 func (n *Node) lastIndexLocked() uint64 {
 	return n.snapshot.Index + uint64(len(n.entries))
+}
+
+// snapshotIndexLocked extends a state-machine snapshot index through the
+// applied log entries that are Raft config commands. The state machine never
+// sees config entries, so its reported applied index may be older than
+// lastApplied; the membership embedded in the snapshot belongs to lastApplied.
+// The index is only advanced while every intervening entry is a config command
+// and still present in memory; otherwise the state machine's index is kept.
+// Caller holds mu.
+func (n *Node) snapshotIndexLocked(index uint64) uint64 {
+	if index == 0 || n.lastApplied <= index {
+		return index
+	}
+	for i := index + 1; i <= n.lastApplied; i++ {
+		if i <= n.snapshot.Index {
+			// The entry is compacted and cannot be inspected.
+			return index
+		}
+		e := n.entries[i-n.snapshot.Index-1]
+		if !isConfigCommand(e.Type) {
+			return index
+		}
+	}
+	return n.lastApplied
 }
 
 func (n *Node) firstIndexLocked() uint64 {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pbv2 "distributed-db/internal/pb/v2"
 )
@@ -33,8 +34,19 @@ type metaAPI interface {
 	GetRange(ctx context.Context, in *pbv2.GetRangeRequest, opts ...grpc.CallOption) (*pbv2.RangeInfo, error)
 	Leader(ctx context.Context, in *pbv2.LeaderRequest, opts ...grpc.CallOption) (*pbv2.LeaderResponse, error)
 	ListRanges(ctx context.Context, in *pbv2.ListRangesRequest, opts ...grpc.CallOption) (*pbv2.ListRangesResponse, error)
+	SetRanges(ctx context.Context, in *pbv2.SetRangesRequest, opts ...grpc.CallOption) (*pbv2.SetRangesResponse, error)
 	SplitRange(ctx context.Context, in *pbv2.MetaSplitRangeRequest, opts ...grpc.CallOption) (*pbv2.MetaSplitRangeResponse, error)
 	MergeRanges(ctx context.Context, in *pbv2.MetaMergeRangesRequest, opts ...grpc.CallOption) (*pbv2.MetaMergeRangesResponse, error)
+}
+
+// adminContext attaches the configured admin Bearer credential to an outgoing
+// meta admin call. Read-only and data-plane calls deliberately bypass it so
+// the token is never sent where it is not required.
+func (c *Client) adminContext(ctx context.Context) context.Context {
+	if c.adminToken == "" {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.adminToken)
 }
 
 type metaEntry struct {
@@ -338,12 +350,39 @@ func (c *Client) ListRanges(ctx context.Context) ([]RangeInfo, error) {
 	return out, nil
 }
 
+// SetRanges replaces the whole meta range map. It is an admin RPC and carries
+// the configured admin token; the caller is responsible for applying a layout
+// that is contiguous, sorted and matches the data placement.
+//
+// The operation is idempotent (it replaces the map wholesale), so a transport
+// failure is retried once against a freshly discovered meta leader.
+func (c *Client) SetRanges(ctx context.Context, ranges []RangeInfo) error {
+	req := &pbv2.SetRangesRequest{Ranges: make([]*pbv2.RangeInfo, 0, len(ranges))}
+	for _, r := range ranges {
+		req.Ranges = append(req.Ranges, &pbv2.RangeInfo{
+			Id: r.ID, Start: append([]byte(nil), r.Start...), End: append([]byte(nil), r.End...),
+			Replicas: append([]string(nil), r.Replicas...),
+			Leader:   r.Leader, Version: r.Version,
+		})
+	}
+	return c.metaCall(ctx, func(mc metaAPI) error {
+		resp, err := mc.SetRanges(c.adminContext(ctx), req)
+		if err != nil {
+			return err
+		}
+		if !resp.GetSuccess() {
+			return newMetaServerError("v2client: set ranges failed", resp.GetError())
+		}
+		return nil
+	})
+}
+
 // SplitRange asks the meta service to split rangeID at splitKey and returns
 // the ID of the new right-hand range. The meta service allocates the new ID.
 func (c *Client) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte) (uint64, error) {
 	var newRangeID uint64
 	err := c.metaCall(ctx, func(mc metaAPI) error {
-		resp, err := mc.SplitRange(ctx, &pbv2.MetaSplitRangeRequest{
+		resp, err := mc.SplitRange(c.adminContext(ctx), &pbv2.MetaSplitRangeRequest{
 			RangeId:  rangeID,
 			SplitKey: splitKey,
 		})
@@ -368,7 +407,7 @@ func (c *Client) SplitRange(ctx context.Context, rangeID uint64, splitKey []byte
 // rightID into leftID.
 func (c *Client) MergeRanges(ctx context.Context, leftID, rightID uint64) error {
 	return c.metaCall(ctx, func(mc metaAPI) error {
-		resp, err := mc.MergeRanges(ctx, &pbv2.MetaMergeRangesRequest{
+		resp, err := mc.MergeRanges(c.adminContext(ctx), &pbv2.MetaMergeRangesRequest{
 			LeftRangeId:  leftID,
 			RightRangeId: rightID,
 		})

@@ -37,6 +37,20 @@ type Config struct {
 	Ranges []meta.Range
 	Logger *slog.Logger
 
+	// AdminToken protects the meta admin RPCs (SetRanges, SplitRange,
+	// MergeRanges) with an "authorization: Bearer <token>" check. An empty
+	// value disables the check and is intended for development only.
+	//
+	// The token is independent of TLS: it is checked by a gRPC unary
+	// interceptor and works on both plaintext and TLS/mTLS listeners. It only
+	// authenticates callers; TLS still protects the token in transit.
+	//
+	// Read-only RPCs (AllocTS, GetRange, ListRanges, Leader) never require it.
+	// KVService admin RPCs (AddReplica, RemoveReplica, SplitRange, MergeRanges
+	// on a data node) are served by the kvserver listener and are not covered
+	// by this token.
+	AdminToken string
+
 	// Replicated enables the Raft meta group. ID defaults to Addr, Peers are
 	// the other meta gRPC addresses, DataDir holds the Raft WAL/snapshots.
 	Replicated         bool
@@ -191,6 +205,9 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.serverCreds != nil {
 		serverOpts = append(serverOpts, grpc.Creds(s.serverCreds))
 	}
+	// The admin-token check is independent of the transport: it is installed
+	// even on plaintext listeners, and a no-op when AdminToken is empty.
+	serverOpts = append(serverOpts, grpc.UnaryInterceptor(adminAuthUnaryInterceptor(s.cfg.AdminToken)))
 	s.grpc = grpc.NewServer(serverOpts...)
 	pbv2.RegisterMetaServiceServer(s.grpc, s)
 	if s.cfg.Replicated {
@@ -214,7 +231,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.log.Info("meta server started",
 		"addr", lis.Addr().String(), "replicated", s.cfg.Replicated,
-		"tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "")
+		"tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
+		"admin_auth", s.cfg.AdminToken != "")
 
 	go func() {
 		<-ctx.Done()

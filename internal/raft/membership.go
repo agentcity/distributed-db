@@ -158,6 +158,9 @@ func (n *Node) applyConfigEntry(entry model.Entry) error {
 		return fmt.Errorf("raft: %q config entry with empty peer", entry.Type)
 	}
 
+	beforeVoters := append([]string(nil), n.voters...)
+	beforeLearners := n.learnerListLocked()
+
 	switch entry.Type {
 	case model.CommandAddLearner:
 		// Adding a peer as a learner also downgrades it if a stale local view
@@ -176,6 +179,13 @@ func (n *Node) applyConfigEntry(entry model.Entry) error {
 
 	voters := append([]string(nil), n.voters...)
 	learners := n.learnerListLocked()
+	// Advance the config epoch only when this entry actually changes the
+	// voter/learner sets. Replaying an entry that is already reflected in a
+	// restored snapshot is then a no-op for the epoch, so a snapshot's
+	// config epoch stays comparable across replicas.
+	if !equalStrings(voters, beforeVoters) || !equalStrings(learners, beforeLearners) {
+		n.configEpoch++
+	}
 	persistErr := n.persistMembershipLocked(voters, learners)
 
 	// The committed entry is authoritative even if the durable membership
@@ -199,48 +209,200 @@ func (n *Node) applyConfigEntry(entry model.Entry) error {
 // MembershipStore capability. Stores without it keep membership only in memory
 // and in the replicated log. Caller holds mu.
 func (n *Node) persistMembershipLocked(voters, learners []string) error {
-	ms, ok := n.store.(MembershipStore)
-	if !ok {
-		return nil
-	}
-	return ms.SaveMembership(voters, learners)
+	return saveMembership(n.store, voters, learners, n.configEpoch)
 }
 
-// initMembership recovers the membership from the store, falling back to the
-// static Config for a new or pre-membership log. The returned voters always
-// include the local node, sorted; the local node is a learner instead when
+// saveMembership persists membership and, when the store supports it, the
+// config epoch. A legacy MembershipStore only receives the sets; the epoch is
+// then reconstructed on the next start.
+func saveMembership(store LogStore, voters, learners []string, epoch uint64) error {
+	if mes, ok := store.(MembershipEpochStore); ok {
+		return mes.SaveMembershipEpoch(voters, learners, epoch)
+	}
+	if ms, ok := store.(MembershipStore); ok {
+		return ms.SaveMembership(voters, learners)
+	}
+	return nil
+}
+
+// initMembership recovers the membership from the snapshot, then the store,
+// then the static Config. The snapshot wins when its config epoch is at least
+// the persisted epoch, so a node that missed membership changes and restarts
+// after installing a snapshot cannot keep a stale voter set. A snapshot without
+// membership (legacy) always falls back to the persisted record or Config.
+//
+// The returned voters always include the local node when they came from the
+// static configuration, sorted; the local node is a learner instead when
 // cfg.Learner is set (and was not overridden by a persisted record).
-func initMembership(cfg Config, store LogStore) ([]string, []string, error) {
+func initMembership(cfg Config, store LogStore, snapMembership *SnapshotMembership) ([]string, []string, uint64, error) {
+	var persistedVoters, persistedLearners []string
+	var persistedEpoch uint64
+	if mes, ok := store.(MembershipEpochStore); ok {
+		voters, learners, epoch, err := mes.LoadMembershipEpoch()
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("raft: load membership: %w", err)
+		}
+		persistedVoters, persistedLearners, persistedEpoch = voters, learners, epoch
+	} else if ms, ok := store.(MembershipStore); ok {
+		voters, learners, err := ms.LoadMembership()
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("raft: load membership: %w", err)
+		}
+		persistedVoters, persistedLearners = voters, learners
+	}
+
+	snapMembership, err := normalizeSnapshotMembership(snapMembership)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
 	if cfg.ForceLearner {
 		voters := canonicalVoters(cfg.Peers)
 		if len(voters) == 0 {
-			return nil, nil, errors.New("raft: learner configuration has no voters")
+			return nil, nil, 0, errors.New("raft: learner configuration has no voters")
 		}
 		learners := canonicalLearners([]string{cfg.ID}, voters)
-		return voters, learners, nil
+		// ForceLearner deliberately replaces the configuration with a fresh
+		// one, so advance past any epoch this node may already have seen.
+		epoch := persistedEpoch
+		if snapMembership != nil && snapMembership.ConfigEpoch > epoch {
+			epoch = snapMembership.ConfigEpoch
+		}
+		if epoch == 0 {
+			epoch = 1
+		} else {
+			epoch++
+		}
+		return voters, learners, epoch, nil
 	}
-	if ms, ok := store.(MembershipStore); ok {
-		voters, learners, err := ms.LoadMembership()
-		if err != nil {
-			return nil, nil, fmt.Errorf("raft: load membership: %w", err)
+
+	if snapMembership != nil && (len(persistedVoters) == 0 || snapMembership.ConfigEpoch >= persistedEpoch) {
+		// The snapshot is at least as new as the persisted membership. Persist
+		// the reconciled state so a restart without the snapshot (or with a
+		// different load path) still sees the same configuration.
+		if err := saveMembership(store, snapMembership.Voters, snapMembership.Learners, snapMembership.ConfigEpoch); err != nil {
+			return nil, nil, 0, fmt.Errorf("raft: persist snapshot membership: %w", err)
 		}
-		if len(voters) > 0 {
-			v := canonicalVoters(voters)
-			l := canonicalLearners(learners, v)
-			return v, l, nil
+		return append([]string(nil), snapMembership.Voters...), append([]string(nil), snapMembership.Learners...),
+			snapMembership.ConfigEpoch, nil
+	}
+
+	if len(persistedVoters) > 0 {
+		epoch := persistedEpoch
+		if epoch == 0 {
+			// A record written before config epochs existed is the initial
+			// configuration.
+			epoch = 1
 		}
+		voters := canonicalVoters(persistedVoters)
+		return voters, canonicalLearners(persistedLearners, voters), epoch, nil
 	}
 
 	if cfg.Learner {
 		voters := canonicalVoters(cfg.Peers)
 		if len(voters) == 0 {
-			return nil, nil, errors.New("raft: learner configuration has no voters")
+			return nil, nil, 0, errors.New("raft: learner configuration has no voters")
 		}
 		learners := canonicalLearners([]string{cfg.ID}, voters)
-		return voters, learners, nil
+		return voters, learners, 1, nil
 	}
 	voters := canonicalVoters(append(append([]string(nil), cfg.Peers...), cfg.ID))
-	return voters, nil, nil
+	return voters, nil, 1, nil
+}
+
+// normalizeSnapshotMembership validates a membership envelope and returns a
+// canonical copy (sorted, de-duplicated slices). A nil envelope is a legacy
+// snapshot and passes through as nil. Corrupt values are rejected: a present
+// envelope must have a positive config epoch, at least one voter, no empty ids,
+// no duplicates, and no id that is both a voter and a learner.
+func normalizeSnapshotMembership(m *SnapshotMembership) (*SnapshotMembership, error) {
+	if m == nil {
+		return nil, nil
+	}
+	if m.ConfigEpoch == 0 {
+		return nil, fmt.Errorf("%w: missing config epoch", ErrInvalidSnapshotMembership)
+	}
+	if len(m.Voters) == 0 {
+		return nil, fmt.Errorf("%w: no voters", ErrInvalidSnapshotMembership)
+	}
+	seen := make(map[string]bool, len(m.Voters)+len(m.Learners))
+	voters := make([]string, 0, len(m.Voters))
+	for _, v := range m.Voters {
+		if v == "" {
+			return nil, fmt.Errorf("%w: empty voter id", ErrInvalidSnapshotMembership)
+		}
+		if seen[v] {
+			return nil, fmt.Errorf("%w: duplicate id %q", ErrInvalidSnapshotMembership, v)
+		}
+		seen[v] = true
+		voters = append(voters, v)
+	}
+	learners := make([]string, 0, len(m.Learners))
+	for _, l := range m.Learners {
+		if l == "" {
+			return nil, fmt.Errorf("%w: empty learner id", ErrInvalidSnapshotMembership)
+		}
+		if seen[l] {
+			return nil, fmt.Errorf("%w: duplicate or overlapping id %q", ErrInvalidSnapshotMembership, l)
+		}
+		seen[l] = true
+		learners = append(learners, l)
+	}
+	sort.Strings(voters)
+	sort.Strings(learners)
+	return &SnapshotMembership{
+		Voters:      voters,
+		Learners:    learners,
+		ConfigEpoch: m.ConfigEpoch,
+	}, nil
+}
+
+// snapshotMembershipLocked returns the current membership as a snapshot
+// envelope. Caller holds mu. The result is always non-nil and canonical.
+func (n *Node) snapshotMembershipLocked() *SnapshotMembership {
+	return &SnapshotMembership{
+		Voters:      append([]string(nil), n.voters...),
+		Learners:    n.learnerListLocked(),
+		ConfigEpoch: n.configEpoch,
+	}
+}
+
+// applySnapshotMembershipLocked replaces the in-memory membership with the
+// envelope carried by an installed snapshot and persists it. A nil envelope
+// (legacy snapshot) leaves the current membership untouched. The snapshot is
+// authoritative: any stale voter or learner is removed, the config epoch moves
+// to the snapshot's epoch, and a leader/candidate that is no longer a voter
+// steps down. Caller holds mu.
+func (n *Node) applySnapshotMembershipLocked(m *SnapshotMembership) error {
+	if m == nil {
+		return nil
+	}
+	normalized, err := normalizeSnapshotMembership(m)
+	if err != nil {
+		return err
+	}
+	if normalized.ConfigEpoch < n.configEpoch {
+		return fmt.Errorf("%w: snapshot epoch %d, local epoch %d",
+			ErrStaleSnapshotMembership, normalized.ConfigEpoch, n.configEpoch)
+	}
+
+	n.voters = append([]string(nil), normalized.Voters...)
+	n.learners = make(map[string]bool, len(normalized.Learners))
+	for _, l := range normalized.Learners {
+		n.learners[l] = true
+	}
+	n.configEpoch = normalized.ConfigEpoch
+	n.configInFlight = false
+	n.syncReplicatorsLocked()
+	n.signalAllLocked()
+	if !n.selfIsVoterLocked() && (n.role == Leader || n.role == Candidate) {
+		n.stepDownWithErrorLocked("", ErrNotLeader)
+	}
+	if err := n.persistMembershipLocked(n.voters, normalized.Learners); err != nil {
+		n.logger.Error("raft: persist snapshot membership failed", "id", n.cfg.ID, "error", err)
+		return err
+	}
+	return nil
 }
 
 // canonicalVoters de-duplicates and sorts voters. A nil/empty input is

@@ -8,6 +8,7 @@ import (
 
 	"distributed-db/internal/grpctls"
 	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/pbconv"
 	"distributed-db/internal/raft"
 
 	"google.golang.org/grpc"
@@ -128,7 +129,10 @@ func (t *Transport) InstallSnapshot(ctx context.Context, peer string, req *raft.
 	}
 	resp, err := c.InstallSnapshot(ctx, &pbv2.InstallSnapshotRequest{
 		Term: req.Term, LeaderId: req.LeaderID,
-		Snapshot: &pbv2.Snapshot{Index: req.Snapshot.Index, Term: req.Snapshot.Term, Data: req.Snapshot.Data},
+		Snapshot: &pbv2.Snapshot{
+			Index: req.Snapshot.Index, Term: req.Snapshot.Term, Data: req.Snapshot.Data,
+			Membership: pbconv.SnapshotMembershipToPB(req.Snapshot.Membership),
+		},
 	})
 	if err != nil {
 		return nil, err
