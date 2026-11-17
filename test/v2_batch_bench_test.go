@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -105,6 +106,57 @@ func benchmarkWorkstations(b *testing.B, durability string, pipelines []int) {
 			b.ReportMetric(float64(pipeline), "txn/op")
 			if elapsed := b.Elapsed(); elapsed > 0 {
 				b.ReportMetric(float64(elapsed.Nanoseconds())/float64(b.N*pipeline), "ns/txn")
+			}
+		})
+	}
+}
+
+// BenchmarkV2MultiRangeWorkstations measures 10 clients with keys spread over
+// multiple ranges. Range i owns keys "NN/"; leaders are distributed by Raft, so
+// this is the fan-out test for independent range leaders.
+func BenchmarkV2MultiRangeWorkstations(b *testing.B) {
+	for _, ranges := range []int{1, 4, 8} {
+		b.Run(fmt.Sprintf("ranges=%d", ranges), func(b *testing.B) {
+			c := newSpeedMultiRangeCluster(b, ranges, kvserver.DurabilityFast)
+			ctx := context.Background()
+			for _, pipeline := range []int{1, 64, 256} {
+				b.Run(fmt.Sprintf("pipeline=%d", pipeline), func(b *testing.B) {
+					var seq atomic.Uint64
+					b.ReportAllocs()
+					b.ResetTimer()
+					b.RunParallel(func(pb *testing.PB) {
+						prefixes := make([][]byte, ranges)
+						for i := range prefixes {
+							prefixes[i] = []byte(fmt.Sprintf("%02d/bench/", i))
+						}
+						for pb.Next() {
+							txns := make([]*v2client.Txn, pipeline)
+							for j := range txns {
+								id := seq.Add(1)
+								rid := int(id % uint64(ranges))
+								txn, err := c.client.Begin(ctx)
+								if err != nil {
+									b.Errorf("ranges=%d pipeline=%d begin: %v", ranges, pipeline, err)
+									return
+								}
+								key := append(append([]byte(nil), prefixes[rid]...), strconv.AppendUint(nil, id, 10)...)
+								txn.Set(key, speedValue)
+								txns[j] = txn
+							}
+							for j, err := range c.client.CommitBatch(ctx, txns) {
+								if err != nil {
+									b.Errorf("ranges=%d pipeline=%d slot %d: %v", ranges, pipeline, j, err)
+									return
+								}
+							}
+						}
+					})
+					b.StopTimer()
+					b.ReportMetric(float64(pipeline), "txn/op")
+					if elapsed := b.Elapsed(); elapsed > 0 {
+						b.ReportMetric(float64(elapsed.Nanoseconds())/float64(b.N*pipeline), "ns/txn")
+					}
+				})
 			}
 		})
 	}

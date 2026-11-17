@@ -17,6 +17,7 @@ package test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"sort"
 	"strconv"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"distributed-db/internal/kvserver"
+	"distributed-db/internal/meta"
 	"distributed-db/internal/metaserver"
 	"distributed-db/internal/v2client"
 )
@@ -144,6 +146,116 @@ func newSpeedClusterWithDurability(tb testing.TB, durability string) *speedClust
 	}
 	tb.Cleanup(func() { _ = client.Close() })
 	return &speedCluster{metaAddr: metaAddr, leader: leader, client: client}
+}
+
+// newSpeedMultiRangeCluster starts one meta service and three KV nodes, each
+// hosting the same n contiguous ranges. Range i owns keys "NN/" where NN is the
+// zero-padded range index; the last range is open-ended.
+func newSpeedMultiRangeCluster(tb testing.TB, n int, durability string) *speedCluster {
+	tb.Helper()
+	if n < 1 {
+		tb.Fatalf("speed bench: ranges must be >= 1")
+	}
+	ctx := context.Background()
+	metaAddr := speedFreeAddr(tb)
+	addrs := []string{speedFreeAddr(tb), speedFreeAddr(tb), speedFreeAddr(tb)}
+
+	metaRanges := make([]meta.Range, 0, n)
+	for i := 0; i < n; i++ {
+		var start []byte
+		if i > 0 {
+			start = []byte(fmt.Sprintf("%02d/", i))
+		}
+		var end []byte
+		if i+1 < n {
+			end = []byte(fmt.Sprintf("%02d/", i+1))
+		}
+		metaRanges = append(metaRanges, meta.Range{
+			ID:       uint64(i + 1),
+			Start:    start,
+			End:      end,
+			Replicas: append([]string(nil), addrs...),
+			Version:  1,
+		})
+	}
+	ms, err := metaserver.New(metaserver.Config{
+		Addr: metaAddr, Ranges: metaRanges, Logger: v2Logger(),
+	})
+	if err != nil {
+		tb.Fatalf("multi-range bench: meta: %v", err)
+	}
+	if err := ms.Start(ctx); err != nil {
+		tb.Fatalf("multi-range bench: start meta: %v", err)
+	}
+	tb.Cleanup(func() { _ = ms.Stop() })
+
+	for i, addr := range addrs {
+		peers := make([]string, 0, len(addrs)-1)
+		for j, p := range addrs {
+			if i != j {
+				peers = append(peers, p)
+			}
+		}
+		rcs := make([]kvserver.RangeConfig, 0, n)
+		for r := 0; r < n; r++ {
+			var start, end []byte
+			if r > 0 {
+				start = []byte(fmt.Sprintf("%02d/", r))
+			}
+			if r+1 < n {
+				end = []byte(fmt.Sprintf("%02d/", r+1))
+			}
+			rcs = append(rcs, kvserver.RangeConfig{
+				ID:    uint64(r + 1),
+				Start: start,
+				End:   end,
+				Peers: append([]string(nil), peers...),
+			})
+		}
+		srv, err := kvserver.New(kvserver.Config{
+			ID:                 addr,
+			RaftAddr:           addr,
+			DataDir:            tb.TempDir(),
+			Ranges:             rcs,
+			ElectionTimeoutMin: 150 * time.Millisecond,
+			ElectionTimeoutMax: 300 * time.Millisecond,
+			HeartbeatInterval:  30 * time.Millisecond,
+			CacheSize:          speedCacheSize,
+			MemTableSize:       speedMemTableSize,
+			Logger:             v2Logger(),
+			DurabilityMode:     durability,
+		})
+		if err != nil {
+			tb.Fatalf("multi-range bench: new node %s: %v", addr, err)
+		}
+		if err := srv.Start(ctx); err != nil {
+			tb.Fatalf("multi-range bench: start node %s: %v", addr, err)
+		}
+		tb.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = srv.Stop(stopCtx)
+		})
+	}
+
+	client, err := v2client.New(metaAddr, addrs)
+	if err != nil {
+		tb.Fatalf("multi-range bench: client: %v", err)
+	}
+	tb.Cleanup(func() { _ = client.Close() })
+	// Warm every range/leader; Commit retries leader discovery, so this also
+	// waits for all groups to elect.
+	for i := 0; i < n; i++ {
+		txn, err := client.Begin(ctx)
+		if err != nil {
+			tb.Fatalf("multi-range bench: warm begin: %v", err)
+		}
+		txn.Set([]byte(fmt.Sprintf("%02d/warmup", i)), speedValue)
+		if err := txn.Commit(ctx); err != nil {
+			tb.Fatalf("multi-range bench: warm commit range %d: %v", i, err)
+		}
+	}
+	return &speedCluster{metaAddr: metaAddr, client: client}
 }
 
 // speedWarmup performs one throwaway transaction so the first measured
