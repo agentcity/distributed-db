@@ -304,5 +304,11 @@
     "title": "Sprint 1 — Evidence & closure",
     "status": "done",
     "file": "0051-sprint-1-evidence.md"
+  },
+  {
+    "id": "0052",
+    "title": "Sprint 2 — Docker multi-arch и Compose",
+    "status": "in_progress",
+    "file": "0052-docker-sprint.md"
   }
 ]
