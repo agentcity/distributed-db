@@ -1,0 +1,50 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{- $base := include "distributed-db.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $domain := .Values.clusterDomain -}}
+{{- $issuer := .Values.tls.certManager.issuerRef -}}
+{{- if not $issuer.name }}
+{{- fail "tls.certManager.issuerRef.name is required when tls.certManager.enabled=true" }}
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $base }}-tls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "distributed-db.tlsSecret" . }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  # One shared identity for all components: the same certificate is used as a
+  # server certificate and as the mTLS client certificate.
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - {{ printf "%s-meta" $base | quote }}
+    - {{ printf "%s-meta.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "%s-meta-headless.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "*.%s-meta-headless.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "%s-kv" $base | quote }}
+    - {{ printf "%s-kv.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "%s-kv-headless.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "*.%s-kv-headless.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "%s-sqlsrv.%s.svc.%s" $base $ns $domain | quote }}
+    - {{ printf "%s-pgsrv.%s.svc.%s" $base $ns $domain | quote }}
+    {{- if .Values.ingress.enabled }}
+    - {{ .Values.ingress.host | quote }}
+    {{- end }}
+    {{- range .Values.tls.certManager.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  issuerRef:
+    name: {{ $issuer.name | quote }}
+    kind: {{ $issuer.kind | quote }}
+    group: {{ $issuer.group | quote }}
+{{- end }}

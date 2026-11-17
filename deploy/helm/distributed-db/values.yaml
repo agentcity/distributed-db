@@ -1,0 +1,310 @@
+# Default values for the distributed-db reference chart.
+#
+# SECURITY CONTRACT
+# -----------------
+# This chart NEVER creates Secret objects and never accepts a password or token
+# as a literal value. Every credential is read from an existing Secret in the
+# release namespace. The names below are references, not credentials.
+#
+# IMAGE CONTRACT
+# --------------
+# The repository's Dockerfile currently builds ONLY cmd/db. The v2 binaries
+# (kv2, sqlsrv, pgsrv, kvctl, kvbackup) are not in that image. The default image
+# below is therefore an explicit placeholder. Build an image that contains all
+# required binaries, publish it, then override image.repository/image.tag.
+# See docs/OPERATIONS.md, "Image and binary baseline".
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Kubernetes DNS suffix. Every pod-to-pod address is a fully qualified name so
+# that TLS certificate SANs are deterministic. If your cluster uses a different
+# domain, override this AND the certificate DNS names.
+clusterDomain: cluster.local
+
+image:
+  # PLACEHOLDER: replace with your registry/repository.
+  repository: ghcr.io/example/distributed-db
+  tag: "0.0.0-placeholder"
+  pullPolicy: IfNotPresent
+  # Example: [{name: my-registry-pull-secret}]
+  pullSecrets: []
+
+serviceAccount:
+  create: true
+  # Defaults to the release fullname when empty.
+  name: ""
+  annotations: {}
+
+commonLabels: {}
+commonAnnotations: {}
+podAnnotations: {}
+podLabels: {}
+
+# Pod-level security context applied to every workload.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context. readOnlyRootFilesystem is enabled for every
+# container; writable paths are explicit emptyDir mounts.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Cluster gRPC TLS/mTLS for meta <-> KV <-> sqlsrv/pgsrv.
+#
+# The Secret must contain a CA bundle, a certificate and its key. With mtls on,
+# the same certificate is presented as the client identity and MUST carry both
+# serverAuth and clientAuth EKUs. A single shared certificate is the simple
+# baseline; per-pod certificates are better and require a chart change.
+#
+# Certificate SANs must cover, at minimum:
+#   *.<fullname>-meta-headless.<namespace>.svc.<clusterDomain>
+#   *.<fullname>-kv-headless.<namespace>.svc.<clusterDomain>
+#   <fullname>-meta.<namespace>.svc.<clusterDomain>
+#   <fullname>-sqlsrv.<namespace>.svc.<clusterDomain>
+#   <fullname>-pgsrv.<namespace>.svc.<clusterDomain>
+tls:
+  enabled: true
+  mtls: true
+  # REQUIRED when tls.enabled=true. The Secret is created by the operator or by
+  # cert-manager (below); it is never rendered by this chart.
+  existingSecret: distributed-db-tls
+  caKey: ca.crt
+  certKey: tls.crt
+  keyKey: tls.key
+  mountPath: /etc/distributed-db/tls
+  certManager:
+    enabled: false
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 720h
+    # Extra DNS names, for example an ingress host.
+    dnsNames: []
+
+auth:
+  # One operator credential, sourced from a Secret, used in two places:
+  #   1. kv2 meta -admin-token: gates SetRanges/SplitRange/MergeRanges (native
+  #      Bearer check in metaserver.Config.AdminToken).
+  #   2. sqlsrv -auth-token: gates /v1/sql, /metrics and /debug/slo on the
+  #      native TLS listener (/health and /healthz stay public).
+  # It does not gate data-path KV RPCs or read-only meta RPCs, and it is not a
+  # per-user identity/RBAC system. Rotate it as one credential.
+  adminToken:
+    existingSecret: distributed-db-admin-token
+    key: token
+  # pgwire password auth. pgsrv requires TLS for password auth. The Secret must
+  # contain a username and a password; no default username/password is rendered.
+  pgsrv:
+    existingSecret: distributed-db-pgsrv-auth
+    usernameKey: username
+    passwordKey: password
+
+meta:
+  # Meta/TSO is a Raft group. Use 3 (default) or 5. It must be an odd number.
+  replicaCount: 3
+  port: 9090
+  # Require auth.adminToken on meta admin RPCs. Disable only for a documented
+  # break-glass bootstrap; an unauthenticated admin API can rewrite the range
+  # map, so this is a production-critical control.
+  adminToken:
+    enabled: true
+  logLevel: info
+  podManagementPolicy: Parallel
+  terminationGracePeriodSeconds: 60
+  updateStrategy: RollingUpdate
+
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    annotations: {}
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  podAntiAffinity:
+    enabled: true
+    weight: 100
+  topologySpread:
+    enabled: true
+    zoneKey: topology.kubernetes.io/zone
+    # DoNotSchedule gives one meta replica per AZ when 3 AZs are available. Set
+    # to ScheduleAnyway on clusters with fewer than 3 zones.
+    whenUnsatisfiable: DoNotSchedule
+    hostnameWhenUnsatisfiable: ScheduleAnyway
+
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+  nodeSelector: {}
+  tolerations: []
+  # When non-empty this replaces the default podAntiAffinity below.
+  affinity: {}
+  priorityClassName: ""
+
+kv:
+  # 3 to 5 KV processes. Each process hosts ranges assigned by meta. Storage is
+  # per pod; capacity planning is in docs/OPERATIONS.md.
+  replicaCount: 3
+  port: 7001
+  logLevel: info
+  # sync is the only production-safe profile. fast is accepted for experiments
+  # and logs a warning; it is not production-safe.
+  durability: sync
+  podManagementPolicy: Parallel
+  terminationGracePeriodSeconds: 60
+  updateStrategy: RollingUpdate
+
+  persistence:
+    enabled: true
+    size: 100Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    annotations: {}
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
+
+  podAntiAffinity:
+    enabled: true
+    weight: 100
+  topologySpread:
+    enabled: true
+    zoneKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    hostnameWhenUnsatisfiable: ScheduleAnyway
+
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+sqlsrv:
+  # Stateless SQL-over-HTTPS layer. Two replicas is the minimum for a rolling
+  # update with no gap. The listener uses the cluster TLS certificate/key and
+  # requires the admin Bearer token; both are native sqlsrv features.
+  replicaCount: 2
+  port: 8080
+  logLevel: info
+  terminationGracePeriodSeconds: 30
+  updateStrategy:
+    maxUnavailable: 0
+    maxSurge: 1
+
+  auth:
+    # Requires tls.enabled=true: sqlhttp rejects a Bearer token on a plaintext
+    # listener. The token is auth.adminToken.
+    enabled: true
+    # When enabled, /v1/sql, /metrics and /debug/slo need
+    # "Authorization: Bearer <token>"; /health and /healthz stay public.
+    # This is a single static credential, not RBAC.
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  topologySpread:
+    enabled: true
+    zoneKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    hostnameWhenUnsatisfiable: ScheduleAnyway
+
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+pgsrv:
+  # PostgreSQL wire-protocol gateway. Stateless; uses pgsrv's own listener TLS
+  # and password authentication.
+  replicaCount: 2
+  port: 5432
+  metricsPort: 9187
+  logLevel: info
+  terminationGracePeriodSeconds: 30
+  updateStrategy:
+    maxUnavailable: 0
+    maxSurge: 1
+
+  auth:
+    enabled: true
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  topologySpread:
+    enabled: true
+    zoneKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    hostnameWhenUnsatisfiable: ScheduleAnyway
+
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+# Optional ingress for the SQL HTTPS API. TLS terminates at the ingress; the pod-level
+# bearer token is still required and the ingress backend must speak HTTPS
+# (nginx: set nginx.ingress.kubernetes.io/backend-protocol: HTTPS).
+ingress:
+  enabled: false
+  className: nginx
+  # The sqlsrv backend speaks HTTPS. For nginx, keep backend-protocol HTTPS.
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+  host: distributed-db.example.internal
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: distributed-db-ingress-tls
+  # Add any client-certificate/allowlist annotations your controller needs;
+  # the backend is already HTTPS.

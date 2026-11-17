@@ -1,0 +1,109 @@
+distributed-db {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) installed as
+release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+THIS IS A REFERENCE OPERATIONS BASELINE, NOT A PRODUCTION CERTIFICATION.
+The database is experimental alpha. Read docs/OPERATIONS.md and
+docs/RUNBOOKS.md before carrying traffic. The chart has NOT been installed on a
+real cluster as part of its validation.
+
+--------------------------------------------------------------------------
+1. Preconditions (the chart does not create these)
+--------------------------------------------------------------------------
+* Image: {{ include "distributed-db.image" . }}
+  The repository Dockerfile builds only cmd/db. Replace the placeholder image
+  with one that contains kv2, sqlsrv, pgsrv, kvctl and kvbackup.
+* TLS Secret: {{ .Values.tls.existingSecret }}
+  Keys: {{ .Values.tls.caKey }}, {{ .Values.tls.certKey }}, {{ .Values.tls.keyKey }}.
+  SANs must cover the meta/kv headless wildcards and the meta, sqlsrv and pgsrv
+  service names (see values.yaml and docs/OPERATIONS.md).
+{{- if or .Values.meta.adminToken.enabled .Values.sqlsrv.auth.enabled }}
+* Admin token Secret: {{ .Values.auth.adminToken.existingSecret }} (key "{{ .Values.auth.adminToken.key }}")
+  Used by meta -admin-token (SetRanges/SplitRange/MergeRanges){{ if .Values.sqlsrv.auth.enabled }} and by sqlsrv -auth-token (/v1/sql, /metrics, /debug/slo){{ end }}.
+  Value must match [A-Za-z0-9._~-]{32,128}. Generate with:
+    openssl rand -base64 48 | tr -d '/+=' | cut -c1-48
+  kvctl admin commands need it via KVCTL_ADMIN_TOKEN or -admin-token.
+{{- end }}
+{{- if .Values.pgsrv.auth.enabled }}
+* pgwire auth Secret: {{ .Values.auth.pgsrv.existingSecret }}
+  Keys: "{{ .Values.auth.pgsrv.usernameKey }}", "{{ .Values.auth.pgsrv.passwordKey }}".
+{{- end }}
+
+Never put these values in values.yaml or in a helm --set on a shared shell.
+
+--------------------------------------------------------------------------
+2. Apply / upgrade
+--------------------------------------------------------------------------
+  helm upgrade --install {{ .Release.Name }} deploy/helm/distributed-db \
+    --namespace {{ .Release.Namespace }} --create-namespace \
+    --values my-values.yaml --atomic --timeout 15m
+
+Wait for the stateful components before sending traffic:
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "distributed-db.fullname" . }}-meta --timeout=10m
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "distributed-db.fullname" . }}-kv   --timeout=10m
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "distributed-db.fullname" . }}-sqlsrv --timeout=5m
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "distributed-db.fullname" . }}-pgsrv  --timeout=5m
+
+--------------------------------------------------------------------------
+3. Verify
+--------------------------------------------------------------------------
+Meta leader, range map and leaders (binary must be present in the image):
+  KVCTL_TLS="{{ if .Values.tls.enabled }}-tls-ca {{ .Values.tls.mountPath }}/{{ .Values.tls.caKey }} -tls-cert {{ .Values.tls.mountPath }}/{{ .Values.tls.certKey }} -tls-key {{ .Values.tls.mountPath }}/{{ .Values.tls.keyKey }}{{ end }}"
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "distributed-db.fullname" . }}-sqlsrv -c sqlsrv -- \
+    /app/kvctl -meta {{ include "distributed-db.metaService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.meta.port }} ${KVCTL_TLS} status
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "distributed-db.fullname" . }}-sqlsrv -c sqlsrv -- \
+    /app/kvctl -meta {{ include "distributed-db.metaService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.meta.port }} ${KVCTL_TLS} ranges
+
+SQL HTTPS (TLS is native; /health and /healthz are public, everything else
+needs the Bearer token):
+  SVC={{ include "distributed-db.sqlsrvService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "distributed-db.sqlsrvService" . }} {{ .Values.sqlsrv.port }}:{{ .Values.sqlsrv.port }} &
+  curl --cacert ca.crt --connect-to "$SVC:{{ .Values.sqlsrv.port }}:127.0.0.1:{{ .Values.sqlsrv.port }}" \
+    "https://$SVC:{{ .Values.sqlsrv.port }}/healthz"
+{{- if .Values.sqlsrv.auth.enabled }}
+
+  TOKEN=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.auth.adminToken.existingSecret }} \
+    -o jsonpath='{.data.{{ .Values.auth.adminToken.key }}}' | base64 -d)
+  curl --cacert ca.crt --connect-to "$SVC:{{ .Values.sqlsrv.port }}:127.0.0.1:{{ .Values.sqlsrv.port }}" \
+    -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+    -d '{"sql":"SELECT 1"}' "https://$SVC:{{ .Values.sqlsrv.port }}/v1/sql"
+{{- end }}
+
+pgwire (TLS + password; get the password from the Secret, do not paste it into
+shell history). hostaddr forces the TCP target while host is used for SNI and
+certificate verification:
+  SVC={{ include "distributed-db.pgsrvService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}
+  psql "host=$SVC hostaddr=127.0.0.1 port={{ .Values.pgsrv.port }} user=<user> dbname=postgres sslmode=verify-full sslrootcert=ca.crt"
+
+Expected: meta and KV endpoints have one ready replica per AZ (when three
+zones exist); kvctl status shows a non-empty meta leader, meta term and range
+count; SQL /v1/sql returns a result for a trivial SELECT. On a fresh install
+range 1 may still have an empty replica list/leader until the one-time SetRanges
+bootstrap described in docs/OPERATIONS.md section 3.3.1.
+
+--------------------------------------------------------------------------
+4. Rollback
+--------------------------------------------------------------------------
+  helm history {{ .Release.Name }} -n {{ .Release.Namespace }}
+  helm rollback {{ .Release.Name }} <REVISION> -n {{ .Release.Namespace }} --wait --timeout 15m
+
+A chart rollback restores manifests; it does NOT roll back data, Raft logs,
+Pebble files, PVC contents or certificate state. If the previous revision used
+an incompatible binary or on-disk format, restore from a verified backup into a
+new cluster instead. See docs/RUNBOOKS.md, "Rolling upgrade and rollback".
+
+--------------------------------------------------------------------------
+5. Known gaps that affect operations
+--------------------------------------------------------------------------
+* kv2/meta expose no HTTP health or metrics endpoint: probes are TCP-only and
+  there are no Raft/TSO metrics. Use logs, kvctl and node-exporter.
+* sqlsrv uses native TLS and one static Bearer token; there is no RBAC, audit,
+  or per-user identity. /metrics requires the token (configure Prometheus
+  accordingly); /health and /healthz are public.
+* kvbackup is plaintext-only and cannot talk to this TLS-enabled cluster.
+  kvctl backup supports TLS; restore currently requires a TLS-capable build.
+* No PITR, no online restore, no tested rolling upgrade, no RBAC/audit/at-rest
+  encryption, no joint consensus. See docs/OPERATIONS.md, "Known gaps".
+* A fresh meta range map has range 1 with NO replicas. Data can flow through
+  the -nodes seed list, but split/merge and scheduler placement need a one-time
+  SetRanges bootstrap that this chart does not automate. See
+  docs/OPERATIONS.md section 3.3.1 before using the cluster.

@@ -1,0 +1,37 @@
+{{- include "distributed-db.validate" . -}}
+{{- $base := include "distributed-db.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $base }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  # Topology is rendered here once so every startup script agrees on the same
+  # fully qualified names. Changing replica counts or clusterDomain requires a
+  # rollout; the StatefulSet annotation below triggers it.
+  CLUSTER_DOMAIN: {{ .Values.clusterDomain | quote }}
+  META_PORT: {{ .Values.meta.port | quote }}
+  META_REPLICAS: {{ .Values.meta.replicaCount | quote }}
+  META_POD_PREFIX: {{ printf "%s-meta" $base | quote }}
+  META_HEADLESS: {{ printf "%s-meta-headless" $base | quote }}
+  META_SERVICE: {{ printf "%s-meta" $base | quote }}
+  KV_PORT: {{ .Values.kv.port | quote }}
+  KV_REPLICAS: {{ .Values.kv.replicaCount | quote }}
+  KV_POD_PREFIX: {{ printf "%s-kv" $base | quote }}
+  KV_HEADLESS: {{ printf "%s-kv-headless" $base | quote }}
+  KV_NODES: {{ include "distributed-db.kvNodes" . | quote }}
+
+  meta-start.sh: |-
+{{ .Files.Get "files/meta-start.sh" | indent 4 }}
+  kv-start.sh: |-
+{{ .Files.Get "files/kv-start.sh" | indent 4 }}
+  pgsrv-start.sh: |-
+{{ .Files.Get "files/pgsrv-start.sh" | indent 4 }}
+  sqlsrv-start.sh: |-
+{{ .Files.Get "files/sqlsrv-start.sh" | indent 4 }}

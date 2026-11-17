@@ -1,0 +1,21 @@
+{{- $root := . -}}
+{{- range $component := list "meta" "kv" "sqlsrv" "pgsrv" }}
+{{- $cfg := index $root.Values $component }}
+{{- if $cfg.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "distributed-db.fullname" $root }}-{{ $component }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  minAvailable: {{ $cfg.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "distributed-db.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
+{{- end }}
+{{- end }}

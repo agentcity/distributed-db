@@ -1,0 +1,177 @@
+{{- $base := include "distributed-db.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $base }}-sqlsrv
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sqlsrv
+spec:
+  replicas: {{ .Values.sqlsrv.replicaCount }}
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  minReadySeconds: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.sqlsrv.updateStrategy.maxUnavailable }}
+      maxSurge: {{ .Values.sqlsrv.updateStrategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "distributed-db.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: sqlsrv
+  template:
+    metadata:
+      labels:
+        {{- include "distributed-db.labels" . | nindent 8 }}
+        app.kubernetes.io/component: sqlsrv
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "distributed-db.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.sqlsrv.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sqlsrv.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.sqlsrv.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sqlsrv.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.sqlsrv.affinity }}
+      affinity:
+        {{- toYaml .Values.sqlsrv.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "distributed-db.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: sqlsrv
+      {{- end }}
+      {{- if .Values.sqlsrv.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.sqlsrv.topologySpread.zoneKey | quote }}
+          whenUnsatisfiable: {{ .Values.sqlsrv.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: sqlsrv
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.sqlsrv.topologySpread.hostnameWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: sqlsrv
+      {{- end }}
+      containers:
+        - name: sqlsrv
+          image: {{ include "distributed-db.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /scripts/sqlsrv-start.sh
+          envFrom:
+            - configMapRef:
+                name: {{ $base }}-config
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SQL_PORT
+              value: {{ .Values.sqlsrv.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.sqlsrv.logLevel | quote }}
+            - name: TLS_ENABLED
+              value: {{ .Values.tls.enabled | quote }}
+            - name: TLS_DIR
+              value: {{ .Values.tls.mountPath | quote }}
+            - name: TLS_CERT_FILE
+              value: {{ .Values.tls.certKey | quote }}
+            - name: TLS_KEY_FILE
+              value: {{ .Values.tls.keyKey | quote }}
+            - name: TLS_CA_FILE
+              value: {{ .Values.tls.caKey | quote }}
+            - name: SQL_AUTH_ENABLED
+              value: {{ .Values.sqlsrv.auth.enabled | quote }}
+            {{- if .Values.sqlsrv.auth.enabled }}
+            - name: SQL_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "distributed-db.adminTokenSecret" . }}
+                  key: {{ .Values.auth.adminToken.key }}
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.sqlsrv.port }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.sqlsrv.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $base }}-config
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "distributed-db.tlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}

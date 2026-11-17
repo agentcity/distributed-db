@@ -1,0 +1,129 @@
+{{- $base := include "distributed-db.fullname" . -}}
+# Headless services publish not-ready addresses so a starting Raft group can
+# resolve peers before it has a quorum and before readiness passes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $base }}-meta-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: meta
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "distributed-db.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: meta
+  ports:
+    - name: grpc
+      port: {{ .Values.meta.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $base }}-meta
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: meta
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "distributed-db.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: meta
+  ports:
+    - name: grpc
+      port: {{ .Values.meta.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $base }}-kv-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kv
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "distributed-db.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kv
+  ports:
+    - name: grpc
+      port: {{ .Values.kv.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $base }}-kv
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kv
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "distributed-db.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kv
+  ports:
+    - name: grpc
+      port: {{ .Values.kv.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $base }}-sqlsrv
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sqlsrv
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "distributed-db.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: sqlsrv
+  ports:
+    - name: https
+      port: {{ .Values.sqlsrv.port }}
+      targetPort: https
+      protocol: TCP
+      appProtocol: https
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $base }}-pgsrv
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgsrv
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "distributed-db.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: pgsrv
+  ports:
+    - name: postgres
+      port: {{ .Values.pgsrv.port }}
+      targetPort: pg
+      protocol: TCP
+      appProtocol: postgresql
+    - name: metrics
+      port: {{ .Values.pgsrv.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+      appProtocol: http

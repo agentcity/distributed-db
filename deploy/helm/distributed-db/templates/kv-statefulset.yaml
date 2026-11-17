@@ -1,0 +1,199 @@
+{{- $base := include "distributed-db.fullname" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $base }}-kv
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kv
+spec:
+  serviceName: {{ $base }}-kv-headless
+  replicas: {{ .Values.kv.replicaCount }}
+  podManagementPolicy: {{ .Values.kv.podManagementPolicy }}
+  updateStrategy:
+    type: {{ .Values.kv.updateStrategy }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "distributed-db.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kv
+  template:
+    metadata:
+      labels:
+        {{- include "distributed-db.labels" . | nindent 8 }}
+        app.kubernetes.io/component: kv
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        distributed-db/durability: {{ .Values.kv.durability | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "distributed-db.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.kv.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kv.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.kv.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kv.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.kv.affinity }}
+      affinity:
+        {{- toYaml .Values.kv.affinity | nindent 8 }}
+      {{- else if .Values.kv.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.kv.podAntiAffinity.weight }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "distributed-db.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: kv
+      {{- end }}
+      {{- if .Values.kv.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.kv.topologySpread.zoneKey | quote }}
+          whenUnsatisfiable: {{ .Values.kv.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: kv
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.kv.topologySpread.hostnameWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: kv
+      {{- end }}
+      containers:
+        - name: kv
+          image: {{ include "distributed-db.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /scripts/kv-start.sh
+          envFrom:
+            - configMapRef:
+                name: {{ $base }}-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LOG_LEVEL
+              value: {{ .Values.kv.logLevel | quote }}
+            - name: DURABILITY
+              value: {{ .Values.kv.durability | quote }}
+            - name: TLS_ENABLED
+              value: {{ .Values.tls.enabled | quote }}
+            - name: MTLS_ENABLED
+              value: {{ .Values.tls.mtls | quote }}
+            - name: TLS_DIR
+              value: {{ .Values.tls.mountPath | quote }}
+            - name: TLS_CERT_FILE
+              value: {{ .Values.tls.certKey | quote }}
+            - name: TLS_KEY_FILE
+              value: {{ .Values.tls.keyKey | quote }}
+            - name: TLS_CA_FILE
+              value: {{ .Values.tls.caKey | quote }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.kv.port }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.kv.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $base }}-config
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "distributed-db.tlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
+        {{- if not .Values.kv.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.kv.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "distributed-db.labels" . | nindent 10 }}
+          app.kubernetes.io/component: kv
+        {{- with .Values.kv.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.kv.persistence.accessModes | nindent 10 }}
+        {{- if .Values.kv.persistence.storageClass }}
+        storageClassName: {{ .Values.kv.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.kv.persistence.size }}
+  {{- end }}

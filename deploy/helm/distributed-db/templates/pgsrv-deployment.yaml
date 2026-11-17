@@ -1,0 +1,193 @@
+{{- $base := include "distributed-db.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $base }}-pgsrv
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgsrv
+spec:
+  replicas: {{ .Values.pgsrv.replicaCount }}
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  minReadySeconds: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.pgsrv.updateStrategy.maxUnavailable }}
+      maxSurge: {{ .Values.pgsrv.updateStrategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "distributed-db.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgsrv
+  template:
+    metadata:
+      labels:
+        {{- include "distributed-db.labels" . | nindent 8 }}
+        app.kubernetes.io/component: pgsrv
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "distributed-db.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.pgsrv.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.pgsrv.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.pgsrv.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.pgsrv.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.pgsrv.affinity }}
+      affinity:
+        {{- toYaml .Values.pgsrv.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "distributed-db.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: pgsrv
+      {{- end }}
+      {{- if .Values.pgsrv.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.pgsrv.topologySpread.zoneKey | quote }}
+          whenUnsatisfiable: {{ .Values.pgsrv.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: pgsrv
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.pgsrv.topologySpread.hostnameWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: pgsrv
+      {{- end }}
+      containers:
+        - name: pgsrv
+          image: {{ include "distributed-db.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /scripts/pgsrv-start.sh
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CLUSTER_DOMAIN
+              value: {{ .Values.clusterDomain | quote }}
+            - name: META_SERVICE
+              value: {{ include "distributed-db.metaService" . | quote }}
+            - name: META_PORT
+              value: {{ .Values.meta.port | quote }}
+            - name: KV_NODES
+              value: {{ include "distributed-db.kvNodes" . | quote }}
+            - name: PG_PORT
+              value: {{ .Values.pgsrv.port | quote }}
+            - name: PG_METRICS_PORT
+              value: {{ .Values.pgsrv.metricsPort | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.pgsrv.logLevel | quote }}
+            - name: TLS_ENABLED
+              value: {{ .Values.tls.enabled | quote }}
+            - name: TLS_DIR
+              value: {{ .Values.tls.mountPath | quote }}
+            - name: TLS_CERT_FILE
+              value: {{ .Values.tls.certKey | quote }}
+            - name: TLS_KEY_FILE
+              value: {{ .Values.tls.keyKey | quote }}
+            - name: TLS_CA_FILE
+              value: {{ .Values.tls.caKey | quote }}
+            - name: PG_AUTH_ENABLED
+              value: {{ .Values.pgsrv.auth.enabled | quote }}
+            {{- if .Values.pgsrv.auth.enabled }}
+            - name: PG_AUTH_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "distributed-db.pgsrvAuthSecret" . }}
+                  key: {{ .Values.auth.pgsrv.usernameKey }}
+            - name: PG_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "distributed-db.pgsrvAuthSecret" . }}
+                  key: {{ .Values.auth.pgsrv.passwordKey }}
+            {{- end }}
+          ports:
+            - name: pg
+              containerPort: {{ .Values.pgsrv.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.pgsrv.metricsPort }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: pg
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: pg
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.pgsrv.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $base }}-config
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "distributed-db.tlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}

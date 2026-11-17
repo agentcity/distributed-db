@@ -1,0 +1,15 @@
+apiVersion: v2
+name: distributed-db
+description: >-
+  Reference Helm chart for a private, single-tenant distributed-db deployment:
+  replicated meta/TSO, a 3-5 node Multi-Raft KV plane, and the stateless
+  sqlsrv/pgsrv gateways. This chart is an operations baseline, not evidence
+  that the database itself is production-ready; read docs/OPERATIONS.md.
+type: application
+version: 0.1.0
+appVersion: "0.0.0-placeholder"
+kubeVersion: ">=1.25.0-0"
+annotations:
+  category: Database
+  licenses: Apache-2.0
+  distributed-db/status: experimental-alpha

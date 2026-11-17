@@ -1,0 +1,205 @@
+{{- $base := include "distributed-db.fullname" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $base }}-meta
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "distributed-db.labels" . | nindent 4 }}
+    app.kubernetes.io/component: meta
+spec:
+  serviceName: {{ $base }}-meta-headless
+  replicas: {{ .Values.meta.replicaCount }}
+  podManagementPolicy: {{ .Values.meta.podManagementPolicy }}
+  updateStrategy:
+    type: {{ .Values.meta.updateStrategy }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "distributed-db.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: meta
+  template:
+    metadata:
+      labels:
+        {{- include "distributed-db.labels" . | nindent 8 }}
+        app.kubernetes.io/component: meta
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "distributed-db.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.meta.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.meta.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.meta.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.meta.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.meta.affinity }}
+      affinity:
+        {{- toYaml .Values.meta.affinity | nindent 8 }}
+      {{- else if .Values.meta.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.meta.podAntiAffinity.weight }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "distributed-db.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: meta
+      {{- end }}
+      {{- if .Values.meta.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.meta.topologySpread.zoneKey | quote }}
+          whenUnsatisfiable: {{ .Values.meta.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: meta
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.meta.topologySpread.hostnameWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "distributed-db.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: meta
+      {{- end }}
+      containers:
+        - name: meta
+          image: {{ include "distributed-db.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /scripts/meta-start.sh
+          envFrom:
+            - configMapRef:
+                name: {{ $base }}-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LOG_LEVEL
+              value: {{ .Values.meta.logLevel | quote }}
+            - name: META_ADMIN_TOKEN_ENABLED
+              value: {{ .Values.meta.adminToken.enabled | quote }}
+            {{- if .Values.meta.adminToken.enabled }}
+            - name: META_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "distributed-db.adminTokenSecret" . }}
+                  key: {{ .Values.auth.adminToken.key }}
+            {{- end }}
+            - name: TLS_ENABLED
+              value: {{ .Values.tls.enabled | quote }}
+            - name: MTLS_ENABLED
+              value: {{ .Values.tls.mtls | quote }}
+            - name: TLS_DIR
+              value: {{ .Values.tls.mountPath | quote }}
+            - name: TLS_CERT_FILE
+              value: {{ .Values.tls.certKey | quote }}
+            - name: TLS_KEY_FILE
+              value: {{ .Values.tls.keyKey | quote }}
+            - name: TLS_CA_FILE
+              value: {{ .Values.tls.caKey | quote }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.meta.port }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.meta.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $base }}-config
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "distributed-db.tlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
+        {{- if not .Values.meta.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.meta.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "distributed-db.labels" . | nindent 10 }}
+          app.kubernetes.io/component: meta
+        {{- with .Values.meta.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.meta.persistence.accessModes | nindent 10 }}
+        {{- if .Values.meta.persistence.storageClass }}
+        storageClassName: {{ .Values.meta.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.meta.persistence.size }}
+  {{- end }}
