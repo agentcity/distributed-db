@@ -27,9 +27,8 @@
    pipeline 256 — ~8.6k tx/s. Один in-flight latency-bound (~200 tx/s).
 3. **Объём:** periodic snapshot/GC/ENOSPC guard есть, но GC сканирует весь
    range и может быть memory-heavy; 1 ТБ не прогнан.
-4. **Membership:** joint consensus, config snapshot и decommission
-   orchestration есть; decommission не подключён к RPC/CLI, нет 1000 random
-   changes под failover.
+4. **Membership:** joint consensus, config snapshot и decommission CLI есть;
+   1000-change stress нестабилен и gated.
 5. **Split/merge:** replicated finish/clear и crash recovery есть; meta↔
    ranges.json переход не атомарен.
 6. **Backup:** ScanForBackup RPC и barrier API есть; 1PC barrier не подключён
@@ -94,8 +93,8 @@ backup, split без полного freeze.
 
 ## 6. Надёжность: четыре блокера
 
-1. Membership: joint config/snapshot/decommission есть; decommission RPC/CLI
-   и 1000 random changes остаются.
+1. Membership: joint config/snapshot/decommission CLI есть; stress и
+   multi-host доказательство остаются.
 2. Split/merge: replicated finish/clear + crash recovery есть; meta↔range-map
    atomicity остаётся.
 3. Storage lifecycle: periodic snapshot, MVCC GC, ENOSPC read-only есть.

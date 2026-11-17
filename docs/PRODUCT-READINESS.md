@@ -133,8 +133,8 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
    - gRPC TLS/mTLS есть опционально, plaintext default;
    - нет RBAC/authz на уровне запросов и audit log;
    - нет encryption at rest;
-   - SQL HTTP TLS/Bearer есть, default open; meta admin-token есть;
-   - KV admin RPC без отдельной auth; pgwire — TLS/password;
+   - SQL HTTP TLS/Bearer есть, default open; meta/KV admin token + RBAC;
+   - audit MVP; pgwire — TLS/password;
    - нет tenant isolation и квот.
 
 4. **Lifecycle**

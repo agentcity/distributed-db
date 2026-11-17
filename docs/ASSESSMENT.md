@@ -103,8 +103,8 @@ DBaaS и не замена PostgreSQL.
    KV admin RPC защищены admin-token; metaserver fan-out токен не передаёт;
    pgwire — один статический пользователь;
    v1 HTTP имеет Basic Auth/TLS, edgehash — TLS/Bearer.
-6. Membership safety: joint consensus, config snapshot и decommission
-   orchestration есть; decommission не подключён к RPC/CLI.
+6. Membership safety: joint consensus, config snapshot, decommission CLI и
+   orchestration есть; 1000-change stress нестабилен и gated.
 7. Rolling upgrade/rollback и совместимость протоколов.
 8. Multi-AZ/geo placement и capacity-aware rebalance.
 

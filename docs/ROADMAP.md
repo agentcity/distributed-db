@@ -2,6 +2,18 @@
 
 > Оценка предложения и спринты: [SPRINT-PLAN.md](SPRINT-PLAN.md).: KV first, SQL second
 
+## Tracks
+
+Карта документации (детали — по ссылкам, не здесь):
+
+- [KV cluster](tracks/kv-cluster.md) — v1/v2 KV, статус и границы.
+- [SQL/NewSQL](tracks/sql-newsql.md) — SQL поверх KV, HTTP и pgwire.
+- [Edgehash](tracks/edgehash.md) — встроенный компонент; `cmd/edgehash` —
+  опциональная сборка, не отдельный продукт.
+
+Быстрые входы: [SQL 5 минут](quickstart/sql-5-minutes.md) и
+[edgehash 10 минут](quickstart/edgehash-10-minutes.md).
+
 Цель — два продукта в одном репозитории:
 
 1. **kvdb** — распределённая транзакционная key/value база: ordered keys,
@@ -215,7 +227,7 @@ SQL:
 
 Не закрыто:
 
-- decommission RPC/CLI, 1000 random changes, meta↔map atomicity;
+- joint/restart stress, 1000 changes в CI, meta↔map atomicity;
 - PITR integration, restore drills;
 - TLS/auth fail-closed, KV admin auth, RBAC/audit/encryption at rest;
 - rolling upgrade/operator, SLO p99 и 1 ТБ soak;

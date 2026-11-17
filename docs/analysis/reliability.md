@@ -35,7 +35,7 @@ liveness/доступность, **C** — capacity. Вероятность — 
 
 | # | Отказ | Класс | Blast radius | Вероятность | Доказательство |
 |---|---|---|---|---|---|
-| R1 | Decommission не подключён к RPC/CLI; joint consensus есть, но нет 1000 random changes под failover | S | кластер: ошибка оператора | средняя | [kvserver/decommission.go](../../internal/kvserver/decommission.go), [raft/joint.go](../../internal/raft/joint.go) |
+| R1 | Joint/restart stress нестабилен, 1000 changes gated; decommission CLI есть, но stress/e2e под failover не доказан | S | кластер: ошибка оператора | средняя | [kvserver/decommission.go](../../internal/kvserver/decommission.go), [raft/joint.go](../../internal/raft/joint.go) |
 | R2 | Joint quorum реализован, но configInFlight/lease и snapshot install требуют multi-host проверки | S | range: потеря конфигурации | низкая–средняя | [raft/joint.go](../../internal/raft/joint.go) |
 | R3 | meta/Raft divergence: `AddReplica` ранний возврат по `containsAddr`; `RemoveReplica` меняет Raft раньше карты | S (control plane) | range: карта врёт, починки нет | средняя | [metaserver/membership.go:58](../../internal/metaserver/membership.go#L58), [:162](../../internal/metaserver/membership.go#L162) |
 | R4 | Split/merge finish реплицирован, но meta↔ranges.json переход не атомарен; crash в окне оставляет старую карту | S/D | range (оба ребёнка) | средняя при crash | [kvserver/split.go](../../internal/kvserver/split.go), [service.go](../../internal/kvserver/service.go) |
@@ -45,7 +45,7 @@ liveness/доступность, **C** — capacity. Вероятность — 
 | R8 | ENOSPC guard покрывает MVCC/RPC; прямой Raft WAL/snapshot I/O не обёрнут, окно до statfs | L/D | узел и его range | низкая–средняя | [kvserver/lifecycle.go](../../internal/kvserver/lifecycle.go) |
 | R9 | Крах между DeleteRange/cfg update и ranges.json не атомарен; данные могут остаться под новым префиксом | D | range | низкая–средняя | [kvserver/split.go](../../internal/kvserver/split.go) |
 | R10 | TTL лока по локальным часам против TSO; lease чтений без запаса на drift | S | транзакция/ключ | низкая–средняя (skew > 3 s) | [mvcc/lock.go:52](../../internal/mvcc/lock.go#L52), [mvcc/mvcc.go:71](../../internal/mvcc/mvcc.go#L71) |
-| R11 | ScanForBackup RPC и strict RemoteScanner есть, но 1PC barrier не подключён к backup; PITR archive не интегрирован | D | бэкап: пропущенный commit | средняя при активной записи | [backup/scanner.go](../../internal/backup/scanner.go), [mvcc/barrier.go](../../internal/mvcc/barrier.go), [pitr](../../internal/pitr) |
+| R11 | ScanForBackup RPC, strict RemoteScanner и backup barrier есть; PITR archive не интегрирован, remote strict требует barrier | D | бэкап: пропущенный commit | средняя при активной записи | [backup/scanner.go](../../internal/backup/scanner.go), [mvcc/barrier.go](../../internal/mvcc/barrier.go), [pitr](../../internal/pitr) |
 
 
 
@@ -73,18 +73,18 @@ RPO 0 недостижим: `durability=sync` защищает только от
 
 | Область | Что есть | Чего нет |
 |---|---|---|
-| Membership | joint consensus, config snapshot/epoch, decommission orchestration | нет RPC/CLI wiring; нет 1000 random changes под failover |
+| Membership | joint consensus, config snapshot/epoch, decommission CLI/orchestration | 1000-change stress нестабилен и gated; нет multi-host |
 | Crash | 1 узел, 32 ключа, SIGKILL, sync/fast | нет power-loss, краха в 2PC/split/snapshot, ENOSPC, slow disk |
 | 2PC | recovery после commit primary, commit-incomplete, resolver, response loss | нет смерти клиента с осиротевшим secondary-локом, нет краха во время commit |
 | Split/merge | freeze/unfreeze, generation-check, duplicate finish, copy-failure | нет краха/рестарта с prepare в логе, replicated clear, расхождения реплик |
-| Backup | lock-aware in-process scan, checksums, restore preflight | нет remote lock-scan RPC, PITR, restore-drill с транзакцией в полёте, RPO/RTO |
+| Backup | ScanForBackup RPC, strict RemoteScanner, barrier, checksums | нет PITR/restore-drill, RPO/RTO |
 | Soak/clock | nightly 3×20 мин; TSO-монотонность на 1 узле | нет 72 ч, multi-node skew, lease-skew, linearizability checker |
 
 ## 6. Топ-5 инвестиций (по порядку)
 
 | # | Инвестиция | Зачем | Эффект | Оценка |
 |---|---|---|---|---|
-| 1 | Decommission RPC/CLI + 1000 random changes под failover | R1/R2 | закрывает операционный блокер G2 | 4–6 pw |
+| 1 | Починить joint/restart stress; 1000 changes в CI | R1/R2 | закрывает операционный блокер G2 | 4–6 pw |
 | 2 | Lifecycle hardening: GC memory/range, snapshot leadership gate, Raft WAL ENOSPC | R7/R8 | держит RTO и диск на 100+ ГБ | 3–4 pw |
 | 3 | Атомарный split/merge: split как реплицированная запись, снапшот ребёнка от лидера, идемпотентное завершение и разморозка | R4/R5 | убирает потерю ack и расхождение реплик | 4–6 pw |
 | 4 | Crash/chaos-контур: инъекции в 2PC/commit/snapshot/split, ENOSPC, power-loss, 72 ч soak, linearizability checker | нет доказательств для G1/G6 | превращает «зелёный CI» в проверяемые инварианты | 4–6 pw |

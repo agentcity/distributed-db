@@ -6,12 +6,12 @@
 
 > **v1** (`cmd/db`) — учебно-демонстрационный координатор + hash-шардинг.
 > **v2** (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`) — experimental alpha:
-> Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, **membership
-> MVP** (single-server, без joint consensus), chunked snapshots, SQL P0.
+> Multi-Raft, MVCC/2PC, range split/merge, replicated meta/TSO, **joint
+> consensus**, decommission orchestration, chunked snapshots, SQL P0.
 > Production-профиль — `-durability=sync` (fsync state machine); `fast` —
-> opt-in. Это ещё **не production-СУБД**: gRPC TLS/mTLS есть опционально
-> (plaintext default), pgwire TLS/password auth есть, но RBAC/audit/at-rest
-> нет; PITR и joint consensus только в ADR; SLO p99/1 ТБ не подтверждены.
+> opt-in. Это ещё **не production-СУБД**: gRPC TLS/mTLS и RBAC/audit MVP
+> есть опционально, pgwire TLS/password; PITR archive MVP не интегрирован;
+> SLO p99/1 ТБ не подтверждены.
 > Практическое руководство (терминал, curl, SQL, psql): [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
 Честная оценка и применимость: [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 Что реализовать до production: [docs/PRODUCTION-PLAN.md](docs/PRODUCTION-PLAN.md).
@@ -19,6 +19,18 @@
 Сравнение скорости с PostgreSQL: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd; mobile — scaffold):
 [docs/EDGE-HASH-CACHE.md](docs/EDGE-HASH-CACHE.md).
+
+## Tracks
+
+Три документальных трека (это карта, не три отдельных продукта):
+
+- [KV cluster](docs/tracks/kv-cluster.md) — v1 demo и v2 Multi-Raft KV.
+- [SQL/NewSQL](docs/tracks/sql-newsql.md) — SQL P0 поверх KV, HTTP и pgwire.
+- [Edgehash](docs/tracks/edgehash.md) — встроенный read-only edge-компонент;
+  `cmd/edgehash` — опциональная сборка, не отдельный продукт.
+
+Быстрые входы: [SQL за 5 минут](docs/quickstart/sql-5-minutes.md) и
+[edgehash за 10 минут](docs/quickstart/edgehash-10-minutes.md).
 
 ## Что внутри
 
@@ -72,8 +84,9 @@ split/merge, replicated meta/TSO, learner→voter membership, leader transfer,
 chunked/resumable snapshots, backup/restore, SQL после split, extended pgwire,
 SLO-метрики и Jepsen partitions.
 
-Что блокирует production: joint consensus/decommission, PITR и restore-учения,
-TLS/auth/audit/encryption, rolling upgrade, SLO p99-прогон, multi-AZ placement.
+Что блокирует production: joint/restart stress, PITR integration и
+restore-учения, fail-closed TLS/audit, rolling upgrade, SLO p99/1 ТБ,
+multi-AZ placement.
 Полный разбор: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 
 ## Куда развивается проект (v2)
@@ -157,18 +170,18 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
 - Stage 2.4: leader transfer и rebalance лидеров (без Add/Remove replica).
 - Stage 2.5: snapshot resume по `next_offset`.
 - Stage 2.6: Add/Remove replica (learner → voter), meta orchestration,
-  membership persist; single-server change, без joint consensus.
+  membership persist; joint consensus C_old,new и snapshot config.
 - Замеры на M1 Pro/loopback в **fast**-профиле: 3 узла single txn ~11.6 мс (~86 tx/s),
   parallel 10 клиентов ~1.2–2.1 мс/op (~480–820 tx/s), batch 256
-  ~0.14–0.20 мс/txn (~5–7k tx/s, но batch latency 36–51 мс); PostgreSQL 13
+  ~0.14–0.20 мс/txn (~5–7k tx/s, batch latency 13–30 мс); PostgreSQL 13
   рядом — ~6.8k tx/s на 10 клиентах. Production default `sync` с одним
   in-flight: ~44–185 tx/s; с pipeline 64–256 на рабочую станцию — ~4–8.6k tx/s,
   то есть aggregate throughput сопоставим с PostgreSQL, но batch latency
   16–30 мс. Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
 
-Пока нет: joint consensus/decommission, per-chunk CRC, durable scheduler
-queue/leader lease, production TLS/auth, SLO p99 прогон, расширенный SQL
-planner (AND/OR, >2 JOIN, parallel).
+Пока нет: стабильного joint stress, PITR integration, durable scheduler
+queue/leader lease, fail-closed production TLS/audit, SLO p99/1 ТБ прогон,
+расширенный SQL planner (AND/OR, >2 JOIN, parallel).
 
 ### SQL P0 поверх KV (experimental)
 

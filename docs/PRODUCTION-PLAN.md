@@ -54,9 +54,10 @@
 
 ### B. Membership safety
 
-Сейчас: joint consensus C_old,new, config snapshot/epoch и decommission
-orchestration реализованы в коде. Decommission не подключён к RPC/CLI;
-1000 random changes и multi-host проверка отсутствуют.
+Сейчас: joint consensus C_old,new, config snapshot/epoch, decommission
+orchestration + `kvctl decommission` и meta fan-out token реализованы.
+1000-change stress есть, но по умолчанию gated (`RAFT_JOINT_STRESS=1`) и
+показывает редкую расходимость под нагрузкой; multi-host проверки нет.
 
 Реализовать:
 
@@ -73,9 +74,9 @@ orchestration реализованы в коде. Decommission не подклю
 
 ### C. Backup и PITR
 
-Сейчас: lock-aware ScanForBackup RPC, строгий RemoteScanner, MVCC
-commit-lease/apply barrier и PITR archive MVP в `internal/pitr`; интеграция
-PITR с Raft WAL/meta/TSO и isolated restore отсутствует.
+Сейчас: ScanForBackup RPC, строгий RemoteScanner, backup apply barrier,
+PITR archive MVP + restore-to-TS planner. Нет Raft WAL tail/meta/TSO
+archive, isolated restore и drill.
 
 Реализовать:
 
@@ -92,8 +93,9 @@ PITR с Raft WAL/meta/TSO и isolated restore отсутствует.
 
 Сейчас: gRPC TLS/mTLS, SQL HTTP TLS/Bearer, meta admin-token реализованы
 опционально (default open); pgwire TLS/password; KVService admin RPC защищены
-admin-token; нет RBAC/audit/at-rest; metaserver fan-out пока не передаёт
-admin-token; edgehash TLS/Bearer.
+admin-token + meta fan-out token; RBAC/audit MVP (token/CN roles, JSONL
+audit); нет at-rest, audit rotation, отдельного admin-listener; edgehash
+TLS/Bearer.
 
 Реализовать:
 
@@ -208,23 +210,26 @@ admin-token; edgehash TLS/Bearer.
   для KV/meta/Raft/v2client/CLI (опционально, plaintext default);
 - 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
 - nightly chaos CI + script; Jepsen partitions проходят;
-- kvctl CRUD/txn/shell + admin ranges/status/split/merge/backup.
+- kvctl CRUD/txn/shell + admin ranges/status/split/merge/decommission/backup;
+- RBAC (token/CN roles) + JSONL audit; kvbackup TLS/admin-token;
+- ScanForBackup + backup barrier; per-chunk snapshot CRC; soak harness.
 
 Не закрыто:
 
-- decommission RPC/CLI wiring; 1000 random changes под failover;
-- PITR integration (Raft WAL/meta/TSO/isolated restore); 1PC barrier wiring;
-- TLS/auth fail-closed, admin-listener, RBAC, audit, at-rest;
+- 1000 random changes под failover: stress gated и пока нестабилен;
+- PITR integration (Raft WAL/meta/TSO/isolated restore); backup barrier
+  wired, но нужен drill;
+- fail-closed TLS, admin-listener, audit rotation/fail-closed, at-rest;
 - libpq-compatible pgwire TLS (сейчас direct TLS, не SSLRequest upgrade);
 - 1 ТБ реальный прогон, real-network soak;
 - multi-range на разных узлах/дисках; parallel apply.
 
 ## 7. Ближайшие 2–4 недели
 
-1. Decommission RPC/CLI + 1000 random changes под failover.
+1. Починить joint/restart convergence stress; 1000 changes в CI.
 2. Meta↔range-map atomic split/merge (distributed 2PC).
-3. PITR integration + 1PC barrier wiring + restore drill.
-4. Admin-listener/RBAC/audit/at-rest, fail-closed TLS.
+3. PITR WAL/meta/TSO integration + restore drill.
+4. Fail-closed TLS, admin-listener, audit rotation/at-rest.
 5. Multi-host multi-range + parallel apply.
 6. 1 ТБ прогон на Linux/NVMe, real network.
 

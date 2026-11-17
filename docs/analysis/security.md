@@ -7,8 +7,9 @@
 
 gRPC TLS/mTLS, SQL HTTP TLS/Bearer и admin-token для meta/KV реализованы, но
 **все три выключены по умолчанию**. Периметр безопасности ещё не production:
-KV admin RPC защищены токеном, но metaserver fan-out его пока не передаёт;
-нет отдельного admin-listener, RBAC, audit и
+KV admin RPC защищены токеном, metaserver fan-out передаёт токен;
+RBAC (admin/operator/read-only) и JSONL audit MVP есть; нет отдельного
+admin-listener, at-rest и
 encryption at rest. Безопасность допустима только в доверенной сети с
 явно включёнными TLS/token.
 
@@ -28,10 +29,10 @@ encryption at rest. Безопасность допустима только в 
 | ID | Уровень | Находка | Исправление |
 |---|---|---|---|
 | S-01 | High | SQL HTTP TLS/Bearer реализованы, но default open; без флагов — полный доступ | fail-closed профиль, auth обязателен |
-| S-02 | High | Meta и KV admin RPC защищены токеном, но fan-out без токена; нет отдельного admin-listener/RBAC | передача токена в fan-out, отдельный listener, RBAC, audit |
+| S-02 | High | Admin RPC защищены токеном/ролью, fan-out передаёт токен; нет отдельного admin-listener и audit rotation | отдельный listener, fail-closed audit |
 | S-03 | High | TLS opt-in, plaintext default; нет требования TLS в production | fail-closed профиль, TLS обязателен |
-| S-04 | High | Нет RBAC/identity на уровне запросов | principal из mTLS, роли/гранты |
-| S-05 | High | Нет audit log | структурный audit, export |
+| S-04 | High | RBAC MVP только для admin RPC; data-plane без identity | per-user principal/гранты |
+| S-05 | High | JSONL audit MVP для admin RPC; нет rotation/export/fail-closed | rotation, export, fail-closed |
 | S-06 | High | Нет encryption at rest и шифрования backup | KMS/envelope, encrypted backup |
 | S-07 | High | pgwire: cleartext-over-TLS, один пользователь, пароль в argv | SCRAM, роли, secrets |
 | S-08 | Medium | `kvbackup` ходит plaintext | TLS-опции и mTLS |
@@ -54,7 +55,7 @@ encryption at rest. Безопасность допустима только в 
 ## 5. Приоритет
 
 1. Fail-closed профиль: TLS/auth обязательны в production.
-2. Admin-listener + токен/mTLS на KV admin RPC + RBAC + audit.
+2. Admin-listener + fail-closed audit + rotation/export.
 3. SQL HTTP default-open убрать.
 4. Encryption at rest/backups.
 5. pgwire SCRAM/роли.
