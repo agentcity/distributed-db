@@ -36,6 +36,22 @@ UPDATE bench SET v = v + 1 WHERE id = :id;
 `ns/op` в parallel-бенчмарке — это время **одной операции**, а не десяти.
 Aggregate throughput = `1e9 / ns/op`, а не `10 * 1e9 / ns/op`.
 
+### Linux (контейнер, не NVMe)
+
+Тот же M1-хост, `golang:1.23-bookworm`, 5 CPU, overlay fs; не multi-host и
+не NVMe:
+
+| Сценарий | Результат |
+|---|---:|
+| fast, 1 клиент | ~6.8 мс / ~147 tx/s |
+| sync, 1 клиент | ~6.9 мс / ~145 tx/s |
+| fast, 10 клиентов | ~1.48 мс/op / ~677 tx/s |
+| sync, 10 клиентов | ~1.25 мс/op / ~800 tx/s |
+
+Linux fsync заметно дешевле macOS `F_FULLFSYNC`; разброс на 5 CPU высокий.
+Для production-SLO нужен отдельный Linux/NVMe/multi-host стенд:
+`./scripts/bench-linux.sh`.
+
 ### Batch/pipeline
 
 `CommitBatch` объединяет независимые транзакции в один Raft-entry;

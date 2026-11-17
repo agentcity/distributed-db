@@ -24,6 +24,11 @@
 | 64 | ~11.8k tx/s | ~3.98k tx/s | ~16 мс |
 | 256 | ~19.5k tx/s | ~8.57k tx/s | ~30 мс |
 
+Linux-контейнер (`golang:1.23-bookworm`, 5 CPU, overlay, не NVMe):
+fast 1 клиент ~6.8 мс, sync ~6.9 мс; 10 клиентов fast ~1.48 мс/op,
+sync ~1.25 мс/op. macOS `F_FULLFSYNC` дороже; на Linux разрыв меньше.
+Повторить: `./scripts/bench-linux.sh`.
+
 PostgreSQL 13 на том же железе: ~0.68 мс / 1 469 tx/s (1 клиент),
 ~1.47 мс / 6 835 tx/s (10 клиентов, один in-flight).
 
