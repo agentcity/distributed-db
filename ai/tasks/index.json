@@ -280,5 +280,11 @@
     "title": "Linux fsync comparison",
     "status": "done",
     "file": "0047-linux-bench.md"
+  },
+  {
+    "id": "0048",
+    "title": "Production hardening — 8 срезов",
+    "status": "in_progress",
+    "file": "0048-production-hardening.md"
   }
 ]
