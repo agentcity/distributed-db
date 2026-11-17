@@ -463,8 +463,9 @@ mismatches, "not hosted", or snapshot catch-up loops.
 
 **Impact:** A stale voter that is still in the Raft configuration can disrupt
 elections if its log is behind or if it was supposed to be removed. This build
-has no joint consensus, no snapshot-resident membership and no supported
-decommission flow (ADR 0005 is proposed). There is no `kvctl remove` command.
+has joint consensus, snapshot-resident membership and decommission
+orchestration in code, but decommission is not wired to an RPC/CLI. There is no
+`kvctl remove` command.
 
 ### 6.1 Safe rejoin (same member, same volume)
 

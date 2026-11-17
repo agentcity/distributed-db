@@ -95,8 +95,8 @@ DBaaS и не замена PostgreSQL.
 2. p99 и tail latency на реальной сети и NVMe.
 3. Crash-consistency `SyncWrites=false`: durability state machine опирается на
    replay Raft-лога; нужен crash-тест/soak.
-4. Restore drills и RPO/RTO; PITR отсутствует; remote backup lock-scan RPC
-   не реализован.
+4. Restore drills и RPO/RTO; PITR archive MVP не интегрирован; ScanForBackup
+   RPC реализован.
 5. Безопасность v2: gRPC TLS/mTLS **есть опционально** (KV/meta/Raft,
    v2client, CLI), но по умолчанию plaintext; нет RBAC/audit/encryption at
    rest; SQL HTTP TLS/Bearer и meta admin-token **есть опционально**;
