@@ -292,5 +292,11 @@
     "title": "Safety/recovery wave",
     "status": "done",
     "file": "0049-safety-recovery.md"
+  },
+  {
+    "id": "0050",
+    "title": "Оценка предложения и план спринтов",
+    "status": "done",
+    "file": "0050-proposal-backlog.md"
   }
 ]

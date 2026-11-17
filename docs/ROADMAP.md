@@ -1,4 +1,6 @@
-# Roadmap: KV first, SQL second
+# Roadmap
+
+> Оценка предложения и спринты: [SPRINT-PLAN.md](SPRINT-PLAN.md).: KV first, SQL second
 
 Цель — два продукта в одном репозитории:
 
