@@ -298,5 +298,11 @@
     "title": "Оценка предложения и план спринтов",
     "status": "done",
     "file": "0050-proposal-backlog.md"
+  },
+  {
+    "id": "0051",
+    "title": "Sprint 1 — Evidence & closure",
+    "status": "in_progress",
+    "file": "0051-sprint-1-evidence.md"
   }
 ]
