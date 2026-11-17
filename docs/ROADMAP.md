@@ -194,8 +194,10 @@ KV:
   meta/range/TSO, smart client, benchmark harness;
 - 3-node v2: prewrite/commit/get/scan, failover, snapshot catch-up;
 - range split/merge, auto-split/merge, leader transfer/rebalance;
-- learner→voter membership, config snapshot/config epoch, chunked snapshots;
-- periodic snapshot + MVCC GC + ENOSPC guard; lock-aware backup scanner;
+- joint consensus, learner→voter, config snapshot/epoch, decommission
+  orchestration, chunked snapshots;
+- periodic snapshot + MVCC GC + ENOSPC guard; ScanForBackup RPC;
+- PITR archive MVP; multi-binary image + bootstrap Job;
 - fast/sync профили; sync по умолчанию;
 - batch/pipeline: fast ~7k tx/s амортизированно, sync pipeline 256 ~8.6k tx/s
   на loopback; один in-flight остаётся latency-bound;
@@ -211,8 +213,8 @@ SQL:
 
 Не закрыто:
 
-- joint consensus/decommission;
-- PITR/continuous backup, remote lock-scan, restore drills;
+- decommission RPC/CLI, 1000 random changes, meta↔map atomicity;
+- PITR integration, restore drills;
 - TLS/auth fail-closed, KV admin auth, RBAC/audit/encryption at rest;
 - rolling upgrade/operator, SLO p99 и 1 ТБ soak;
 - AND/OR, >2 JOIN, NULL/DECIMAL/JSON/FK, online DDL, pg_catalog/JDBC.

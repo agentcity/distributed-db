@@ -100,10 +100,11 @@ DBaaS и не замена PostgreSQL.
 5. Безопасность v2: gRPC TLS/mTLS **есть опционально** (KV/meta/Raft,
    v2client, CLI), но по умолчанию plaintext; нет RBAC/audit/encryption at
    rest; SQL HTTP TLS/Bearer и meta admin-token **есть опционально**;
-   KV admin RPC без auth; pgwire — один статический пользователь;
+   KV admin RPC защищены admin-token; metaserver fan-out токен не передаёт;
+   pgwire — один статический пользователь;
    v1 HTTP имеет Basic Auth/TLS, edgehash — TLS/Bearer.
-6. Membership safety: config в state-machine snapshot есть, но нет joint
-   consensus и decommission.
+6. Membership safety: joint consensus, config snapshot и decommission
+   orchestration есть; decommission не подключён к RPC/CLI.
 7. Rolling upgrade/rollback и совместимость протоколов.
 8. Multi-AZ/geo placement и capacity-aware rebalance.
 

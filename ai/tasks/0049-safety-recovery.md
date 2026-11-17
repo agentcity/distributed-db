@@ -18,9 +18,22 @@ scope: {backend: true, console: false, mobile: false}
 7. Decommission orchestration.
 8. Release image + chart bootstrap.
 
-## Критерии
+## Результат
 
-- [ ] Каждый срез компилируется и имеет тесты.
-- [ ] Нет конфликтов по файлам.
-- [ ] `go build/vet/gofmt`, `go test -race ./...`.
-- [ ] Оставшиеся gaps перечислены явно.
+- [x] Joint consensus C_old,new + auto-finalize + snapshot.
+- [x] Split/merge replicated finish/clear + crash recovery.
+- [x] MVCC commit-lease/apply barrier.
+- [x] ScanForBackup RPC + strict RemoteScanner.
+- [x] PITR archive MVP.
+- [x] KVService admin token.
+- [x] Decommission orchestration.
+- [x] Multi-binary image + chart bootstrap.
+- [x] `go build/vet/gofmt`, `go test -race ./...`.
+
+## Осталось
+
+- decommission RPC/CLI + 1000 random changes;
+- meta↔ranges.json atomicity;
+- PITR integration + 1PC barrier wiring + restore drill;
+- metaserver admin fan-out token, RBAC/audit/at-rest;
+- 1 ТБ multi-host.

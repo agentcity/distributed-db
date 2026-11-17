@@ -54,9 +54,9 @@
 
 ### B. Membership safety
 
-Сейчас: learner→voter→remove, single-server change, без joint consensus;
-config (voters/learners/epoch) уже входит в state-machine snapshot;
-decommission и joint consensus отсутствуют.
+Сейчас: joint consensus C_old,new, config snapshot/epoch и decommission
+orchestration реализованы в коде. Decommission не подключён к RPC/CLI;
+1000 random changes и multi-host проверка отсутствуют.
 
 Реализовать:
 
@@ -73,8 +73,9 @@ decommission и joint consensus отсутствуют.
 
 ### C. Backup и PITR
 
-Сейчас: логический backup/restore, lock-aware scanner для in-process store;
-remote lock-scan RPC и PITR отсутствуют; restore неатомарен.
+Сейчас: lock-aware ScanForBackup RPC, строгий RemoteScanner, MVCC
+commit-lease/apply barrier и PITR archive MVP в `internal/pitr`; интеграция
+PITR с Raft WAL/meta/TSO и isolated restore отсутствует.
 
 Реализовать:
 
@@ -90,8 +91,9 @@ remote lock-scan RPC и PITR отсутствуют; restore неатомаре�
 ### D. Security
 
 Сейчас: gRPC TLS/mTLS, SQL HTTP TLS/Bearer, meta admin-token реализованы
-опционально (default open); pgwire TLS/password; KV admin RPC без auth; нет
-RBAC/audit/at-rest; edgehash TLS/Bearer.
+опционально (default open); pgwire TLS/password; KVService admin RPC защищены
+admin-token; нет RBAC/audit/at-rest; metaserver fan-out пока не передаёт
+admin-token; edgehash TLS/Bearer.
 
 Реализовать:
 
@@ -197,10 +199,11 @@ RBAC/audit/at-rest; edgehash TLS/Bearer.
 - crash-injection harness: SIGKILL + restart, fast и sync; подтверждённых
   потерь нет, fast восстанавливается replay Raft-лога;
 - ADR 0005 membership safety и ADR 0006 PITR;
-- membership config в Raft snapshot (config epoch, install path);
+- joint consensus, membership config в snapshot, decommission orchestration;
 - periodic snapshot + MVCC GC + ENOSPC read-only guard;
-- lock-aware backup scanner для in-process store; restore preflight/checksums;
-- SQL HTTP TLS/Bearer; meta admin-token;
+- lock-aware ScanForBackup RPC, strict RemoteScanner, PITR archive MVP;
+- MVCC commit-lease/apply barrier;
+- SQL HTTP TLS/Bearer; meta и KV admin-token;
 - pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS/mTLS
   для KV/meta/Raft/v2client/CLI (опционально, plaintext default);
 - 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
@@ -209,19 +212,19 @@ RBAC/audit/at-rest; edgehash TLS/Bearer.
 
 Не закрыто:
 
-- joint consensus/decommission (config snapshot уже есть);
-- PITR/continuous archive; remote backup lock-scan RPC;
-- TLS/auth fail-closed, KV admin auth, admin-listener, RBAC, audit, at-rest;
+- decommission RPC/CLI wiring; 1000 random changes под failover;
+- PITR integration (Raft WAL/meta/TSO/isolated restore); 1PC barrier wiring;
+- TLS/auth fail-closed, admin-listener, RBAC, audit, at-rest;
 - libpq-compatible pgwire TLS (сейчас direct TLS, не SSLRequest upgrade);
 - 1 ТБ реальный прогон, real-network soak;
 - multi-range на разных узлах/дисках; parallel apply.
 
 ## 7. Ближайшие 2–4 недели
 
-1. Joint consensus + decommission (config snapshot готов).
-2. Атомарный реплицированный split/merge.
-3. Remote lock-scan RPC + PITR/continuous archive.
-4. KV admin auth, admin-listener/RBAC, fail-closed TLS.
+1. Decommission RPC/CLI + 1000 random changes под failover.
+2. Meta↔range-map atomic split/merge (distributed 2PC).
+3. PITR integration + 1PC barrier wiring + restore drill.
+4. Admin-listener/RBAC/audit/at-rest, fail-closed TLS.
 5. Multi-host multi-range + parallel apply.
 6. 1 ТБ прогон на Linux/NVMe, real network.
 

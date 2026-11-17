@@ -25,9 +25,9 @@ plan to rehearse in staging.
 
 Two immediate consequences:
 
-1. The default image in `values.yaml` is a placeholder. The repository
-   `Dockerfile` builds only `cmd/db`; it does not contain `kv2`, `sqlsrv`,
-   `pgsrv`, `kvctl` or `kvbackup`. See §3.1.
+1. The image is built from the repository `Dockerfile` and contains `db`,
+   `kv2`, `sqlsrv`, `pgsrv`, `kvctl`, `kvbackup` and `edgehash`; publish it to
+   your registry and override `image.repository`/`image.tag` (§3.1).
 2. SQL HTTPS uses the native sqlsrv TLS listener and a single static Bearer
    token (`-auth-token`). It is transport security plus one operator
    credential, not RBAC, per-user identity or audit. The optional ingress adds
@@ -199,24 +199,18 @@ same PVC** (node recovery), not adding or removing voters.
 
 ### 3.1 Build the image first
 
-The repository Dockerfile is not the image this chart needs. It builds
-`./cmd/db` only. Build and publish an Alpine-based image that contains:
+Build and publish the multi-binary image:
 
-```
-/app/kv2       # -mode=meta and -mode=node
-/app/sqlsrv
-/app/pgsrv
-/app/kvctl
-/app/kvbackup
-/bin/sh        # startup scripts use POSIX sh
-ca-certificates
+```bash
+make image IMAGE_REPOSITORY=<registry>/distributed-db IMAGE_TAG=<tag>
+make image-push IMAGE_REPOSITORY=... IMAGE_TAG=...
 ```
 
-The container must run as UID/GID 10001 (the chart's `runAsUser`/`fsGroup`) and
-write only under `/data` and `/tmp`, which are mounted. The default
-`image.repository`/`image.tag` are placeholders; `helm install` with the
-defaults will try to pull `ghcr.io/example/distributed-db:0.0.0-placeholder`.
-Override both values after publishing the image.
+The image contains `/app/kv2`, `/app/sqlsrv`, `/app/pgsrv`, `/app/kvctl`,
+`/app/kvbackup`, `/app/edgehash`, `/app/db`, CA certificates and `/bin/sh`.
+It runs as UID/GID 10001 and writes only under `/data` and `/tmp`.
+Override `image.repository`/`image.tag`; defaults are a local tag, not a
+published image.
 
 The chart targets a build whose `sqlsrv -h` includes `-tls-cert`, `-tls-key`,
 `-tls-ca`, `-tls-server-name` and `-auth-token`, and whose `kv2 -h` includes
@@ -388,17 +382,18 @@ but this is not a production placement:
 - every KV pod is a member of range 1's Raft group because they were started
   with the full `-peers` list, regardless of what meta says.
 
-The chart does **not** bootstrap the range map. `SetRanges` is an admin RPC
-(`MetaService/SetRanges`) protected by the admin token, and neither `kvctl` nor
-the chart exposes a supported command for it. Before treating an install as a
-working cluster, an operator/engineer must set range 1's replicas to the KV pod
-addresses (all of them for the default single-range layout) using an approved
-internal tool, then verify with `kvctl ranges`.
+`kvctl init-ranges -replicas <kv-pod-addresses>` sets range 1's replicas
+idempotently. The chart can run it as an optional post-install Job:
 
-Do not run a "bootstrap" against an existing cluster: `SetRanges` replaces the
-whole range map and can orphan split ranges and data. This is a one-time,
-pre-data operation. If splits/merges are part of the workload, treat the
-missing bootstrap tooling as a release blocker until it is provided and tested.
+```bash
+helm upgrade --install ... --set bootstrap.enabled=true
+```
+
+The Job waits for a meta leader, calls `init-ranges` with the KV pod DNS
+addresses, and is safe to retry (identical set no-op; a different existing set
+is refused). `bootstrap.enabled` is **false** by default; enable it only for a
+fresh, pre-data install. Do not run it against an existing cluster: `SetRanges`
+replaces the whole range map and can orphan split ranges.
 
 ### 3.4 Verify
 
@@ -860,8 +855,8 @@ The step-by-step procedures are in [RUNBOOKS.md](RUNBOOKS.md).
 
 1. **No production evidence**: no cluster install, 72 h soak, p99 run, Jepsen
    run or 1 TB test backs this chart.
-2. **Image placeholder**: the repository Dockerfile does not contain the v2
-   binaries. The chart cannot deploy until an image is built and published.
+2. **Image**: the multi-binary image builds, but the default tag is local;
+   publish and override `image.repository`/`image.tag`.
 3. **SQL auth is one static token**: sqlsrv has native TLS and a native Bearer
    check, but only one operator token for `/v1/sql`, `/metrics` and
    `/debug/slo`; `/health` and `/healthz` are public. The same token is the meta
@@ -873,9 +868,9 @@ The step-by-step procedures are in [RUNBOOKS.md](RUNBOOKS.md).
    token, restore is not atomic and does not delete extra keys, and there is no
    PITR/continuous archive. A TLS-enabled cluster cannot run the existing
    restore path without a new build; see §5.3.
-5. **Membership is not safe enough for scaling**: no joint consensus, no
-   decommission, no membership-in-snapshot guarantee. Do not scale or replace
-   voters with this chart; ADR 0005 is proposed, not implemented.
+5. **Membership**: joint consensus, config snapshot and decommission
+   orchestration exist in code, but decommission is not wired to an RPC/CLI
+   and the chart should still treat voter replacement as manual.
 6. **No rolling-upgrade guarantee**: no protocol versioning or mixed-version
    test. Treat upgrades as maintenance windows with backups.
 7. **No RBAC/audit/at-rest encryption**: mTLS and a shared admin token are not
@@ -893,13 +888,10 @@ The step-by-step procedures are in [RUNBOOKS.md](RUNBOOKS.md).
 12. **Reliance on stable DNS and time**: node IDs are DNS names; TSO/leases
     assume reasonably synchronized clocks. IP-only networking or clock drift
     is unsupported.
-13. **No supported range-map bootstrap**: the chart does not call `SetRanges`
-    and `kvctl` has no command for it. Fresh installs start with an empty
-    replica list for range 1; split/merge and scheduler placement need a
-    one-time bootstrap (§3.3.1). Restoring a multi-range backup into a fresh
-    cluster has the same prerequisite: `-ensure-ranges` updates metadata but
-    cannot start range groups on the target, so the target must already host
-    the same boundaries.
+13. **Range-map bootstrap is opt-in**: enable `bootstrap.enabled` and provide
+    KV pod addresses for a fresh install (§3.3.1). Restoring a multi-range
+    backup still requires the target to host the same range boundaries;
+    `-ensure-ranges` updates metadata but cannot start groups.
 
 ### 9.2 Assumptions this baseline makes
 

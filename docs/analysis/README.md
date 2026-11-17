@@ -14,7 +14,7 @@
 | Скорость, sync | 4 | pipeline 256 — ~8.6k tx/s; один in-flight — ~200 tx/s |
 | Потенциал объёма | 3 | комфортно ≤50 ГБ; 50–300 ГБ рискованно; 1 ТБ — нет |
 | Безопасность | 3 | gRPC TLS/mTLS opt-in; нет RBAC/audit/at-rest |
-| Надёжность | 3 | happy path крепкий; 4 production-блокера |
+| Надёжность | 4 | joint consensus/split recovery/backup barrier есть; остались wiring и PITR |
 | **Production readiness** | **3** | **pre-alpha / trusted-network prototype** |
 
 Оценки — суждение на основе кода и измерений, не SLA.
@@ -25,14 +25,15 @@
    ~480–820 tx/s; batch 256 ~7k tx/s амортизированно.
 2. **Sync-профиль:** один Pebble batch/fsync на Raft-батч; 10 клиентов с
    pipeline 256 — ~8.6k tx/s. Один in-flight latency-bound (~200 tx/s).
-3. **Объём:** 1 ТБ диск вместит, но процесс — нет: MVCC GC не вызывается,
-   Raft WAL не снапшотится периодически, split копирует всё под freeze,
-   backup квадратичен.
-4. **Membership:** конфигурация не в snapshot, joint consensus нет; узел
-   после snapshot может подтвердить запись не тем кворумом.
-5. **Split/merge:** не атомарны и не реплицированы; запись после prepare
-   может потеряться, ошибка оставляет range frozen.
-6. **Backup:** `Scan` игнорирует locks; PITR нет; RPO 0 не обеспечен.
+3. **Объём:** periodic snapshot/GC/ENOSPC guard есть, но GC сканирует весь
+   range и может быть memory-heavy; 1 ТБ не прогнан.
+4. **Membership:** joint consensus, config snapshot и decommission
+   orchestration есть; decommission не подключён к RPC/CLI, нет 1000 random
+   changes под failover.
+5. **Split/merge:** replicated finish/clear и crash recovery есть; meta↔
+   ranges.json переход не атомарен.
+6. **Backup:** ScanForBackup RPC и barrier API есть; 1PC barrier не подключён
+   к backup, PITR archive не интегрирован; RPO 0 не доказан.
 7. **Безопасность:** gRPC TLS/mTLS реализован, но opt-in/plaintext default;
    SQL HTTP TLS/Bearer и meta admin-token есть opt-in; KV admin RPC,
    RBAC/audit/at-rest — нет.
@@ -93,11 +94,13 @@ backup, split без полного freeze.
 
 ## 6. Надёжность: четыре блокера
 
-1. Membership: config in snapshot + joint consensus + decommission.
-2. Split/merge: реплицированный child snapshot, идемпотентный finish,
-   разморозка при ошибке.
-3. Storage lifecycle: periodic snapshot, MVCC GC, ENOSPC read-only, disk metrics.
-4. Backup: lock-aware Scan/base barrier, PITR, restore drill, RPO/RTO.
+1. Membership: joint config/snapshot/decommission есть; decommission RPC/CLI
+   и 1000 random changes остаются.
+2. Split/merge: replicated finish/clear + crash recovery есть; meta↔range-map
+   atomicity остаётся.
+3. Storage lifecycle: periodic snapshot, MVCC GC, ENOSPC read-only есть.
+4. Backup: ScanForBackup RPC + barrier API есть; PITR integration/restore drill
+   остаются.
 
 ## 7. Итог
 

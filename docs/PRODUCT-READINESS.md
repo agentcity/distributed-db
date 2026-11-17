@@ -117,11 +117,9 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
 ### P0 — блокеры
 
 1. **Membership safety**
-   - нет joint consensus, изменения по одному серверу;
-   - config входит в snapshot, но joint consensus/decommission нет: после
-     смены состава возможен
-     stale voter set;
-   - нет decommission и политики замены узла;
+   - joint consensus и config snapshot есть;
+   - decommission orchestration есть, но не подключён к RPC/CLI;
+   - нет 1000 random changes под failover и политики замены узла;
    - удалённый узел может хранить stale state.
 
 2. **Данные и восстановление**

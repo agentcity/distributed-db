@@ -5,9 +5,10 @@
 
 ## 1. Вердикт
 
-gRPC TLS/mTLS, SQL HTTP TLS/Bearer и admin-token для meta реализованы, но
+gRPC TLS/mTLS, SQL HTTP TLS/Bearer и admin-token для meta/KV реализованы, но
 **все три выключены по умолчанию**. Периметр безопасности ещё не production:
-KVService admin RPC не защищены, нет отдельного admin-listener, RBAC, audit и
+KV admin RPC защищены токеном, но metaserver fan-out его пока не передаёт;
+нет отдельного admin-listener, RBAC, audit и
 encryption at rest. Безопасность допустима только в доверенной сети с
 явно включёнными TLS/token.
 
@@ -27,7 +28,7 @@ encryption at rest. Безопасность допустима только в 
 | ID | Уровень | Находка | Исправление |
 |---|---|---|---|
 | S-01 | High | SQL HTTP TLS/Bearer реализованы, но default open; без флагов — полный доступ | fail-closed профиль, auth обязателен |
-| S-02 | High | Meta admin RPC защищены токеном, но KVService admin RPC — нет; нет отдельного admin-listener/RBAC | отдельный listener, mTLS/token на KV admin, RBAC, audit |
+| S-02 | High | Meta и KV admin RPC защищены токеном, но fan-out без токена; нет отдельного admin-listener/RBAC | передача токена в fan-out, отдельный listener, RBAC, audit |
 | S-03 | High | TLS opt-in, plaintext default; нет требования TLS в production | fail-closed профиль, TLS обязателен |
 | S-04 | High | Нет RBAC/identity на уровне запросов | principal из mTLS, роли/гранты |
 | S-05 | High | Нет audit log | структурный audit, export |
