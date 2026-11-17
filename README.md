@@ -52,7 +52,7 @@ Edge-кэш хешей (Bloom + Merkle, Ed25519, zstd; mobile — scaffold):
 private single-tenant metadata store**, но не для публичного DBaaS, регулируемых
 данных и больших OLAP-нагрузок.
 
-Отдельный трек — **edge hash cache** (`cmd/edgehash`): read-only membership
+Встроенный компонент — **edge hash cache** (`cmd/edgehash`): read-only membership
 (Bloom + Merkle + Ed25519) для дедупликации/blocklists. Это самая готовая
 часть, но mobile SDK — scaffold, а CDN — только headers/layout.
 

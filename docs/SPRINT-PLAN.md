@@ -15,8 +15,8 @@
 
 Остальные пункты годные. Главный приоритет — **не Edge Hash Cache, а
 доказательства безопасности и восстановления**: 72 ч soak, 1 ТБ, PITR,
-decommission, RBAC/audit. Edgehash — отдельный продуктовый трек, его нельзя
-смешивать с production-готовностью БД.
+decommission, RBAC/audit. Edgehash остаётся **встроенным компонентом
+репозитория**; отдельная сборка — только опциональный спайк, не новый продукт.
 
 ## 2. Разбор по пунктам
 
@@ -24,7 +24,7 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 |---|---|---|---|---|
 | 1 | Joint Consensus | Уже есть: C_old,new, joint quorum, auto-finalize, snapshot/epoch. Нет 1000 random changes, e2e через gRPC, decommission RPC/CLI | **Принять частично**: не переписывать, а доказать и закрыть decommission | P0 |
 | 2 | Per-chunk CRC снапшотов | Есть общий CRC32 всего снапшота и incremental CRC потока; проверка — в конце. Per-chunk CRC нет | **Принять**: defense-in-depth, ранний отказ, меньше IO при битом чанке. Не safety-critical: общий CRC уже не даёт установить битый снапшот | P1 |
-| 3 | Edgehash как продукт | Bloom+Merkle+Ed25519, HTTP/cache, TLS/Bearer; mobile — каркас; нет Workers/Nginx/Envoy рецептов | **Принять как отдельный трек**: быстрый adoption, но не заменяет безопасность БД | P1 |
+| 3 | Edgehash как отдельная сборка | Bloom+Merkle+Ed25519, HTTP/cache, TLS/Bearer; mobile — каркас; рецептов Workers/Nginx/Envoy нет | **Не выделять в продукт.** Оставить в репо; опциональный `cmd/edgehash` build — идея на подумать | P2 |
 | 4 | Soak 72 ч / 100 ГБ–1 ТБ / p99 | Есть loopback-бенчи и 1 ТБ harness; реального 1 ТБ и 72 ч прогона нет. 8.6k tx/s — loopback pipeline, не SLO | **Принять, P0**: это главный недостающий evidence | P0 |
 | 5 | mTLS + RBAC + audit | mTLS/TLS есть opt-in; RBAC/audit/at-rest нет; KV admin token есть, но meta fan-out его не передаёт | **Принять с поправкой**: mTLS не «доделать», а сделать fail-closed; RBAC/audit — новое | P0 |
 | 6 | Разделить roadmap на треки и туториалы | Сейчас один ROADMAP; документация уже без исторических цифр | **Принять, P2**: полезно для community, но после safety/evidence | P2 |
@@ -38,7 +38,8 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 - «8.6k tx/s» — это aggregate throughput на loopback с pipeline 256, не latency
   одного запроса и не production SLO.
 - Edgehash «близок к продакшену» — альфа-компонент: API/формат ещё могут
-  меняться, mobile — каркас, рецептов интеграции нет.
+  меняться, mobile — каркас. Но это **не повод** делать отдельный продукт:
+  компонент ценен именно внутри репозитория.
 
 ## 3. Приоритеты
 
@@ -51,17 +52,25 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 4. RBAC/audit/fail-closed TLS, encryption at rest.
 5. Per-chunk CRC и corruption chaos — после P0 evidence, но в том же спринте.
 
-### P1 — продуктовый трек Edgehash
+### P1 — production hardening
 
-1. Заморозить API/формат манифеста/сегментов.
-2. Go SDK + CLI.
-3. Cloudflare Worker, Nginx, Envoy recipes.
-4. Mobile SDK: pinning, Bearer, offline cache.
-5. Бенчмарки: latency, размер, false-positive Bloom.
+1. Per-chunk CRC и corruption chaos.
+2. `kvbackup` TLS + admin-token.
+3. Decommission/meta fan-out token.
+4. PITR integration/restore drill.
+5. RBAC/audit enforcement.
+
+### P2 — Edgehash как встроенный компонент (не продукт)
+
+1. Опциональная сборка `cmd/edgehash` — только convenience, не отдельный репозиторий.
+2. Интеграционные рецепты Workers/Nginx/Envoy — если будет спрос.
+3. Mobile SDK — только после реального запроса.
+4. Бенчмарки компонента.
+5. API/формат не замораживать до внешних пользователей.
 
 ### P2 — community/docs
 
-1. Три трека: KV Cluster, SQL/NewSQL, Edgehash.
+1. Три раздела документации: KV Cluster, SQL/NewSQL, Edgehash (в одном репо).
 2. Quickstart «SQL за 5 минут», «Edgehash за 10 минут».
 3. Contribution guide, RFC template, roadmap по трекам.
 
@@ -77,7 +86,7 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 | 4 | Per-chunk CRC + corruption injection | `internal/raft`, `proto`, `internal/pbconv` | чанк-тесты |
 | 5 | 72 ч soak harness + 1 ТБ multi-host p99 | `test/`, `scripts/` | отчёт (запуск — Sprint 2) |
 | 6 | RBAC/audit MVP: роли, audit log, fail-closed TLS | `internal/metaserver`, `internal/kvserver`, `cmd` | policy + tests |
-| 7 | Edgehash API freeze + Go SDK contract | `internal/edgeset`, `internal/edgehttp` | API v1 draft |
+| 7 | `kvbackup` TLS/admin-token + optional edgehash build spike | `internal/backup`, `cmd/edgehash` | backup TLS + build note |
 | 8 | Docs tracks + quickstart skeleton | `docs/` | 3 трека + 2 гайда |
 
 Критерий выхода: все срезы собираются, race-тесты зелёные; 1 ТБ и 72 ч ещё
@@ -92,8 +101,8 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 | 3 | Restore drill: RPO/RTO, isolated restore, PITR | drill report |
 | 4 | RBAC enforcement + audit export + key rotation | security tests |
 | 5 | Per-chunk CRC chaos: corrupt/loss/latency | fail-closed тесты |
-| 6 | Edgehash Cloudflare Worker recipe | рабочий пример |
-| 7 | Edgehash Nginx/Envoy recipe + cache headers | рабочий пример |
+| 6 | `kvbackup` TLS/admin-token production path | restore через TLS |
+| 7 | Optional edgehash build spike (timeboxed, no product split) | build/README note |
 | 8 | Mobile SDK: pinning/Bearer/offline | alpha SDK |
 
 Критерий выхода: G1/G3/G6 evidence, security gaps P0 закрыты или явно
@@ -103,10 +112,10 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 
 | # | Срез | Выход |
 |---|---|---|
-| 1 | Edgehash standalone release/versioning | v0.1 |
-| 2 | Edgehash benchmarks/limits | отчёт |
+| 1 | Optional edgehash build packaging (not a product) | convenience build |
+| 2 | Edgehash integrated benchmarks/limits | отчёт |
 | 3 | SQL 5-minute quickstart | tutorial |
-| 4 | Edgehash 10-minute quickstart | tutorial |
+| 4 | Edgehash integrated quickstart | tutorial |
 | 5 | Multi-arch image + chart install/upgrade/rollback | release |
 | 6 | Protocol versioning / mixed-version test | compatibility report |
 | 7 | CONTRIBUTING/RFC templates | docs |
@@ -119,7 +128,8 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 - **PITR**: без 1PC barrier wiring restore может пропустить commit; срез 3
   зависит от `internal/mvcc/barrier.go`.
 - **Security**: RBAC/audit нельзя делать после Edgehash; это P0.
-- **Edgehash**: API freeze до SDK/recipes, иначе придётся переписывать примеры.
+- **Edgehash**: не выделять в продукт; отдельная сборка — только после P0 и по запросу.
+- **Edgehash API**: не замораживать до внешних пользователей.
 - **Soak**: 72 ч и 1 ТБ нельзя «ускорить»; нужен отдельный стенд, не CI.
 - **8 агентов**: максимум 8 параллельных срезов; при конфликте файлов дробить
   на 2 волны, а не запускать 16.
@@ -128,5 +138,6 @@ decommission, RBAC/audit. Edgehash — отдельный продуктовый
 
 - Не переписывать joint consensus с нуля.
 - Не позиционировать 8.6k tx/s как production SLO.
-- Не выпускать edgehash SDK до freeze API.
+- Не выделять Edgehash в отдельный продукт/репозиторий.
+- Не выпускать edgehash SDK до реального запроса.
 - Не добавлять SQL-фичи до G1/G3 evidence.

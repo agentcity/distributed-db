@@ -221,9 +221,10 @@ SQL:
 - rolling upgrade/operator, SLO p99 и 1 ТБ soak;
 - AND/OR, >2 JOIN, NULL/DECIMAL/JSON/FK, online DDL, pg_catalog/JDBC.
 
-## Отдельный трек: edge hash cache
+## Встроенный компонент: edge hash cache
 
-Не транзакционная БД, а read-only membership для edge/CDN:
+Встроенный в репозиторий read-only membership для edge/CDN; отдельная
+сборка `cmd/edgehash` — опция, не отдельный продукт:
 
 - immutable сегменты, Bloom, Merkle inclusion/absence, Ed25519, zstd;
 - HTTP TLS/Bearer/rate limit/Range/CDN headers;

@@ -24,7 +24,13 @@ scope: {backend: true, console: false, mobile: false}
 
 ## P1
 
-Edgehash standalone: API freeze, SDK, Cloudflare/Nginx/Envoy, mobile.
+Per-chunk CRC, kvbackup TLS/admin-token, decommission fan-out token,
+PITR integration, RBAC/audit.
+
+## P2
+
+Edgehash остаётся встроенным. Опциональная сборка `cmd/edgehash` —
+идея на подумать, не отдельный продукт. API freeze/SDK — только после спроса.
 
 ## P2
 
