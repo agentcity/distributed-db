@@ -10,8 +10,8 @@
 
 | Критерий | Оценка (1–10) | Текущее состояние |
 |---|---:|---|
-| Скорость, fast | 7 | 12 мс single; pipeline 64–256 на 10 клиентах — 12–19.5k tx/s |
-| Скорость, sync | 4 | pipeline 64–256 — 4–8.6k tx/s; один in-flight — ~200 tx/s |
+| Скорость, fast | 6 | 12 мс single; pipeline 256 — ~19.5k tx/s (1 range); multi-range на одном диске не быстрее |
+| Скорость, sync | 4 | pipeline 256 — ~8.6k tx/s; один in-flight — ~200 tx/s |
 | Потенциал объёма | 3 | комфортно ≤50 ГБ; 50–300 ГБ рискованно; 1 ТБ — нет |
 | Безопасность | 3 | gRPC TLS/mTLS opt-in; нет RBAC/audit/at-rest |
 | Надёжность | 3 | happy path крепкий; 4 production-блокера |
@@ -37,6 +37,8 @@
    SQL HTTP без TLS/auth; admin RPC на data-порту; нет RBAC/audit/at-rest.
 8. **Админ-плоскость:** `kvctl ranges/status/split/merge/backup` есть;
    split/merge safety делегирована metaserver.
+9. **Multi-range:** 4/8 range на одном диске не быстрее одного range;
+   fan-out требует разных узлов/дисков и достаточной нагрузки на range.
 
 ## 3. Скорость
 

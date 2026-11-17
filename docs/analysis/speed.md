@@ -39,6 +39,22 @@ PostgreSQL 13 на том же железе: ~0.68 мс / 1 469 tx/s (1 клие
 Fast платит за Raft-лог; sync добавляет fsync state machine, но один
 Pebble batch/fsync на весь Raft-батч, не на команду.
 
+## 2.1 Multi-range fan-out
+
+3 узла/один диск, 10 клиентов:
+
+| Ranges | Pipeline | Throughput | Latency/batch |
+|---:|---:|---:|---:|
+| 1 | 256 | ~19.5k tx/s | ~13 мс |
+| 4 | 1 | ~185 tx/s | ~5.4 мс |
+| 4 | 64 | ~6.1k tx/s | ~10.4 мс |
+| 4 | 256 | ~12.6k tx/s | ~20.3 мс |
+| 8 | 1 | ~155 tx/s | ~6.5 мс |
+| 8 | 256 | ~4.8k tx/s | ~53.6 мс |
+
+На одном диске fan-out не выигрывает: Raft-fsync на каждый range идёт в тот
+же диск. Нужны разные узлы/диски и достаточная нагрузка на range.
+
 ## 3. Где предел
 
 - **Один in-flight** упирается в latency 12–25 мс: 10 клиентов дают
@@ -51,7 +67,8 @@ Pebble batch/fsync на весь Raft-батч, не на команду.
 
 ## 4. Приоритеты
 
-1. Multi-range benchmark и parallel apply по range’ам.
+1. Multi-range на разных узлах/дисках; parallel apply уже независим по
+   range’ам, но упирается в общий диск.
 2. Pipelined AppendEntries/больше in-flight entry.
 3. Linux/NVMe замер.
 4. Adaptive batch.
