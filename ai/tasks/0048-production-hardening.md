@@ -18,9 +18,21 @@ scope: {backend: true, console: false, mobile: false}
 7. Multi-host SLO/1 ТБ harness.
 8. Helm/operator + runbooks/alerts.
 
-## Критерии
+## Результат
 
-- [ ] Каждый срез собирается и имеет тесты/документацию.
-- [ ] `go build ./...`, `go vet ./...`, gofmt.
-- [ ] `go test -race ./...`.
-- [ ] Нет конфликтов/затирания чужих изменений.
+- [x] Raft config snapshot + proto/gRPC forwarding.
+- [x] Split/merge freeze safety (partial atomicity; gaps listed).
+- [x] Periodic snapshot + MVCC GC + ENOSPC guard.
+- [x] Lock-aware backup (in-process); remote RPC gap.
+- [x] SQL HTTP TLS/Bearer.
+- [x] Meta admin-token.
+- [x] Helm/runbooks/SLO harness.
+- [x] `go build`, `go vet`, gofmt, `go test -race ./...`.
+
+## Осталось (P0)
+
+- joint consensus/decommission;
+- атомарный split/merge finish/clear;
+- remote lock-scan RPC + 1PC apply barrier + PITR;
+- KV admin auth, RBAC/audit/at-rest;
+- 1 ТБ multi-host прогон.

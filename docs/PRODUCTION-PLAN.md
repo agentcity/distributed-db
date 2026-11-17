@@ -55,7 +55,8 @@
 ### B. Membership safety
 
 Сейчас: learner→voter→remove, single-server change, без joint consensus;
-membership не в state-machine snapshot.
+config (voters/learners/epoch) уже входит в state-machine snapshot;
+decommission и joint consensus отсутствуют.
 
 Реализовать:
 
@@ -72,7 +73,8 @@ membership не в state-machine snapshot.
 
 ### C. Backup и PITR
 
-Сейчас: логический backup/restore, без PITR; restore неатомарен.
+Сейчас: логический backup/restore, lock-aware scanner для in-process store;
+remote lock-scan RPC и PITR отсутствуют; restore неатомарен.
 
 Реализовать:
 
@@ -87,9 +89,9 @@ membership не в state-machine snapshot.
 
 ### D. Security
 
-Сейчас: gRPC TLS/mTLS реализован опционально (plaintext default); pgwire —
-TLS/password; SQL HTTP без TLS/auth; нет RBAC/audit/at-rest; edgehash —
-TLS/Bearer.
+Сейчас: gRPC TLS/mTLS, SQL HTTP TLS/Bearer, meta admin-token реализованы
+опционально (default open); pgwire TLS/password; KV admin RPC без auth; нет
+RBAC/audit/at-rest; edgehash TLS/Bearer.
 
 Реализовать:
 
@@ -195,6 +197,10 @@ TLS/Bearer.
 - crash-injection harness: SIGKILL + restart, fast и sync; подтверждённых
   потерь нет, fast восстанавливается replay Raft-лога;
 - ADR 0005 membership safety и ADR 0006 PITR;
+- membership config в Raft snapshot (config epoch, install path);
+- periodic snapshot + MVCC GC + ENOSPC read-only guard;
+- lock-aware backup scanner для in-process store; restore preflight/checksums;
+- SQL HTTP TLS/Bearer; meta admin-token;
 - pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS/mTLS
   для KV/meta/Raft/v2client/CLI (опционально, plaintext default);
 - 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
@@ -203,20 +209,20 @@ TLS/Bearer.
 
 Не закрыто:
 
-- joint consensus и membership snapshot (ADR, не код);
-- PITR (ADR, не код);
-- TLS по умолчанию, admin-listener, RBAC, audit, encryption at rest;
+- joint consensus/decommission (config snapshot уже есть);
+- PITR/continuous archive; remote backup lock-scan RPC;
+- TLS/auth fail-closed, KV admin auth, admin-listener, RBAC, audit, at-rest;
 - libpq-compatible pgwire TLS (сейчас direct TLS, не SSLRequest upgrade);
 - 1 ТБ реальный прогон, real-network soak;
-- multi-range throughput и parallel apply.
+- multi-range на разных узлах/дисках; parallel apply.
 
 ## 7. Ближайшие 2–4 недели
 
-1. Membership config в snapshot + joint consensus.
+1. Joint consensus + decommission (config snapshot готов).
 2. Атомарный реплицированный split/merge.
-3. Periodic snapshot + MVCC GC + ENOSPC guard.
-4. SQL HTTP TLS/auth, admin-listener/RBAC.
-5. Multi-range benchmark + parallel apply.
+3. Remote lock-scan RPC + PITR/continuous archive.
+4. KV admin auth, admin-listener/RBAC, fail-closed TLS.
+5. Multi-host multi-range + parallel apply.
 6. 1 ТБ прогон на Linux/NVMe, real network.
 
 

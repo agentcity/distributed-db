@@ -194,7 +194,8 @@ KV:
   meta/range/TSO, smart client, benchmark harness;
 - 3-node v2: prewrite/commit/get/scan, failover, snapshot catch-up;
 - range split/merge, auto-split/merge, leader transfer/rebalance;
-- learner→voter membership, chunked snapshots, logical backup/restore;
+- learner→voter membership, config snapshot/config epoch, chunked snapshots;
+- periodic snapshot + MVCC GC + ENOSPC guard; lock-aware backup scanner;
 - fast/sync профили; sync по умолчанию;
 - batch/pipeline: fast ~7k tx/s амортизированно, sync pipeline 256 ~8.6k tx/s
   на loopback; один in-flight остаётся latency-bound;
@@ -205,14 +206,14 @@ SQL:
 - parser, каталог, row encoding, indexes, CBO/plan cache;
 - CREATE/DROP TABLE/INDEX, INSERT/SELECT/UPDATE/DELETE;
 - WHERE, GROUP BY, INNER JOIN, ORDER BY/LIMIT;
-- pgwire simple+extended, HTTP `POST /v1/sql`;
+- pgwire simple+extended, HTTP `POST /v1/sql` с TLS/Bearer;
 - SQL после split и на 3 узлах с failover.
 
 Не закрыто:
 
-- joint consensus/decommission, membership в snapshot;
-- PITR/continuous backup, restore drills;
-- TLS по умолчанию, RBAC/audit/encryption at rest;
+- joint consensus/decommission;
+- PITR/continuous backup, remote lock-scan, restore drills;
+- TLS/auth fail-closed, KV admin auth, RBAC/audit/encryption at rest;
 - rolling upgrade/operator, SLO p99 и 1 ТБ soak;
 - AND/OR, >2 JOIN, NULL/DECIMAL/JSON/FK, online DDL, pg_catalog/JDBC.
 

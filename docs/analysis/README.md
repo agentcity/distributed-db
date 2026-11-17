@@ -34,7 +34,8 @@
    может потеряться, ошибка оставляет range frozen.
 6. **Backup:** `Scan` игнорирует locks; PITR нет; RPO 0 не обеспечен.
 7. **Безопасность:** gRPC TLS/mTLS реализован, но opt-in/plaintext default;
-   SQL HTTP без TLS/auth; admin RPC на data-порту; нет RBAC/audit/at-rest.
+   SQL HTTP TLS/Bearer и meta admin-token есть opt-in; KV admin RPC,
+   RBAC/audit/at-rest — нет.
 8. **Админ-плоскость:** `kvctl ranges/status/split/merge/backup` есть;
    split/merge safety делегирована metaserver.
 9. **Multi-range:** 4/8 range на одном диске не быстрее одного range;

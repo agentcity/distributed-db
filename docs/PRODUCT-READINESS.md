@@ -66,7 +66,7 @@ SDK — scaffold, не production.
 | Prometheus-метрики KV/SQL/pgwire, SLO p50/p95/p99 | есть |
 | `/metrics`, `/debug/slo` в sqlsrv/pgsrv | есть |
 | Jepsen kill/restart, partitions, clock skew (client-side) | есть, opt-in |
-| TLS/mTLS, authn/authz, audit | gRPC TLS/mTLS **есть, опционально**; RBAC/audit/at-rest нет; SQL HTTP без TLS/auth; edgehash TLS/Bearer |
+| TLS/mTLS, authn/authz, audit | gRPC TLS/mTLS, SQL HTTP TLS/Bearer, meta admin-token **есть, опционально**; KV admin RPC/RBAC/audit/at-rest нет |
 | Multi-tenancy, quotas, rate limits | **нет** (edgehash — per-IP rate limit) |
 | PITR/continuous backup, restore drills | **нет** |
 | Helm/operator, rolling upgrade/rollback | **нет** |
@@ -118,13 +118,15 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
 
 1. **Membership safety**
    - нет joint consensus, изменения по одному серверу;
-   - membership не входит в state-machine snapshot: после компакции возможен
+   - config входит в snapshot, но joint consensus/decommission нет: после
+     смены состава возможен
      stale voter set;
    - нет decommission и политики замены узла;
    - удалённый узел может хранить stale state.
 
 2. **Данные и восстановление**
-   - backup логический, без PITR/CDC;
+   - backup логический, lock-aware только для in-process store; remote
+     lock-scan RPC и PITR/CDC отсутствуют;
    - restore неатомарен и не изолирован от писателей;
    - нет регулярных restore-учений и заявленных RPO/RTO;
    - нет проверки backup на больших объёмах.
@@ -133,7 +135,8 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
    - gRPC TLS/mTLS есть опционально, plaintext default;
    - нет RBAC/authz на уровне запросов и audit log;
    - нет encryption at rest;
-   - SQL HTTP без TLS/auth; pgwire — TLS/password есть;
+   - SQL HTTP TLS/Bearer есть, default open; meta admin-token есть;
+   - KV admin RPC без отдельной auth; pgwire — TLS/password;
    - нет tenant isolation и квот.
 
 4. **Lifecycle**

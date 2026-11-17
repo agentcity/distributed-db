@@ -5,10 +5,11 @@
 
 ## 1. Вердикт
 
-gRPC TLS/mTLS для KV/meta/Raft реализован и покрыт тестами, но **выключен по
-умолчанию**. Периметр безопасности ещё не production: admin RPC на data-порту,
-SQL HTTP без TLS/auth, нет RBAC/audit/encryption at rest. Безопасность
-допустима только в доверенной сети.
+gRPC TLS/mTLS, SQL HTTP TLS/Bearer и admin-token для meta реализованы, но
+**все три выключены по умолчанию**. Периметр безопасности ещё не production:
+KVService admin RPC не защищены, нет отдельного admin-listener, RBAC, audit и
+encryption at rest. Безопасность допустима только в доверенной сети с
+явно включёнными TLS/token.
 
 ## 2. Покрытие
 
@@ -25,8 +26,8 @@ SQL HTTP без TLS/auth, нет RBAC/audit/encryption at rest. Безопасн
 
 | ID | Уровень | Находка | Исправление |
 |---|---|---|---|
-| S-01 | Critical | SQL HTTP `POST /v1/sql` без TLS/auth — полный доступ к БД | TLS + authn/authz, loopback default |
-| S-02 | Critical | Admin/membership RPC на data-порту без отдельного admin-listener/RBAC | отдельный listener, mTLS, RBAC, audit |
+| S-01 | High | SQL HTTP TLS/Bearer реализованы, но default open; без флагов — полный доступ | fail-closed профиль, auth обязателен |
+| S-02 | High | Meta admin RPC защищены токеном, но KVService admin RPC — нет; нет отдельного admin-listener/RBAC | отдельный listener, mTLS/token на KV admin, RBAC, audit |
 | S-03 | High | TLS opt-in, plaintext default; нет требования TLS в production | fail-closed профиль, TLS обязателен |
 | S-04 | High | Нет RBAC/identity на уровне запросов | principal из mTLS, роли/гранты |
 | S-05 | High | Нет audit log | структурный audit, export |
@@ -43,15 +44,17 @@ SQL HTTP без TLS/auth, нет RBAC/audit/encryption at rest. Безопасн
 ## 4. Что закрыто
 
 - gRPC TLS 1.3/mTLS для KV/meta/Raft, v2client, CLI (`kv2/sqlsrv/pgsrv/kvctl`).
+- SQL HTTP TLS + Bearer (`sqlsrv -tls-cert/-tls-key/-auth-token`).
+- Admin-token на meta `SetRanges/SplitRange/MergeRanges`; kvctl/kv2 флаги.
 - mTLS 3-node Raft, отказ plaintext/certless клиентов.
 - pgwire TLS + password (cleartext внутри TLS), auth без TLS запрещён.
 - edgehash TLS/Bearer/rate limit, Ed25519-манифесты.
 
 ## 5. Приоритет
 
-1. SQL HTTP TLS/auth.
-2. Admin-listener + RBAC + audit.
-3. TLS fail-closed для production.
+1. Fail-closed профиль: TLS/auth обязательны в production.
+2. Admin-listener + токен/mTLS на KV admin RPC + RBAC + audit.
+3. SQL HTTP default-open убрать.
 4. Encryption at rest/backups.
 5. pgwire SCRAM/роли.
 6. kvbackup TLS, edgehash key rotation, mobile pinning, SCA.
