@@ -1,7 +1,7 @@
 # Продуктовая оценка и путь к production
 
-- Дата: 2026-11-17
-- Состояние кода: 2026-11-17
+- Дата: 2026-11-18
+- Состояние кода: 2026-11-18
 - Область: v1 (`cmd/db`), v2 (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`,
   `cmd/kvbackup`, `cmd/metricsrv`), edge hash cache (`cmd/edgehash`) и
   mobile scaffold.
@@ -36,14 +36,14 @@ SDK — scaffold, не production.
 | Cross-range 2PC | есть, MVP | primary-first, recovery, без wait-for графа |
 | Range split/merge | есть | streaming copy, auto-split/auto-merge |
 | Replicated meta/TSO | есть | Raft 3/5, TSO batch на клиенте |
-| Dynamic membership | есть, MVP | learner→voter→remove; **без joint consensus** |
+| Dynamic membership | есть | joint consensus, pre-vote, decommission CLI |
 | Leader transfer/rebalance | есть | TransferLeader/TimeoutNow |
 | Snapshots | есть | chunked, gzip, resume по offset |
-| Backup/restore | есть, логический | `cmd/kvbackup`, без PITR |
+| Backup/restore | есть | logical + ScanForBackup + barrier; PITR adapters, runtime не собран |
 | Read barrier / lease reads | есть | линеаризуемые чтения с лидера |
 | Follower reads | нет | |
 | Batch entry / `CommitBatch` | есть | несколько txn в одном Raft-entry; не atomic batch |
-| TLS/mTLS, auth, audit (v2) | **нет** | pgwire без TLS/паролей |
+| TLS/mTLS, auth, audit (v2) | есть opt-in | gRPC TLS/mTLS, RBAC/audit, admin token; fail-closed/at-rest нет |
 
 ### SQL/API
 
@@ -68,7 +68,7 @@ SDK — scaffold, не production.
 | Jepsen kill/restart, partitions, clock skew (client-side) | есть, opt-in |
 | TLS/mTLS, authn/authz, audit | gRPC TLS/mTLS, SQL HTTP TLS/Bearer, meta admin-token **есть, опционально**; KV admin RPC/RBAC/audit/at-rest нет |
 | Multi-tenancy, quotas, rate limits | **нет** (edgehash — per-IP rate limit) |
-| PITR/continuous backup, restore drills | **нет** |
+| PITR/continuous backup, restore drills | **частично** | archive adapters + in-process drill; runtime WAL/meta/TSO нет |
 | Helm/operator, rolling upgrade/rollback | **нет** |
 | Encryption at rest, secrets management | **нет** |
 | Multi-AZ/geo placement policy | **нет** (ручной placement) |
@@ -130,8 +130,8 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
    - нет проверки backup на больших объёмах.
 
 3. **Безопасность**
-   - gRPC TLS/mTLS есть опционально, plaintext default;
-   - нет RBAC/authz на уровне запросов и audit log;
+   - gRPC TLS/mTLS и RBAC/audit есть опционально, plaintext default;
+   - data-plane identity/grants и at-rest нет;
    - нет encryption at rest;
    - SQL HTTP TLS/Bearer есть, default open; meta/KV admin token + RBAC;
    - audit MVP; pgwire — TLS/password;
@@ -241,10 +241,10 @@ Multi-tenancy, billing, quotas, compliance, geo, support, SLA-контракты
 
 | Риск | Последствие |
 |---|---|
-| Нет joint consensus | смена состава при сбое может нарушить кворум |
+| Pre-vote/multi-host не проверены | stale term и смена состава под сбоем |
 | Membership не в snapshot | stale voter set после компакции |
 | Cross-range 2PC без wait-for графа | долгие блокировки/таймауты вместо диагностируемого deadlock |
-| Backup без PITR | потеря данных между бэкапами |
+| PITR runtime отсутствует | потеря данных между бэкапами |
 | Нет TLS/auth | любой доступ к сети = доступ к данным |
 | Нет upgrade-пути | обновление = простой/ручной риск |
 | SQL full scan/CBO без гистограмм | плохие планы на больших таблицах |

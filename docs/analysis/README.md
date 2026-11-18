@@ -1,6 +1,6 @@
 # Аудит проекта по критериям
 
-- Дата: 2026-11-17
+- Дата: 2026-11-18
 - Метод: чтение кода + существующие тесты/бенчмарки; без 1 ТБ, без реальной
   сети, без пентеста.
 - Детали: [speed.md](speed.md), [data-volume.md](data-volume.md),
@@ -13,9 +13,9 @@
 | Скорость, fast | 6 | macOS 12 мс; Linux-контейнер ~6.8 мс; pipeline 256 — ~19.5k tx/s (1 range) |
 | Скорость, sync | 4 | pipeline 256 — ~8.6k tx/s; один in-flight — ~200 tx/s |
 | Потенциал объёма | 3 | комфортно ≤50 ГБ; 50–300 ГБ рискованно; 1 ТБ — нет |
-| Безопасность | 3 | gRPC TLS/mTLS opt-in; нет RBAC/audit/at-rest |
-| Надёжность | 4 | joint consensus/split recovery/backup barrier есть; остались wiring и PITR |
-| **Production readiness** | **3** | **pre-alpha / trusted-network prototype** |
+| Безопасность | 5 | TLS/mTLS, RBAC/audit, admin token; нет fail-closed/at-rest/data-plane identity |
+| Надёжность | 5 | joint/pre-vote, split recovery, backup barrier, restore drill; PITR runtime/meta 2PC остаются |
+| **Production readiness** | **4** | **pre-alpha / trusted-network prototype** |
 
 Оценки — суждение на основе кода и измерений, не SLA.
 
@@ -33,9 +33,8 @@
    ranges.json переход не атомарен.
 6. **Backup:** ScanForBackup RPC и barrier API есть; 1PC barrier не подключён
    к backup, PITR archive не интегрирован; RPO 0 не доказан.
-7. **Безопасность:** gRPC TLS/mTLS реализован, но opt-in/plaintext default;
-   SQL HTTP TLS/Bearer и meta admin-token есть opt-in; KV admin RPC,
-   RBAC/audit/at-rest — нет.
+7. **Безопасность:** TLS/mTLS, SQL TLS/Bearer, RBAC/audit, admin token есть
+   opt-in; fail-closed, at-rest и data-plane identity — нет.
 8. **Админ-плоскость:** `kvctl ranges/status/split/merge/backup` есть;
    split/merge safety делегирована metaserver.
 9. **Multi-range:** 4/8 range на одном диске не быстрее одного range;

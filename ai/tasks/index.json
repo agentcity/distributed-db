@@ -322,5 +322,11 @@
     "title": "Sprint 2 — code-only hardening",
     "status": "done",
     "file": "0054-code-only-sprint.md"
+  },
+  {
+    "id": "0055",
+    "title": "Актуализация оценки проекта",
+    "status": "done",
+    "file": "0055-assessment-refresh.md"
   }
 ]

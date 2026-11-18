@@ -1,7 +1,7 @@
 # Честная оценка проекта
 
-- Дата: 2026-11-17
-- Состояние: 2026-11-17
+- Дата: 2026-11-18
+- Состояние: 2026-11-18
 - Область: v1 (`cmd/db`), v2 KV/SQL (`cmd/kv2`, `cmd/sqlsrv`, `cmd/pgsrv`),
   edge hash cache (`cmd/edgehash`, `internal/edgeset`, `edgehttp`, `edgecache`),
   mobile scaffold (`mobile/`).
@@ -37,11 +37,10 @@ DBaaS и не замена PostgreSQL.
 - Cross-range 2PC primary-first, параллельный commit secondary.
 - Range split/merge, streaming copy, auto-split/auto-merge.
 - Replicated meta/TSO (Raft 3/5), client range cache, TSO batching.
-- Membership: learner → voter → remove; **single-server change, без joint
-  consensus**.
+- Membership: joint consensus, pre-vote, learner → voter → decommission CLI.
 - Leader transfer/rebalance; chunked/gzip/resumable snapshots.
 - Read barrier/lease reads с лидера; follower reads нет.
-- Logical backup/restore (`cmd/kvbackup`), без PITR.
+- Logical backup/restore, ScanForBackup, barrier, PITR archive adapters; runtime PITR нет.
 - Batch-entry: несколько `CommitSingle` в одном Raft-entry; клиентский
   `CommitBatch` (pipelining, не atomic batch).
 
@@ -97,11 +96,9 @@ DBaaS и не замена PostgreSQL.
    replay Raft-лога; нужен crash-тест/soak.
 4. Restore drills и RPO/RTO; PITR archive MVP не интегрирован; ScanForBackup
    RPC реализован.
-5. Безопасность v2: gRPC TLS/mTLS **есть опционально** (KV/meta/Raft,
-   v2client, CLI), но по умолчанию plaintext; нет RBAC/audit/encryption at
-   rest; SQL HTTP TLS/Bearer и meta admin-token **есть опционально**;
-   KV admin RPC защищены admin-token; metaserver fan-out токен не передаёт;
-   pgwire — один статический пользователь;
+5. Безопасность v2: gRPC TLS/mTLS, SQL HTTP TLS/Bearer, RBAC/audit и
+   admin-token **есть опционально**; по умолчанию plaintext; нет at-rest и
+   data-plane identity; pgwire — один статический пользователь;
    v1 HTTP имеет Basic Auth/TLS, edgehash — TLS/Bearer.
 6. Membership safety: joint consensus, config snapshot, decommission CLI и
    orchestration есть; 1000-change stress в CI; нет pre-vote.
@@ -163,10 +160,10 @@ DBaaS и не замена PostgreSQL.
 
 | Риск | Последствие |
 |---|---|
-| Нет joint consensus | смена состава при сбое может нарушить кворум |
+| Pre-vote/multi-host не проверены | stale term и смена состава под сбоем |
 | Membership не в snapshot | stale voter set после компакции |
 | `SyncWrites=false` без crash-soak | потеря/несогласованность state machine после сбоя |
-| Нет PITR | потеря данных между бэкапами |
+| PITR runtime отсутствует | потеря данных между бэкапами |
 | Нет TLS/auth в v2 | доступ к сети = доступ к данным |
 | Cross-range 2PC без wait-for графа | долгие блокировки вместо диагностируемого deadlock |
 | SQL planner без гистограмм | плохие планы на больших таблицах |
