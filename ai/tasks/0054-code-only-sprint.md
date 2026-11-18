@@ -18,8 +18,21 @@ scope: {backend: true, console: false, mobile: false}
 7. Restore drill automation.
 8. Registry/Helm release automation.
 
-## Критерии
+## Результат
 
-- [ ] 8 срезов собираются, race-тесты.
-- [ ] Нет 72 ч/1 ТБ/registry/K8s заявок.
-- [ ] Full `go test -race ./...`.
+- [x] Pre-vote core + gRPC transport.
+- [x] PITR WAL/checkpoint adapters + restore drill.
+- [x] RBAC CLI + audit rotation/fail-closed.
+- [x] Truthful range leader/health.
+- [x] Durable split/merge intent.
+- [x] Protocol handshake + release workflow/schema.
+- [x] Full `go test -race ./...`, stress 1x.
+
+## Gaps
+
+- Pre-vote не проверен multi-host; gRPC adapters wired but no mixed-version cluster.
+- PITR не tail-ит WAL и не имеет meta TSO RPC; drill in-process.
+- Split intent не закрывает meta↔ranges.json distributed 2PC.
+- Release workflow не запускался; registry/K8s не проверялись.
+- Audit rotation без external hook; fan-out role tokens inbound-only.
+- 72 ч/1 ТБ не запускались.

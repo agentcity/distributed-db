@@ -21,11 +21,11 @@ decommission, RBAC/audit. Edgehash остаётся **встроенным ко�
 
 | # | Предложение | Факт | Вердикт | Приоритет |
 |---|---|---|---|---|
-| 1 | Joint Consensus | C_old,new, joint quorum, snapshot/epoch, decommission CLI, 1000-change stress (3× race) и CI job | **Закрыто по stress**; остались pre-vote и multi-host | P0 |
+| 1 | Joint Consensus | C_old,new, joint quorum, snapshot/epoch, decommission CLI, pre-vote, 1000-change stress и CI | **Закрыто по коду/stress**; остались multi-host и decommission stress | P0 |
 | 2 | Per-chunk CRC снапшотов | Есть общий CRC32 всего снапшота и incremental CRC потока; проверка — в конце. Per-chunk CRC нет | **Принять**: defense-in-depth, ранний отказ, меньше IO при битом чанке. Не safety-critical: общий CRC уже не даёт установить битый снапшот | P1 |
 | 3 | Edgehash как отдельная сборка | Bloom+Merkle+Ed25519, HTTP/cache, TLS/Bearer; mobile — каркас; рецептов Workers/Nginx/Envoy нет | **Не выделять в продукт.** Оставить в репо; опциональный `cmd/edgehash` build — идея на подумать | P2 |
 | 4 | Soak 72 ч / 100 ГБ–1 ТБ / p99 | Harness готов (`test/soak_test.go`), реального 1 ТБ и 72 ч прогона нет. 8.6k tx/s — loopback pipeline, не SLO | **Принять, P0**: главный недостающий evidence | P0 |
-| 5 | mTLS + RBAC + audit | TLS/mTLS, RBAC/audit MVP, admin token и meta fan-out есть; нет fail-closed, CLI wiring, rotation, at-rest | **Принять с поправкой**: включить и ужесточить, не писать заново | P0 |
+| 5 | mTLS + RBAC + audit | TLS/mTLS, RBAC/audit, CLI flags, rotation, fail-closed audit, admin token/fan-out есть; нет at-rest/RBAC на data-plane | **Закрыто по admin-плоскости**; остались at-rest и data-plane identity | P0 |
 | 6 | Разделить roadmap на треки и туториалы | Сейчас один ROADMAP; документация уже без исторических цифр | **Принять, P2**: полезно для community, но после safety/evidence | P2 |
 
 ### 2.1 Что в предложении неверно
@@ -82,6 +82,9 @@ decommission, RBAC/audit. Edgehash остаётся **встроенным ко�
 - **Docker-спринт — закрыт:** multi-arch image, demo/cluster compose,
   bootstrap, quickstart.
 - **Joint convergence — исправлен:** 1000 changes 3× race, CI job.
+- **Sprint 2 code-only — закрыт:** pre-vote (core + gRPC), PITR adapters,
+  RBAC CLI/audit rotation, leader/health, durable split intent,
+  protocol handshake, restore drill, release workflow.
 
 ### Sprint 1 — Evidence & closure (закрыт, 4 недели)
 

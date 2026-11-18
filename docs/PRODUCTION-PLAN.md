@@ -57,7 +57,7 @@
 Сейчас: joint consensus C_old,new, config snapshot/epoch, decommission
 orchestration + `kvctl decommission` и meta fan-out token реализованы.
 1000-change stress стабилен (3× race), включён отдельным CI job;
-multi-host проверки и pre-vote нет.
+pre-vote есть; multi-host проверки нет.
 
 Реализовать:
 
@@ -201,11 +201,11 @@ TLS/Bearer.
 - crash-injection harness: SIGKILL + restart, fast и sync; подтверждённых
   потерь нет, fast восстанавливается replay Raft-лога;
 - ADR 0005 membership safety и ADR 0006 PITR;
-- joint consensus, membership config в snapshot, decommission orchestration;
+- joint consensus, pre-vote (core + gRPC), config snapshot, decommission CLI;
 - periodic snapshot + MVCC GC + ENOSPC read-only guard;
-- lock-aware ScanForBackup RPC, strict RemoteScanner, PITR archive MVP;
+- ScanForBackup RPC, PITR WAL/checkpoint adapters, restore drill;
 - MVCC commit-lease/apply barrier;
-- SQL HTTP TLS/Bearer; meta и KV admin-token;
+- SQL HTTP TLS/Bearer; meta/KV admin-token; RBAC CLI; audit rotation/fail-closed;
 - pgwire TLS + cleartext-password-over-TLS (без SCRAM); gRPC TLS/mTLS
   для KV/meta/Raft/v2client/CLI (опционально, plaintext default);
 - 1 ТБ benchmark harness + p99 (smoke 0.05 GiB);
@@ -226,7 +226,7 @@ TLS/Bearer.
 
 ## 7. Ближайшие 2–4 недели
 
-1. Pre-vote и multi-host joint stress; decommission под failover.
+1. Multi-host joint stress и decommission под failover.
 2. Meta↔range-map atomic split/merge (distributed 2PC).
 3. PITR WAL/meta/TSO integration + restore drill.
 4. Fail-closed TLS, admin-listener, audit rotation/at-rest.

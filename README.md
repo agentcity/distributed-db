@@ -85,9 +85,8 @@ split/merge, replicated meta/TSO, learner→voter membership, leader transfer,
 chunked/resumable snapshots, backup/restore, SQL после split, extended pgwire,
 SLO-метрики и Jepsen partitions.
 
-Что блокирует production: PITR integration и
-restore-учения, fail-closed TLS/audit, rolling upgrade, SLO p99/1 ТБ,
-multi-AZ placement.
+Что блокирует production: PITR runtime и restore-drill на кластере,
+fail-closed TLS/at-rest, rolling upgrade, SLO p99/1 ТБ, multi-AZ placement.
 Полный разбор: [docs/PRODUCT-READINESS.md](docs/PRODUCT-READINESS.md).
 
 ## Куда развивается проект (v2)
@@ -180,8 +179,8 @@ JEPSEN=1 go test -race ./test -run TestJepsenKillRestart -v
   то есть aggregate throughput сопоставим с PostgreSQL, но batch latency
   16–30 мс. Это не SLO: loopback, маленькие данные, без p99 и 1 ТБ soak.
 
-Пока нет: PITR integration, durable scheduler
-queue/leader lease, fail-closed production TLS/audit, SLO p99/1 ТБ прогон,
+Пока нет: PITR runtime, durable scheduler
+queue/leader lease, fail-closed TLS/at-rest, SLO p99/1 ТБ прогон,
 расширенный SQL planner (AND/OR, >2 JOIN, parallel).
 
 ### SQL P0 поверх KV (experimental)
