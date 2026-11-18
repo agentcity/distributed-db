@@ -127,6 +127,27 @@ type RequestVoteResponse struct {
 	VoteGranted bool
 }
 
+// PreVoteRequest is sent by a candidate before it starts a real election. Term
+// is the term the candidate would use for that election (its current term + 1),
+// not a term it has already adopted: a receiver must never persist it or update
+// its own term because of this request. A pre-vote grant is advisory and only
+// lets the candidate campaign once it has collected a quorum.
+type PreVoteRequest struct {
+	Term         uint64
+	CandidateID  string
+	LastLogIndex uint64
+	LastLogTerm  uint64
+}
+
+// PreVoteResponse is the reply to a PreVoteRequest. Term is the receiver's
+// current term, which lets a candidate that fell behind learn the newer term
+// without granting anything. VoteGranted reports only that the receiver would
+// vote for the candidate in Term.
+type PreVoteResponse struct {
+	Term        uint64
+	VoteGranted bool
+}
+
 // AppendEntriesRequest is sent by the leader to replicate entries and as a
 // heartbeat.
 type AppendEntriesRequest struct {
@@ -151,6 +172,15 @@ type AppendEntriesResponse struct {
 type Transport interface {
 	RequestVote(ctx context.Context, peer string, req *RequestVoteRequest) (*RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, peer string, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
+}
+
+// PreVoteTransport is the optional Transport capability used by Node to run a
+// pre-vote round before incrementing its term. A transport that does not
+// implement it keeps the legacy election path: the node starts a real election
+// after its election timeout, exactly as before. Implementations only need to
+// deliver the RPC; Node.HandlePreVote supplies the receiver-side rules.
+type PreVoteTransport interface {
+	PreVote(ctx context.Context, peer string, req *PreVoteRequest) (*PreVoteResponse, error)
 }
 
 // TimeoutNowRequest asks a follower to start an election immediately. It is

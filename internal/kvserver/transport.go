@@ -101,6 +101,22 @@ func (t *peerTransport) RequestVote(ctx context.Context, peer string, req *raft.
 	return &raft.RequestVoteResponse{Term: resp.GetTerm(), VoteGranted: resp.GetVoteGranted()}, nil
 }
 
+func (t *peerTransport) PreVote(ctx context.Context, peer string, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	c, err := t.client(peer)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.PreVote(ctx, &pbv2.PreVoteRequest{
+		Term: req.Term, CandidateId: req.CandidateID,
+		LastLogIndex: req.LastLogIndex, LastLogTerm: req.LastLogTerm,
+		RangeId: t.rangeID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raft.PreVoteResponse{Term: resp.GetTerm(), VoteGranted: resp.GetVoteGranted()}, nil
+}
+
 func (t *peerTransport) AppendEntries(ctx context.Context, peer string, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
 	c, err := t.client(peer)
 	if err != nil {

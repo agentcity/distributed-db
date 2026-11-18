@@ -5,6 +5,16 @@
 // -tls-cert and -tls-key together with -auth-token. -auth-token without a TLS
 // listener is rejected at startup so a Bearer token can never cross the
 // network in cleartext.
+//
+// # SQL auth is not cluster admin auth
+//
+// -auth-token (or SQLSRV_AUTH_TOKEN) authenticates SQL HTTP clients only. It is
+// deliberately not accepted as a cluster admin credential and is never forwarded
+// to kv2/metaserver admin RPCs: sqlsrv serves no admin RPC, and reusing the SQL
+// bearer token for control-plane RBAC would couple a data-plane credential to
+// topology permissions. Admin RBAC (roles, mTLS CN mapping, audit log) is
+// configured on the servers with kv2's -admin-token-roles, -admin-mtls-roles and
+// -audit-log flags.
 package main
 
 import (
@@ -26,42 +36,103 @@ import (
 	"distributed-db/internal/v2client"
 )
 
+// authTokenEnv supplies the SQL bearer token when -auth-token is not set on the
+// command line. It is read after flag parsing, so the value never appears in
+// -help output or a flag parse error. It is a SQL transport credential and is
+// never used as a cluster admin credential.
+const authTokenEnv = "SQLSRV_AUTH_TOKEN"
+
+// options holds the sqlsrv command-line flags. It is a separate type so tests
+// can assert flag/env precedence and that no cluster admin flags are exposed
+// without starting a listener.
+type options struct {
+	httpAddr      string
+	metaAddr      string
+	nodes         string
+	tlsCA         string
+	tlsCert       string
+	tlsKey        string
+	tlsServerName string
+	authToken     string
+	logLevel      string
+}
+
+// registerFlags registers the sqlsrv flags on fs. There are intentionally no
+// -admin-token/-admin-mtls-roles/-audit-log flags here: sqlsrv has no admin
+// surface. See the package comment.
+func registerFlags(fs *flag.FlagSet) *options {
+	o := &options{}
+	fs.StringVar(&o.httpAddr, "http-addr", ":8080", "SQL HTTP listen address (also serves /metrics, /debug/slo, and /healthz)")
+	fs.StringVar(&o.metaAddr, "meta", "127.0.0.1:9090", "meta/TSO gRPC address")
+	fs.StringVar(&o.nodes, "nodes", "", "comma-separated KV node gRPC addresses")
+	fs.StringVar(&o.tlsCA, "tls-ca", "", "PEM CA bundle used to verify the meta/KV servers (default: system roots); setting it or -tls-server-name enables cluster TLS")
+	fs.StringVar(&o.tlsCert, "tls-cert", "", "PEM TLS certificate for the SQL HTTP listener (requires -tls-key); also presented to meta/KV when -tls-ca or -tls-server-name enables cluster TLS")
+	fs.StringVar(&o.tlsKey, "tls-key", "", "PEM private key for -tls-cert (requires -tls-cert)")
+	fs.StringVar(&o.tlsServerName, "tls-server-name", "", "expected server name for meta/KV certificate verification; setting it or -tls-ca enables cluster TLS")
+	fs.StringVar(&o.authToken, "auth-token", "",
+		"Bearer token required for /v1/sql, /metrics, and /debug/slo (requires -tls-cert/-tls-key; "+
+			"env "+authTokenEnv+"); /health and /healthz stay public. This is SQL auth only, not a cluster admin credential")
+	fs.StringVar(&o.logLevel, "log-level", "info", "debug, info, warn, error")
+	return o
+}
+
+// resolveEnv applies the SQLSRV_AUTH_TOKEN fallback unless -auth-token was set
+// explicitly. An explicit empty flag therefore disables SQL auth even when the
+// environment is set.
+func (o *options) resolveEnv(fs *flag.FlagSet) {
+	if flagWasSet(fs, "auth-token") {
+		return
+	}
+	if v := strings.TrimSpace(os.Getenv(authTokenEnv)); v != "" {
+		o.authToken = v
+	}
+}
+
+// httpConfig assembles the validated SQL HTTP configuration.
+func (o *options) httpConfig() sqlhttp.Config {
+	return sqlhttp.Config{
+		TLSCertFile: o.tlsCert,
+		TLSKeyFile:  o.tlsKey,
+		AuthToken:   o.authToken,
+	}
+}
+
+// flagWasSet reports whether name appeared on the command line.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func main() {
-	httpAddr := flag.String("http-addr", ":8080", "SQL HTTP listen address (also serves /metrics, /debug/slo, and /healthz)")
-	metaAddr := flag.String("meta", "127.0.0.1:9090", "meta/TSO gRPC address")
-	nodes := flag.String("nodes", "", "comma-separated KV node gRPC addresses")
-	tlsCA := flag.String("tls-ca", "", "PEM CA bundle used to verify the meta/KV servers (default: system roots); setting it or -tls-server-name enables cluster TLS")
-	tlsCert := flag.String("tls-cert", "", "PEM TLS certificate for the SQL HTTP listener (requires -tls-key); also presented to meta/KV when -tls-ca or -tls-server-name enables cluster TLS")
-	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert (requires -tls-cert)")
-	tlsServerName := flag.String("tls-server-name", "", "expected server name for meta/KV certificate verification; setting it or -tls-ca enables cluster TLS")
-	authToken := flag.String("auth-token", "", "Bearer token required for /v1/sql, /metrics, and /debug/slo (requires -tls-cert/-tls-key; /health and /healthz stay public)")
-	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
+	opts := registerFlags(flag.CommandLine)
 	flag.Parse()
+	opts.resolveEnv(flag.CommandLine)
 
 	// Validate the security flags before touching the cluster so an unsafe
 	// combination (for example auth without TLS) fails immediately.
-	httpCfg := sqlhttp.Config{
-		TLSCertFile: *tlsCert,
-		TLSKeyFile:  *tlsKey,
-		AuthToken:   *authToken,
-	}
+	httpCfg := opts.httpConfig()
 	if err := httpCfg.Validate(); err != nil {
 		fatal(err)
 	}
-	if *nodes == "" {
+	if opts.nodes == "" {
 		fmt.Fprintln(os.Stderr, "fatal: -nodes is required (comma-separated KV addresses)")
 		os.Exit(2)
 	}
-	log := newLogger(*logLevel)
+	log := newLogger(opts.logLevel)
 	// Cluster TLS is opt-in through -tls-ca or -tls-server-name so that
 	// enabling TLS on the SQL HTTP listener alone keeps dialing an existing
 	// plaintext cluster. Once enabled, the listener certificate is also
 	// presented for mTLS when it is configured.
-	clientTLS, err := clusterTLSOptions(*tlsCA, *tlsServerName, *tlsCert, *tlsKey)
+	clientTLS, err := clusterTLSOptions(opts.tlsCA, opts.tlsServerName, opts.tlsCert, opts.tlsKey)
 	if err != nil {
 		fatal(err)
 	}
-	client, err := v2client.NewWithTLS(*metaAddr, splitList(*nodes), clientTLS)
+	client, err := v2client.NewWithTLS(opts.metaAddr, splitList(opts.nodes), clientTLS)
 	if err != nil {
 		fatal(err)
 	}
@@ -74,7 +145,7 @@ func main() {
 	httpCfg.Engine = engine
 	httpCfg.Metrics = reg
 	httpCfg.SLO = sqlMetrics.SLO
-	srv, err := newHTTPServer(*httpAddr, httpCfg)
+	srv, err := newHTTPServer(opts.httpAddr, httpCfg)
 	if err != nil {
 		fatal(err)
 	}
@@ -97,15 +168,16 @@ func main() {
 		log.Warn("SQL HTTP authentication is disabled; use -auth-token in production")
 	}
 	log.Info("sqlsrv started",
-		"http", *httpAddr,
+		"http", opts.httpAddr,
 		"tls", tlsEnabled,
 		"auth", authEnabled,
 		"metrics", "/metrics",
 		"slo", "/debug/slo",
 		"health", "/healthz",
-		"meta", *metaAddr,
-		"nodes", *nodes,
-		"cluster_tls", clientTLS != nil)
+		"meta", opts.metaAddr,
+		"nodes", opts.nodes,
+		"cluster_tls", clientTLS != nil,
+		"cluster_admin", false)
 
 	var serveErr error
 	if tlsEnabled {

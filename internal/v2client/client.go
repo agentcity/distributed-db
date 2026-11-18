@@ -5,6 +5,12 @@
 // API. TSO comes from the meta service and is fetched in batches. Range
 // descriptors are cached briefly so a retry storm does not turn into a meta
 // RPC storm; both caches are invalidated when the meta leader moves.
+//
+// Every meta and KV connection also carries a wire-additive protocol version
+// handshake: the client advertises its semantic version and feature bits on
+// each RPC, records the server version from the response headers and exposes
+// the result through ProtocolInfo, NegotiatedVersion and ProtocolSummary. A
+// server without handshake support is treated as the legacy protocol version.
 package v2client
 
 import (
@@ -24,6 +30,7 @@ import (
 
 	"distributed-db/internal/grpctls"
 	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/version"
 )
 
 var (
@@ -226,6 +233,13 @@ type Client struct {
 	// custom timeouts, test interceptors and advanced transport settings;
 	// transport security itself is set by Options.TLS or NewWithTLS.
 	dialOpts []grpc.DialOption
+	// protocol records the negotiated protocol version of every meta and KV
+	// peer. It is populated by the handshake interceptors in protocolOpts.
+	protocol *version.Registry
+	// protocolOpts attach the version handshake to every dial. They are kept
+	// separate from dialOpts so public Options.DialOptions stays exactly what
+	// the caller supplied.
+	protocolOpts []grpc.DialOption
 
 	// Meta service connection pool and leader discovery. Connections are
 	// pooled by address so repeated failover does not create a new gRPC
@@ -377,6 +391,16 @@ func newClient(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions
 		transportCreds = creds
 	}
 	metaOpts := []grpc.DialOption{grpc.WithTransportCredentials(transportCreds)}
+	// The handshake interceptors are added to every meta and KV connection.
+	// They only add version metadata; transport security and any caller
+	// dial options are untouched.
+	protocol := version.NewRegistry()
+	handshake := version.NewClientHandshake(protocol)
+	protocolOpts := []grpc.DialOption{
+		grpc.WithChainUnaryInterceptor(handshake.Unary()),
+		grpc.WithChainStreamInterceptor(handshake.Stream()),
+	}
+	metaOpts = append(metaOpts, protocolOpts...)
 	cc, err := grpc.NewClient(metaAddr, metaOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("v2client: dial meta: %w", err)
@@ -394,6 +418,8 @@ func newClient(metaAddr string, addrs []string, clientTLS *grpctls.ClientOptions
 		addrs:           append([]string(nil), addrs...),
 		transportCreds:  transportCreds,
 		dialOpts:        append([]grpc.DialOption(nil), opts...),
+		protocol:        protocol,
+		protocolOpts:    protocolOpts,
 		clients:         make(map[string]pbv2.KVServiceClient),
 		conns:           make(map[string]*grpc.ClientConn),
 		leaders:         make(map[uint64]leaderEntry),
@@ -461,9 +487,10 @@ func (c *Client) node(addr string) (pbv2.KVServiceClient, error) {
 		// public constructors always set the configured transport security.
 		creds = insecure.NewCredentials()
 	}
-	opts := make([]grpc.DialOption, 0, len(c.dialOpts)+1)
+	opts := make([]grpc.DialOption, 0, len(c.dialOpts)+len(c.protocolOpts)+1)
 	opts = append(opts, grpc.WithTransportCredentials(creds))
 	opts = append(opts, c.dialOpts...)
+	opts = append(opts, c.protocolOpts...)
 	cc, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, err

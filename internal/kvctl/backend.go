@@ -128,20 +128,28 @@ func (b *v2Backend) Ping(ctx context.Context) error {
 
 func (b *v2Backend) Close() error { return b.client.Close() }
 
+// ListRanges reads the range map and enriches it with best-effort liveness
+// health. The probe is read-only (KVService.Status) and does not need the admin
+// token; unreachable replicas leave LiveVoters empty and never fail the list.
 func (b *v2Backend) ListRanges(ctx context.Context) ([]RangeInfo, error) {
-	infos, err := b.client.ListRanges(ctx)
+	infos, err := b.client.ListRangesWithHealth(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]RangeInfo, 0, len(infos))
 	for _, info := range infos {
 		out = append(out, RangeInfo{
-			ID:       info.ID,
-			Start:    info.Start,
-			End:      info.End,
-			Replicas: info.Replicas,
-			Leader:   info.Leader,
-			Version:  info.Version,
+			ID:           info.ID,
+			Start:        info.Start,
+			End:          info.End,
+			Replicas:     info.Replicas,
+			Leader:       info.Leader,
+			Version:      info.Version,
+			LeaderKnown:  info.LeaderKnown,
+			ReplicaCount: info.ReplicaCount,
+			LiveVoters:   info.LiveVoters,
+			Epoch:        info.Epoch,
+			Stale:        info.Stale,
 		})
 	}
 	return out, nil

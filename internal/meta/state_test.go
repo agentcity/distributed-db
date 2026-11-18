@@ -43,3 +43,42 @@ func TestAdvanceTSNeverGoesBackwards(t *testing.T) {
 		t.Fatalf("LastTS = %d, want 100", got)
 	}
 }
+
+func TestRestoreLeaderEpoch(t *testing.T) {
+	c := meta.New()
+	if err := c.SetRanges([]meta.Range{{
+		ID: 1, Replicas: []string{"n1", "n2"}, Version: 1,
+	}}); err != nil {
+		t.Fatalf("SetRanges: %v", err)
+	}
+	if err := c.UpdateLeader(1, "n1"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+
+	other := meta.New()
+	if err := other.Restore(c.Export()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	r, err := other.RangeForKey(nil)
+	if err != nil {
+		t.Fatalf("RangeForKey: %v", err)
+	}
+	if r.Leader != "n1" || r.LeaderEpoch != 1 || r.LeaderStale() {
+		t.Fatalf("restored range = %+v", r)
+	}
+
+	// A snapshot whose hint epoch predates its descriptor version is stale
+	// and must not be restored as a current leader.
+	state := c.Export()
+	state.Ranges[0].Version = 2
+	if err := other.Restore(state); err != nil {
+		t.Fatalf("Restore stale: %v", err)
+	}
+	r, err = other.RangeForKey(nil)
+	if err != nil {
+		t.Fatalf("RangeForKey after restore: %v", err)
+	}
+	if r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("stale snapshot restored hint %+v", r)
+	}
+}

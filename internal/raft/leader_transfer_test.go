@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,11 @@ type testTransferTransport struct {
 	raft.Transport
 	cluster *testCluster
 	id      string
+	// preVotes counts pre-vote RPCs sent by this node and preVoteGrants counts
+	// the replies that granted one. They let PreVote tests prove that a node
+	// kept campaigning while the peers refused to grant.
+	preVotes      atomic.Int64
+	preVoteGrants atomic.Int64
 }
 
 func (t *testTransferTransport) TimeoutNow(ctx context.Context, peer string, req *raft.TimeoutNowRequest) (*raft.TimeoutNowResponse, error) {
@@ -26,6 +32,32 @@ func (t *testTransferTransport) TimeoutNow(ctx context.Context, peer string, req
 		return nil, fmt.Errorf("test transport: unknown peer %s", peer)
 	}
 	return node.HandleTimeoutNow(ctx, req)
+}
+
+// PreVote delivers the pre-vote RPC directly to the peer node. rafttest's
+// Transport is returned as the raft.Transport interface, so the optional
+// capability is not promoted from the embedded field; forwarding it here makes
+// the shared test cluster exercise the PreVote election path.
+// PreVote forwards the optional RPC through the embedded network transport so
+// partition rules apply exactly as they do to RequestVote, and counts the
+// grants a node actually received. Ad-hoc transports used without a network
+// fall back to direct delivery.
+func (t *testTransferTransport) PreVote(ctx context.Context, peer string, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	t.preVotes.Add(1)
+	resp, err := func() (*raft.PreVoteResponse, error) {
+		if tr, ok := t.Transport.(raft.PreVoteTransport); ok {
+			return tr.PreVote(ctx, peer, req)
+		}
+		node := t.cluster.node(peer)
+		if node == nil {
+			return nil, fmt.Errorf("test transport: unknown peer %s", peer)
+		}
+		return node.HandlePreVote(ctx, req)
+	}()
+	if err == nil && resp != nil && resp.VoteGranted {
+		t.preVoteGrants.Add(1)
+	}
+	return resp, err
 }
 
 // InstallSnapshot delivers the legacy unary snapshot directly to the peer so
@@ -40,6 +72,7 @@ func (t *testTransferTransport) InstallSnapshot(ctx context.Context, peer string
 
 var _ raft.TimeoutNowTransport = (*testTransferTransport)(nil)
 var _ raft.SnapshotTransport = (*testTransferTransport)(nil)
+var _ raft.PreVoteTransport = (*testTransferTransport)(nil)
 
 func otherID(ids []string, id string) string {
 	for _, other := range ids {

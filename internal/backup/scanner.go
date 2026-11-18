@@ -66,12 +66,12 @@ func (s StoreScanner) ScanForBackup(ctx context.Context, start, end []byte, ts u
 }
 
 // WaitApplied implements BackupBarrier by delegating to the store's commit
-// barrier. A StoreScanner is therefore self-sufficient for
-// BackupConfig.RequireLockAwareScan: it supplies both the lock-aware snapshot
-// scan and the applied-commit wait. RemoteScanner deliberately does not, because
-// it has no server-side barrier RPC yet.
+// barrier through LeaseBarrier. A StoreScanner is therefore self-sufficient
+// for BackupConfig.RequireLockAwareScan: it supplies both the lock-aware
+// snapshot scan and the applied-commit wait. RemoteScanner deliberately does
+// not, because it has no server-side barrier RPC yet.
 func (s StoreScanner) WaitApplied(ctx context.Context, ts uint64) error {
-	return StoreBarrier{Store: s.Store}.WaitApplied(ctx, ts)
+	return LeaseBarrier{Store: s.Store}.WaitApplied(ctx, ts)
 }
 
 // RemoteScanner adapts a remote v2 cluster to SnapshotScanner through the

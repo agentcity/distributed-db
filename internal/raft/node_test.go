@@ -165,6 +165,7 @@ type testCluster struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	nodes       map[string]*raft.Node
+	transports  map[string]*testTransferTransport
 	sms         map[string]*testSM
 	stores      map[string]*raft.FileStore
 	dirs        map[string]string
@@ -243,6 +244,7 @@ func newTestClusterWithTimeouts(t *testing.T, size int, electionMin, electionMax
 		ctx:         ctx,
 		cancel:      cancel,
 		nodes:       make(map[string]*raft.Node),
+		transports:  make(map[string]*testTransferTransport),
 		sms:         make(map[string]*testSM),
 		stores:      make(map[string]*raft.FileStore),
 		dirs:        make(map[string]string),
@@ -275,6 +277,7 @@ func newTestClusterWithTimeouts(t *testing.T, size int, electionMin, electionMax
 		c.dirs[id] = dir
 		c.stores[id] = store
 		c.sms[id] = sm
+		c.transports[id] = tr
 		c.setNode(id, node)
 		c.net.Register(id, node)
 		if err := node.Start(ctx); err != nil {

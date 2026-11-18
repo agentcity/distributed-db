@@ -20,6 +20,7 @@ import (
 	"distributed-db/internal/raft"
 	"distributed-db/internal/rbac"
 	"distributed-db/internal/storage"
+	"distributed-db/internal/version"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -143,15 +144,42 @@ type Config struct {
 
 	// AuditLogPath enables append-only JSON Lines audit of protected RPC
 	// attempts at that path. The file is created with mode 0600 and the parent
-	// directory is created if needed. There is no built-in rotation; rotate
-	// externally and restrict access. The path requires at least one
-	// configured credential (New rejects audit without auth).
+	// directory is created if needed. The path requires at least one
+	// configured credential (New rejects audit without auth). Records never
+	// contain a token.
 	AuditLogPath string
 
 	// AuditLogSync fsyncs the audit file after every record. It trades
 	// throughput for durability; the default (false) relies on the OS page
-	// cache. Audit write failures are logged but do not fail the RPC.
+	// cache. Audit write failures are logged but do not fail the RPC unless
+	// AuditRequired is set.
 	AuditLogSync bool
+
+	// AuditLogMaxBytes enables size-based rotation of the audit file at that
+	// threshold. Zero (the default) disables built-in rotation and keeps the
+	// historical behaviour where operators rotate externally. When set, the
+	// active file is renamed to "<AuditLogPath>.1" and older backups shift to
+	// .2, .3, ... up to AuditLogMaxBackups.
+	AuditLogMaxBytes int64
+
+	// AuditLogMaxBackups is the number of rotated audit files to retain. Zero
+	// discards the rotated file. It is ignored when AuditLogMaxBytes is zero
+	// and New rejects a positive value with rotation disabled. Negative values
+	// are rejected.
+	AuditLogMaxBackups int
+
+	// AuditRequired makes protected admin RPCs fail closed: if the audit sink
+	// is closed/broken before the call, or the outcome record cannot be
+	// written, the RPC is rejected with codes.Unavailable instead of running
+	// unaudited. The default (false) keeps the historical best-effort
+	// behaviour. It requires AuditLogPath; New rejects AuditRequired without
+	// an audit sink. Because the outcome is only known after the handler runs,
+	// a post-handler write failure rejects the response after the mutation may
+	// already have been applied; the pre-call health check covers the common
+	// rotation/reopen failure. Credential denials are always rejected, and a
+	// failure to record a denial is also surfaced as Unavailable when this is
+	// set.
+	AuditRequired bool
 
 	// Storage lifecycle. A completely zero lifecycle block selects
 	// production-safe defaults so a node that does not configure maintenance
@@ -261,8 +289,10 @@ func (c Config) resolveSyncWrites() (bool, error) {
 // share one Pebble engine; each range sees its own keyspace through a
 // storage.Prefix wrapper.
 type Server struct {
-	cfg Config
-	log *slog.Logger
+	// protocolRegistry records negotiated peer protocol versions.
+	protocolRegistry *version.Registry
+	cfg              Config
+	log              *slog.Logger
 
 	// authz is the admin RBAC policy. It is disabled (Enabled() == false) when
 	// no credential is configured, in which case the interceptor passes every
@@ -455,13 +485,23 @@ func New(cfg Config) (*Server, error) {
 	// PermissionDenied (not with a storage status) and before the handler so
 	// protected RPCs never mutate state on a bad credential. A disabled policy
 	// makes the interceptor a pass-through.
-	opts = append(opts, grpc.ChainUnaryInterceptor(newKVAdminInterceptor(s.authz, s.auditLog)))
+	opts = append(opts, grpc.ChainUnaryInterceptor(newKVAdminInterceptor(s.authz, s.auditLog, s.cfg.AuditRequired)))
 	// Reject mutating KV RPCs with a clear ResourceExhausted status while
 	// storage is full. Reads keep working. The interceptor is cheap: one
 	// atomic load per unary RPC.
 	if s.lifecycle != nil {
 		opts = append(opts, grpc.ChainUnaryInterceptor(s.diskGuardUnaryInterceptor))
 	}
+	// Protocol version handshake: v2client/raftgrpc send metadata on every
+	// dial; this records peers and rejects incompatible majors. Missing
+	// metadata is treated as legacy 2.0.0 for rolling upgrades.
+	protoReg := version.NewRegistry()
+	protoHandshake := version.NewServerHandshakeWithVersion(protoReg, version.Current, version.CurrentFeatures, s.cfg.Logger)
+	opts = append(opts,
+		grpc.ChainUnaryInterceptor(protoHandshake.Unary()),
+		grpc.ChainStreamInterceptor(protoHandshake.Stream()),
+	)
+	s.protocolRegistry = protoReg
 	s.grpcSrv = grpc.NewServer(opts...)
 	RegisterKVServiceWithBackupScan(s.grpcSrv, s)
 	pbv2.RegisterRaftServiceServer(s.grpcSrv, &raftService{s: s})
@@ -536,6 +576,7 @@ func (s *Server) Start(ctx context.Context) error {
 		"raft_addr", lis.Addr().String(), "ranges", s.groupIDs, "default_range", s.defaultID,
 		"sync_writes", s.syncWrites, "tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
 		"admin_auth", s.authz.Enabled(), "admin_audit", s.auditLog != nil,
+		"admin_audit_required", s.cfg.AuditRequired, "admin_audit_rotate_bytes", s.cfg.AuditLogMaxBytes,
 		"snapshot_interval", snapshotInterval, "gc_interval", gcInterval)
 	return nil
 }

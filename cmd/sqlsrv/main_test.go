@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"flag"
+	"io"
 	"strings"
 	"testing"
 
@@ -119,5 +122,98 @@ func TestClusterTLSOptionsEnabledByCA(t *testing.T) {
 	}
 	if opts == nil || opts.CAFile != "ca.pem" || opts.CertFile != "server.crt" || opts.KeyFile != "server.key" {
 		t.Fatalf("clusterTLSOptions = %+v", opts)
+	}
+}
+
+func newSQLFlagSet(t *testing.T) (*flag.FlagSet, *options) {
+	t.Helper()
+	fs := flag.NewFlagSet("sqlsrv-test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	return fs, registerFlags(fs)
+}
+
+// TestSQLFlagsExposeNoClusterAdminSurface guards the design decision that SQL
+// bearer auth is not cluster admin auth: sqlsrv serves no admin RPC and must
+// not grow admin RBAC or audit flags by accident.
+func TestSQLFlagsExposeNoClusterAdminSurface(t *testing.T) {
+	fs, _ := newSQLFlagSet(t)
+	for _, name := range []string{
+		"admin-token", "admin-token-roles", "admin-token-roles-file",
+		"admin-mtls-roles", "audit-log", "audit-log-sync", "audit-required",
+	} {
+		if fs.Lookup(name) != nil {
+			t.Fatalf("sqlsrv registered cluster admin flag -%s", name)
+		}
+	}
+	if fs.Lookup("auth-token") == nil {
+		t.Fatal("sqlsrv is missing its SQL -auth-token flag")
+	}
+}
+
+func TestAuthTokenEnvFallback(t *testing.T) {
+	t.Setenv(authTokenEnv, "env-sql-token")
+	fs, opts := newSQLFlagSet(t)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	opts.resolveEnv(fs)
+	if opts.authToken != "env-sql-token" {
+		t.Fatalf("auth token = %q, want environment fallback", opts.authToken)
+	}
+}
+
+func TestAuthTokenFlagWinsOverEnv(t *testing.T) {
+	t.Setenv(authTokenEnv, "env-sql-token")
+	fs, opts := newSQLFlagSet(t)
+	if err := fs.Parse([]string{"-auth-token", "flag-sql-token"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	opts.resolveEnv(fs)
+	if opts.authToken != "flag-sql-token" {
+		t.Fatalf("auth token = %q, want the explicit flag", opts.authToken)
+	}
+}
+
+func TestExplicitEmptyAuthTokenDisablesEnv(t *testing.T) {
+	t.Setenv(authTokenEnv, "env-sql-token")
+	fs, opts := newSQLFlagSet(t)
+	if err := fs.Parse([]string{"-auth-token", ""}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	opts.resolveEnv(fs)
+	if opts.authToken != "" {
+		t.Fatalf("auth token = %q, want explicit empty to win over the environment", opts.authToken)
+	}
+}
+
+func TestAuthTokenHelpDoesNotLeakEnvValue(t *testing.T) {
+	const token = "sql-help-leak-token"
+	t.Setenv(authTokenEnv, token)
+	fs, _ := newSQLFlagSet(t)
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	fs.PrintDefaults()
+	if strings.Contains(buf.String(), token) {
+		t.Fatalf("sqlsrv help leaked the token:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), authTokenEnv) {
+		t.Fatalf("sqlsrv help does not document %s:\n%s", authTokenEnv, buf.String())
+	}
+}
+
+func TestEnvAuthTokenStillRequiresTLS(t *testing.T) {
+	const token = "sql-env-secret-token"
+	t.Setenv(authTokenEnv, token)
+	fs, opts := newSQLFlagSet(t)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	opts.resolveEnv(fs)
+	err := opts.httpConfig().Validate()
+	if err == nil || !strings.Contains(err.Error(), "requires TLS") {
+		t.Fatalf("httpConfig.Validate = %v, want an auth-requires-TLS error", err)
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("validation error leaked the token: %v", err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -58,18 +59,35 @@ func TestE2EAdminCommands(t *testing.T) {
 		t.Fatalf("ranges = code %d err %q", code, errOut)
 	}
 	var ranges []struct {
-		ID       uint64   `json:"id"`
-		Start    string   `json:"start"`
-		End      string   `json:"end"`
-		Leader   string   `json:"leader"`
-		Replicas []string `json:"replicas"`
-		Version  uint64   `json:"version"`
+		ID           uint64   `json:"id"`
+		Start        string   `json:"start"`
+		End          string   `json:"end"`
+		Leader       string   `json:"leader"`
+		LeaderKnown  bool     `json:"leader_known"`
+		Replicas     []string `json:"replicas"`
+		ReplicaCount int      `json:"replica_count"`
+		LiveVoters   []string `json:"live_voters"`
+		Version      uint64   `json:"version"`
+		Epoch        uint64   `json:"epoch"`
+		Stale        bool     `json:"stale"`
 	}
 	if err := json.Unmarshal([]byte(out), &ranges); err != nil {
 		t.Fatalf("ranges json: %v (%q)", err, out)
 	}
 	if len(ranges) != 1 || ranges[0].ID != 1 || len(ranges[0].Replicas) != len(kvAddrs) {
 		t.Fatalf("initial ranges = %s", out)
+	}
+	// The whole point of the health view: a live cluster must not show an
+	// empty LEADER or an empty live-voter set.
+	if !ranges[0].LeaderKnown || ranges[0].Leader == "" {
+		t.Fatalf("initial range has no truthful leader: %s", out)
+	}
+	if !slices.Contains(kvAddrs, ranges[0].Leader) {
+		t.Fatalf("leader %q is not a replica: %s", ranges[0].Leader, out)
+	}
+	if ranges[0].ReplicaCount != len(kvAddrs) || len(ranges[0].LiveVoters) == 0 ||
+		ranges[0].Stale || ranges[0].Epoch == 0 {
+		t.Fatalf("initial range health = %s", out)
 	}
 
 	code, out, errOut = run(append(append([]string{}, base...), "-format", "json", "status")...)
@@ -88,12 +106,14 @@ func TestE2EAdminCommands(t *testing.T) {
 	if status.MetaLeader != metaLeader || status.MetaTerm == 0 || status.Ranges != 1 {
 		t.Fatalf("status = %s (meta leader %s)", out, metaLeader)
 	}
-	// The meta range map does not necessarily know the current KV leaders, so
-	// Leaders may legitimately be empty here. Per-leader counting is covered
-	// by the unit tests; this only checks that every reported leader is known.
+	// Status uses the same health-enriched range list, so a live cluster must
+	// report at least one range leader and never an empty key.
+	if len(status.Leaders) == 0 {
+		t.Fatalf("status reported no live range leaders: %s", out)
+	}
 	for leader := range status.Leaders {
-		if leader == "" {
-			t.Fatalf("status leaders contain an empty leader: %v", status.Leaders)
+		if leader == "" || !slices.Contains(kvAddrs, leader) {
+			t.Fatalf("status leaders contain an unknown leader: %v", status.Leaders)
 		}
 	}
 
@@ -126,6 +146,11 @@ func TestE2EAdminCommands(t *testing.T) {
 		ranges[0].End != "m" || ranges[1].Start != "m" {
 		t.Fatalf("ranges after split = %s", out)
 	}
+	for _, r := range ranges {
+		if !r.LeaderKnown || !slices.Contains(kvAddrs, r.Leader) {
+			t.Fatalf("range %d has no truthful leader after split: %s", r.ID, out)
+		}
+	}
 
 	// merge the right range back into the left one.
 	rightID := split.NewRangeID
@@ -143,6 +168,9 @@ func TestE2EAdminCommands(t *testing.T) {
 	}
 	if len(ranges) != 1 || ranges[0].ID != 1 || ranges[0].End != "" {
 		t.Fatalf("ranges after merge = %s", out)
+	}
+	if !ranges[0].LeaderKnown || !slices.Contains(kvAddrs, ranges[0].Leader) {
+		t.Fatalf("merged range has no truthful leader: %s", out)
 	}
 
 	// backup requires KV nodes and must produce a valid manifest.

@@ -1034,6 +1034,24 @@ type raftService struct {
 	s *Server
 }
 
+func (r *raftService) PreVote(ctx context.Context, req *pbv2.PreVoteRequest) (*pbv2.PreVoteResponse, error) {
+	if req == nil {
+		return nil, errors.New("kvserver: nil PreVote")
+	}
+	g, err := r.s.groupForID(req.GetRangeId())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.node.HandlePreVote(ctx, &raft.PreVoteRequest{
+		Term: req.GetTerm(), CandidateID: req.GetCandidateId(),
+		LastLogIndex: req.GetLastLogIndex(), LastLogTerm: req.GetLastLogTerm(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pbv2.PreVoteResponse{Term: resp.Term, VoteGranted: resp.VoteGranted}, nil
+}
+
 func (r *raftService) RequestVote(ctx context.Context, req *pbv2.RequestVoteRequest) (*pbv2.RequestVoteResponse, error) {
 	if req == nil {
 		return nil, errors.New("kvserver: nil RequestVote")

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -12,11 +15,34 @@ import (
 	pbv2 "distributed-db/internal/pb/v2"
 )
 
+const (
+	// rangeHealthProbeTimeout bounds one KVService.Status call made by
+	// ListRangesWithHealth.
+	rangeHealthProbeTimeout = 400 * time.Millisecond
+	// rangeHealthRangeTimeout bounds all probes for one range.
+	rangeHealthRangeTimeout = 2 * time.Second
+	// rangeHealthTotalTimeout bounds the whole health pass so a large or
+	// partially unreachable cluster cannot stall the CLI for minutes. Ranges
+	// not reached in time keep the metadata-only leader hint.
+	rangeHealthTotalTimeout = 5 * time.Second
+	// rangeHealthWorkers caps concurrent range probes.
+	rangeHealthWorkers = 8
+)
+
 // RangeInfo is one meta range descriptor. Start is inclusive and End is
 // exclusive; a nil boundary means the range is unbounded on that side.
 //
 // RangeInfo is intentionally a plain value type so administrative callers do
 // not depend on the generated protobuf types.
+//
+// Leader and Version are the values carried by the wire descriptor. The health
+// fields are filled only by ListRangesWithHealth (and are zero after a plain
+// ListRanges): they come from best-effort KVService.Status probes, never from
+// the metadata service, and never invent a leader. LeaderKnown is false when no
+// leader hint is known; LiveVoters contains only replicas that answered Status
+// as voters during the probe; Epoch is the descriptor version against which the
+// probe was made; Stale reports that the wire leader hint disagreed with the
+// leader observed live.
 type RangeInfo struct {
 	ID       uint64
 	Start    []byte
@@ -24,6 +50,12 @@ type RangeInfo struct {
 	Replicas []string
 	Leader   string
 	Version  uint64
+
+	LeaderKnown  bool
+	ReplicaCount int
+	LiveVoters   []string
+	Epoch        uint64
+	Stale        bool
 }
 
 // metaAPI is the subset of pbv2.MetaServiceClient used by the client. Keeping
@@ -348,6 +380,139 @@ func (c *Client) ListRanges(ctx context.Context) ([]RangeInfo, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// ListRangesWithHealth returns the meta range map enriched with best-effort
+// liveness information. Every replica is probed with KVService.Status, using
+// the same read-only path the data plane uses for leader discovery. The probe
+// is bounded per replica, per range and for the whole pass, so an unreachable
+// node degrades to an empty LiveVoters list (and the metadata leader hint)
+// instead of failing the command. A leader is reported
+// only when a replica claims leadership or a follower names a current replica;
+// an unknown leader stays empty rather than being guessed.
+//
+// ListRanges remains the pure wire mapping, so existing callers and tests are
+// unaffected.
+func (c *Client) ListRangesWithHealth(ctx context.Context) ([]RangeInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ranges, err := c.ListRanges(ctx)
+	if err != nil {
+		return nil, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, rangeHealthTotalTimeout)
+	defer cancel()
+	c.attachRangeHealth(probeCtx, ranges)
+	return ranges, nil
+}
+
+// attachRangeHealth fills the health fields of ranges in place, probing up to
+// rangeHealthWorkers ranges concurrently.
+func (c *Client) attachRangeHealth(ctx context.Context, ranges []RangeInfo) {
+	if len(ranges) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, rangeHealthWorkers)
+	for i := range ranges {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ranges[i] = c.probeRangeHealth(ctx, ranges[i])
+		}(i)
+	}
+	wg.Wait()
+}
+
+// probeRangeHealth probes one range's replicas. It never mutates the cluster or
+// the map; it only observes KVService.Status.
+func (c *Client) probeRangeHealth(ctx context.Context, info RangeInfo) RangeInfo {
+	info.ReplicaCount = len(info.Replicas)
+	info.Epoch = info.Version
+	originalLeader := info.Leader
+	live := make([]string, 0, len(info.Replicas))
+	observed := ""
+	hint := ""
+
+	probeCtx, cancel := context.WithTimeout(ctx, rangeHealthRangeTimeout)
+	defer cancel()
+
+	seen := make(map[string]struct{}, len(info.Replicas)+1)
+	candidates := make([]string, 0, len(info.Replicas)+1)
+	if info.Leader != "" {
+		candidates = append(candidates, info.Leader)
+	}
+	candidates = append(candidates, info.Replicas...)
+	for _, addr := range candidates {
+		if addr == "" {
+			continue
+		}
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+
+		cl, err := c.node(addr)
+		if err != nil {
+			continue
+		}
+		callCtx, callCancel := context.WithTimeout(probeCtx, rangeHealthProbeTimeout)
+		resp, err := cl.Status(callCtx, &pbv2.StatusRequest{RangeId: info.ID})
+		callCancel()
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(resp.GetRole(), "leader") {
+			observed = addr
+		} else if hint == "" && resp.GetLeader() != "" && containsString(info.Replicas, resp.GetLeader()) {
+			hint = resp.GetLeader()
+		}
+		if !resp.GetLearner() && (len(resp.GetVoters()) == 0 || containsString(resp.GetVoters(), addr)) {
+			live = append(live, addr)
+		}
+	}
+	if observed == "" {
+		observed = hint
+	}
+	if observed != "" {
+		info.Leader = observed
+	}
+	info.LeaderKnown = info.Leader != ""
+	info.LiveVoters = sortedUniqueStrings(live)
+	info.Stale = originalLeader != "" && observed != "" && originalLeader != observed
+	return info
+}
+
+func containsString(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedUniqueStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SetRanges replaces the whole meta range map. It is an admin RPC and carries

@@ -270,6 +270,15 @@ func (n *Node) voteQuorumLocked() bool {
 	return n.quorumInConfig(n.electoralConfigLocked(), ack)
 }
 
+// preVoteQuorumLocked applies the same electoral quorum rule to pre-vote
+// grants: a majority of C_new and, while joint, a majority of C_old. A
+// C_new-only or C_old-only pre-vote majority must not let a candidate start an
+// election.
+func (n *Node) preVoteQuorumLocked() bool {
+	ack := func(id string) bool { return n.preVotes[id] }
+	return n.quorumInConfig(n.electoralConfigLocked(), ack)
+}
+
 // electoralVotersExceptSelfLocked lists the peers a candidate must ask for a
 // vote: the union of the latest voter sets in its log, minus itself.
 func (n *Node) electoralVotersExceptSelfLocked() []string {

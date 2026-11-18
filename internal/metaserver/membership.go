@@ -110,6 +110,15 @@ func (s *Server) AddReplica(ctx context.Context, rangeID uint64, target string) 
 		updated := rows[i]
 		updated.Replicas = newReplicas
 		updated.Version = newVersion
+		// Adding a voter does not move leadership; carry a live hint forward
+		// at the new descriptor version instead of letting SetRanges treat it
+		// as stale.
+		if updated.Leader != "" && containsAddr(newReplicas, updated.Leader) {
+			updated.LeaderEpoch = newVersion
+		} else {
+			updated.Leader = ""
+			updated.LeaderEpoch = 0
+		}
 		next = append(next, updated)
 	}
 	if err := s.ApplyRanges(ctx, next); err != nil {
@@ -200,10 +209,15 @@ func (s *Server) RemoveReplica(ctx context.Context, rangeID uint64, target strin
 		}
 		updated := rows[i]
 		updated.Replicas = newReplicas
-		if updated.Leader == target {
-			updated.Leader = ""
-		}
 		updated.Version = newVersion
+		if updated.Leader == target || !containsAddr(newReplicas, updated.Leader) {
+			updated.Leader = ""
+			updated.LeaderEpoch = 0
+		} else if updated.Leader != "" {
+			// Removal did not move leadership away from the remaining
+			// voters; re-stamp the hint at the new version.
+			updated.LeaderEpoch = newVersion
+		}
 		next = append(next, updated)
 	}
 	if err := s.ApplyRanges(ctx, next); err != nil {
@@ -381,6 +395,7 @@ func (s *Server) transferAwayFrom(ctx context.Context, r meta.Range, leader stri
 			continue
 		}
 		if resp.GetSuccess() {
+			s.rememberLeaderHint(r.ID, candidate, r.Version)
 			return nil
 		}
 		lastErr = fmt.Errorf("transfer to %s rejected: %s%s", candidate,

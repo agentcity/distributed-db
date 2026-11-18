@@ -63,46 +63,89 @@ func adminAuthUnaryInterceptor(token string) grpc.UnaryServerInterceptor {
 			return nil, status.Error(codes.Internal, "metaserver: invalid admin auth configuration")
 		}
 	}
-	return newMetaAdminInterceptor(policy, nil)
+	return newMetaAdminInterceptor(policy, nil, false)
 }
 
 // newMetaAdminInterceptor enforces authentication, RBAC and audit on
 // metaAdminMethods. Every protected attempt is audited, including denials and
 // handler/application failures. Tokens never appear in audit records: the
 // record carries the role (or mTLS CN), method, range and outcome only.
-func newMetaAdminInterceptor(policy *rbac.Policy, auditLog *audit.Logger) grpc.UnaryServerInterceptor {
+//
+// auditRequired turns audit failures into a codes.Unavailable rejection
+// (fail-closed); the default false keeps audit best-effort.
+func newMetaAdminInterceptor(policy *rbac.Policy, auditLog *audit.Logger, auditRequired ...bool) grpc.UnaryServerInterceptor {
 	if policy == nil || !policy.Enabled() {
 		return metaAdminPassThrough
 	}
+	// Variadic keeps the historical two-argument construction (best-effort
+	// audit) source-compatible for tests and callers; New always passes the
+	// configured value.
+	required := len(auditRequired) > 0 && auditRequired[0]
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if _, ok := metaAdminMethods[info.FullMethod]; !ok {
 			return handler(ctx, req)
 		}
+		// Fail closed before the handler runs if the sink is already broken:
+		// an unauditable protected mutation must not execute.
+		if err := metaAuditPreflight(auditLog, required); err != nil {
+			return nil, err
+		}
 		permission, ok := rbac.MetaPermission(info.FullMethod)
 		if !ok {
-			_ = auditLog.Record(metaAuditEvent(rbac.Identity{}, info.FullMethod, req,
-				audit.ResultDenied, audit.ErrorClassPermissionDenied))
+			if fail := metaAuditFailure(required, auditLog.Record(metaAuditEvent(rbac.Identity{}, info.FullMethod, req,
+				audit.ResultDenied, audit.ErrorClassPermissionDenied))); fail != nil {
+				return nil, fail
+			}
 			return nil, status.Error(codes.PermissionDenied, "metaserver: admin method has no RBAC classification")
 		}
 
 		identity, err := policy.Authenticate(ctx)
 		if err != nil {
-			_ = auditLog.Record(metaAuditEvent(rbac.Identity{}, info.FullMethod, req,
-				audit.ResultDenied, audit.ErrorClassUnauthenticated))
+			if fail := metaAuditFailure(required, auditLog.Record(metaAuditEvent(rbac.Identity{}, info.FullMethod, req,
+				audit.ResultDenied, audit.ErrorClassUnauthenticated))); fail != nil {
+				return nil, fail
+			}
 			return nil, metaAdminAuthError(err)
 		}
 		if err := policy.Authorize(identity.Role, permission); err != nil {
-			_ = auditLog.Record(metaAuditEvent(identity, info.FullMethod, req,
-				audit.ResultDenied, audit.ErrorClassPermissionDenied))
+			if fail := metaAuditFailure(required, auditLog.Record(metaAuditEvent(identity, info.FullMethod, req,
+				audit.ResultDenied, audit.ErrorClassPermissionDenied))); fail != nil {
+				return nil, fail
+			}
 			return nil, status.Errorf(codes.PermissionDenied,
 				"metaserver: role %q may not perform %q", identity.Role, permission)
 		}
 
 		resp, err := handler(ctx, req)
 		result, class := audit.Outcome(resp, err)
-		_ = auditLog.Record(metaAuditEvent(identity, info.FullMethod, req, result, class))
+		if fail := metaAuditFailure(required, auditLog.Record(
+			metaAuditEvent(identity, info.FullMethod, req, result, class))); fail != nil {
+			return nil, fail
+		}
 		return resp, err
 	}
+}
+
+// metaAuditPreflight reports an audit sink that cannot accept a record before a
+// protected handler runs. With audit disabled or best-effort it is a no-op.
+func metaAuditPreflight(auditLog *audit.Logger, required bool) error {
+	if !required {
+		return nil
+	}
+	if err := auditLog.Healthy(); err != nil {
+		return status.Error(codes.Unavailable, "metaserver: admin audit unavailable")
+	}
+	return nil
+}
+
+// metaAuditFailure converts a failed audit write into the fail-closed
+// rejection. The text is fixed so sink details never reach the client; the
+// detailed error goes to the server logger through audit.OnError.
+func metaAuditFailure(required bool, err error) error {
+	if !required || err == nil {
+		return nil
+	}
+	return status.Error(codes.Unavailable, "metaserver: admin audit unavailable")
 }
 
 // metaAdminAuthError maps an RBAC authentication error to the historical gRPC
@@ -141,7 +184,8 @@ func metaAdminPassThrough(ctx context.Context, req any, _ *grpc.UnaryServerInfo,
 //
 // Fail-fast rules mirror kvserver: unknown roles are rejected; AdminMTLSRoles
 // requires TLS.Server.ClientCAFile (mTLS); an audit log path requires at least
-// one credential.
+// one credential; AuditRequired requires AuditLogPath; rotation options must be
+// non-negative and MaxBackups requires MaxBytes.
 func buildMetaAdminPolicy(cfg Config) (*rbac.Policy, error) {
 	tokens := make(map[string]string, len(cfg.AdminTokenRoles)+1)
 	for token, role := range cfg.AdminTokenRoles {
@@ -166,6 +210,18 @@ func buildMetaAdminPolicy(cfg Config) (*rbac.Policy, error) {
 	if cfg.AuditLogPath != "" && !policy.Enabled() {
 		return nil, errors.New("metaserver: AuditLogPath requires at least one admin token or mTLS role")
 	}
+	if cfg.AuditLogMaxBytes < 0 {
+		return nil, errors.New("metaserver: AuditLogMaxBytes must not be negative")
+	}
+	if cfg.AuditLogMaxBackups < 0 {
+		return nil, errors.New("metaserver: AuditLogMaxBackups must not be negative")
+	}
+	if cfg.AuditLogMaxBackups > 0 && cfg.AuditLogMaxBytes == 0 {
+		return nil, errors.New("metaserver: AuditLogMaxBackups requires AuditLogMaxBytes")
+	}
+	if cfg.AuditRequired && cfg.AuditLogPath == "" {
+		return nil, errors.New("metaserver: AuditRequired requires AuditLogPath")
+	}
 	return policy, nil
 }
 
@@ -180,7 +236,9 @@ func openMetaAdminAudit(cfg Config) (*audit.Logger, error) {
 		logger = slog.Default()
 	}
 	l, err := audit.Open(cfg.AuditLogPath, audit.Options{
-		Sync: cfg.AuditLogSync,
+		Sync:       cfg.AuditLogSync,
+		MaxBytes:   cfg.AuditLogMaxBytes,
+		MaxBackups: cfg.AuditLogMaxBackups,
 		OnError: func(err error) {
 			logger.Error("admin audit write failed", "error", err)
 		},

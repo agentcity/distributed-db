@@ -225,7 +225,9 @@ func (n *Node) HandleTimeoutNow(ctx context.Context, req *TimeoutNowRequest) (*T
 	n.electionDeadline = time.Now()
 	n.mu.Unlock()
 
-	n.beginElection()
+	// The current leader asked for this election and is stepping down, so its
+	// lease must not reject the campaign: start the real election directly.
+	n.beginElection(true)
 	return &TimeoutNowResponse{Term: acceptedTerm, Success: true}, nil
 }
 

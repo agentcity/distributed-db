@@ -1,19 +1,23 @@
 // Package pitr implements the storage half of a point-in-time recovery (PITR)
 // archive: immutable, checksummed log segments, an atomic manifest, a reader
-// with integrity and gap checks, retention/GC, an adapter from committed
-// Raft/WAL-like entries, and a deterministic restore planner and executor over
-// a base backup plus archived records.
+// with integrity and gap checks, retention/GC, adapters from committed
+// Raft/WAL-like entries and a local Raft log store, a meta/TSO checkpoint
+// record, and a deterministic restore planner and executor over a base backup
+// plus archived records.
 //
 // # Scope
 //
 // This package is an MVP archive component, not cluster-integrated PITR. It
-// does not read the Raft WAL, meta log, MVCC store, TSO allocator or the
-// existing backup chunks. ArchiveAdapter consumes a committed, gap-free entry
-// source supplied by the caller; the caller also supplies the commit TSO it
-// observed. Planner pairs a internal/backup manifest with the archive, and
-// RestoreToTS feeds the resulting plan to a caller-supplied RestoreSink. Those
-// wirings are narrow interfaces, not a running cluster integration. The
-// remaining open work is listed under "Integration gaps" below.
+// reads a local Raft log store in read-only mode, but it does not tail the log,
+// fence leadership, gate truncation or coordinate multiple archivers. It does
+// not read the meta log, MVCC store, TSO allocator or the existing backup
+// chunks; a caller supplies the captured high-water TSO and range metadata.
+// ArchiveAdapter consumes a committed, gap-free entry source supplied by the
+// caller; RaftLogSource is one concrete source over raft.LogStore.Load.
+// Planner pairs an internal/backup manifest with the archive, and RestoreToTS
+// feeds the resulting plan to a caller-supplied RestoreSink. Those wirings are
+// narrow interfaces, not a running cluster integration. The remaining open
+// work is listed under "Integration gaps" below.
 //
 // # Archive layout
 //
@@ -21,8 +25,9 @@
 //	<dir>/segments/range-<16-hex>/<start>-<end>-<sha-prefix>.seg
 //
 // The manifest records the cluster id, incarnation, timestamps, retained
-// segment descriptors and per-range GC trim frontiers. Segments are immutable
-// and sorted by (range id, start index).
+// segment descriptors, per-range GC trim frontiers and an optional meta/TSO
+// checkpoint (high-water TSO plus the range map observed at capture).
+// Segments are immutable and sorted by (range id, start index).
 //
 // # Segment format (version 1)
 //
@@ -68,15 +73,18 @@
 // the archive. It emits records in base range order (by start key, then range
 // id) and Raft index order within each range, filtering to
 // BaseTSO < TSO <= TargetTSO. It rejects a target before the base, unknown
-// requested ranges, a trimmed prefix that may contain records above the base,
-// and missing/corrupt/non-contiguous segments needed by the requested ranges.
+// requested ranges, a needed range absent from the checkpoint range map, a
+// trimmed prefix that may contain records above the base, and
+// missing/corrupt/non-contiguous segments needed by the requested ranges.
 //
 // RestoreToTS builds that plan and feeds it to a RestoreSink in plan order. It
-// fails closed before the first sink call when the target is above the newest
-// TSO observed for any needed range (completeness cannot be proven without a
-// global checkpoint); PlanRequest.AllowUnprovenTarget is an explicit opt-out.
-// It does not execute commands, resolve locks, delete keys absent from the
-// base, or perform an atomic cutover.
+// fails closed before the first sink call when the target is above the safe
+// high-water: the smallest of the manifest checkpoint, per-needed-range archive
+// coverage and PlanRequest.BarrierFrontier (the applied frontier reported by
+// the commit-lease barrier). PlanRequest.AllowUnprovenTarget is an explicit
+// opt-out. A target at or below the base is always allowed because the base is
+// independently complete. RestoreToTS does not execute commands, resolve locks,
+// delete keys absent from the base, or perform an atomic cutover.
 //
 // The plan is a pure function of its inputs: building it twice yields the same
 // records, order, segment list and SHA-256 Hash. Applying the plan twice is
@@ -93,8 +101,25 @@
 // ascending, gap-free indices: Raft delivers apply entries with gaps when it
 // consumes membership commands itself, so an integration must feed the
 // committed log sequence (including those commands) rather than the state-
-// machine apply stream, or fill the gaps before calling the adapter. Neither
-// the adapter nor this package tails the WAL.
+// machine apply stream, or fill the gaps before calling the adapter.
+//
+// RaftLogSource adapts raft.LogStore.Load (for example *raft.FileStore) to
+// EntrySource. It takes one read-only Load snapshot per call, validates
+// index/term ordering, clamps the result to a caller-supplied commit index
+// (typically raft.Node.Status().CommitIndex), and returns entries in index
+// order. A requested index below the first retained entry returns *GapError
+// with Compacted set and FirstAvailable reported; *raft.FileStore's snapshot
+// metadata lets the adapter report that frontier even when no entries remain.
+//
+// # Meta/TSO checkpoint
+//
+// CaptureCheckpoint reads a high-water TSO and range map from narrow caller
+// interfaces, optionally waits on an applied-commit barrier at that TSO, and
+// returns a validated Checkpoint. Writer.SetCheckpoint persists it atomically
+// in the manifest; checkpoints are monotonic in TSO. Reader.CheckTargetTSO
+// rejects a target above the checkpoint high-water (or, without a checkpoint,
+// above the newest observed archived TSO). This is a declarative bound, not a
+// proven global T_safe.
 //
 // # Guarantees
 //
@@ -106,8 +131,13 @@
 //     except at a recorded GC trim boundary.
 //   - ArchiveAdapter rejects gaps, duplicates, term regressions and malformed
 //     commit TSOs before calling Writer.Append.
+//   - RaftLogSource never returns an entry above the caller's commit index and
+//     reports a compacted prefix as a typed gap with the first retained index.
+//   - A checkpoint is validated (TSO, capture time, sorted contiguous range
+//     map) before it is written and again when the manifest is loaded.
 //   - RestoreToTS performs no sink call until the plan has been fully read,
-//     verified against segment checksums and checked for coverage.
+//     verified against segment checksums and checked for checkpoint, archive
+//     and barrier coverage.
 //   - GC never deletes a segment whose MaxTSO is above a non-zero ProtectTSO
 //     and never creates a hole inside a range's retained suffix.
 //   - Reader and Planner are safe for concurrent use and share no mutable
@@ -115,20 +145,19 @@
 //
 // # Integration gaps
 //
-//   - No Raft WAL/log-store tailing, no leadership/epoch fencing and no
-//     log-truncation handling. EntrySource is a caller-provided committed,
-//     contiguous prefix; the adapter cannot discover a configuration-entry
-//     gap on its own.
-//   - No global checkpoint/safe point (T_safe), no per-range frontier, no TSO
-//     high-water or meta archive. RestoreToTS can only compare the target with
-//     the newest TSO observed per needed range; it rejects a higher target
-//     unless explicitly opted out.
+//   - The local Raft reader is a snapshot-per-call adapter, not a tailer: it
+//     does not follow leadership/epoch changes, detect truncation between
+//     calls, gate TruncatePrefix, or retry a compacted prefix. A caller must
+//     archive before truncation and treat *GapError as a hard failure.
+//   - The checkpoint is supplied by the caller; this package does not
+//     coordinate per-range frontiers, publish a global T_safe, or archive the
+//     meta Raft log itself. Range coverage remains a conservative heuristic.
 //   - No RPO 0 claim. Unsealed records are lost on a writer crash, archive lag
 //     is invisible to the planner, and strict-acknowledgement mode does not
 //     exist.
 //   - No split/merge lineage, range-epoch conflict detection or multi-writer
-//     arbitration. Archive ranges absent from the base are skipped with a
-//     warning; two writers for one archive directory are unsupported.
+//     arbitration. A needed range absent from the checkpoint map fails closed;
+//     archive ranges absent from the base are skipped with a warning.
 //   - No cross-range transaction reconstruction, MVCC command semantics, lock
 //     staging/resolution or imported base chunks. RestoreSink is the caller's
 //     executor.

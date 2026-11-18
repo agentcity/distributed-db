@@ -269,6 +269,10 @@ type Manifest struct {
 	UpdatedAt     time.Time      `json:"updated_at"`
 	Segments      []SegmentInfo  `json:"segments"`
 	Trimmed       []TrimmedRange `json:"trimmed,omitempty"`
+	// Checkpoint is the optional meta/TSO high-water and range-map record.
+	// It is additive: archives written before checkpoints existed still load,
+	// but a planner has no declarative safe high-water for them.
+	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
 }
 
 // Validate checks the manifest's own framing, ordering, per-range
@@ -292,6 +296,11 @@ func (m *Manifest) Validate() error {
 	}
 	if m.UpdatedAt.Before(m.CreatedAt) {
 		return fmt.Errorf("%w: updated_at precedes created_at", ErrManifest)
+	}
+	if m.Checkpoint != nil {
+		if err := m.Checkpoint.Validate(); err != nil {
+			return fmt.Errorf("%w: %w", ErrManifest, err)
+		}
 	}
 
 	trimmed := make(map[uint64]TrimmedRange, len(m.Trimmed))
@@ -377,6 +386,7 @@ func (m *Manifest) Clone() *Manifest {
 	out := *m
 	out.Segments = append([]SegmentInfo(nil), m.Segments...)
 	out.Trimmed = append([]TrimmedRange(nil), m.Trimmed...)
+	out.Checkpoint = m.Checkpoint.Clone()
 	return &out
 }
 

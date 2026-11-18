@@ -26,6 +26,7 @@ import (
 	"distributed-db/internal/raft"
 	"distributed-db/internal/raftgrpc"
 	"distributed-db/internal/rbac"
+	"distributed-db/internal/version"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -74,13 +75,31 @@ type Config struct {
 
 	// AuditLogPath enables append-only JSON Lines audit of protected RPC
 	// attempts at that path (mode 0600, parent directory created if needed).
-	// There is no built-in rotation; rotate externally. The path requires at
-	// least one configured credential.
+	// The path requires at least one configured credential. Records never
+	// contain a token.
 	AuditLogPath string
 
 	// AuditLogSync fsyncs the audit file after every record. Audit write
-	// failures are logged but do not fail the RPC.
+	// failures are logged but do not fail the RPC unless AuditRequired is set.
 	AuditLogSync bool
+
+	// AuditLogMaxBytes enables size-based rotation of the audit file at that
+	// threshold. Zero (the default) disables built-in rotation; operators
+	// rotate externally in that mode. When set, the active file is renamed to
+	// "<AuditLogPath>.1" and older backups shift to .2, .3, ... up to
+	// AuditLogMaxBackups.
+	AuditLogMaxBytes int64
+
+	// AuditLogMaxBackups is the number of rotated audit files to retain. Zero
+	// discards the rotated file. It is ignored when AuditLogMaxBytes is zero
+	// and New rejects a positive value with rotation disabled.
+	AuditLogMaxBackups int
+
+	// AuditRequired makes protected meta admin RPCs fail closed when the audit
+	// sink cannot record the attempt or its outcome: the RPC is rejected with
+	// codes.Unavailable instead of running unaudited. The default (false)
+	// keeps best-effort audit. It requires AuditLogPath.
+	AuditRequired bool
 
 	// Replicated enables the Raft meta group. ID defaults to Addr, Peers are
 	// the other meta gRPC addresses, DataDir holds the Raft WAL/snapshots.
@@ -109,6 +128,8 @@ type Config struct {
 
 // Server is a gRPC MetaService backed by meta.Cluster, optionally replicated.
 type Server struct {
+	// protocolRegistry records negotiated peer protocol versions.
+	protocolRegistry *version.Registry
 	pbv2.UnimplementedMetaServiceServer
 
 	cfg     Config
@@ -155,6 +176,13 @@ type Server struct {
 	// tsMu serializes TSO reservations so two proposals cannot reserve the
 	// same timestamp on one leader.
 	tsMu sync.Mutex
+
+	// leaderMu guards the best-effort range-leader refresh throttle. Leader
+	// hints are advisory: UpdateLeader/RefreshLeader mutate this server's
+	// range map locally, while hints included in a SetRanges command are
+	// replicated with the map. Hints are never used for safety decisions.
+	leaderMu          sync.Mutex
+	lastLeaderRefresh time.Time
 }
 
 // autoSplitLoop is the cancel handle for one StartAutoSplit goroutine.
@@ -261,7 +289,14 @@ func (s *Server) Start(ctx context.Context) error {
 	// installed even on plaintext listeners, and a no-op when no credential is
 	// configured. Verification of an mTLS CN still requires the listener's
 	// client CA.
-	serverOpts = append(serverOpts, grpc.UnaryInterceptor(newMetaAdminInterceptor(s.authz, s.auditLog)))
+	protoReg := version.NewRegistry()
+	protoHandshake := version.NewServerHandshakeWithVersion(protoReg, version.Current, version.CurrentFeatures, s.cfg.Logger)
+	serverOpts = append(serverOpts,
+		grpc.ChainUnaryInterceptor(newMetaAdminInterceptor(s.authz, s.auditLog, s.cfg.AuditRequired)),
+		grpc.ChainUnaryInterceptor(protoHandshake.Unary()),
+		grpc.ChainStreamInterceptor(protoHandshake.Stream()),
+	)
+	s.protocolRegistry = protoReg
 	s.grpc = grpc.NewServer(serverOpts...)
 	pbv2.RegisterMetaServiceServer(s.grpc, s)
 	if s.cfg.Replicated {
@@ -286,7 +321,8 @@ func (s *Server) Start(ctx context.Context) error {
 	s.log.Info("meta server started",
 		"addr", lis.Addr().String(), "replicated", s.cfg.Replicated,
 		"tls", s.cfg.TLS.Enabled(), "mtls", s.cfg.TLS.Server.ClientCAFile != "",
-		"admin_auth", s.authz.Enabled(), "admin_audit", s.auditLog != nil)
+		"admin_auth", s.authz.Enabled(), "admin_audit", s.auditLog != nil,
+		"admin_audit_required", s.cfg.AuditRequired, "admin_audit_rotate_bytes", s.cfg.AuditLogMaxBytes)
 
 	go func() {
 		<-ctx.Done()
@@ -451,11 +487,15 @@ func (s *Server) GetRange(ctx context.Context, req *pbv2.GetRangeRequest) (*pbv2
 	return rangeInfo(r), nil
 }
 
-// ListRanges implements pbv2.MetaServiceServer.
+// ListRanges implements pbv2.MetaServiceServer. Before returning, it performs
+// a throttled, best-effort refresh of leader hints for ranges whose hint is
+// missing or stale, so kvctl can show a truthful LEADER instead of an empty
+// column. A range without a reachable leader remains unknown (empty).
 func (s *Server) ListRanges(ctx context.Context, _ *pbv2.ListRangesRequest) (*pbv2.ListRangesResponse, error) {
 	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
+	s.maybeRefreshRangeLeaders(ctx)
 	rows := s.cluster.Snapshot()
 	out := make([]*pbv2.RangeInfo, 0, len(rows))
 	for i := range rows {

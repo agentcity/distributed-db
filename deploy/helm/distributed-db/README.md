@@ -74,6 +74,14 @@ target never stores credentials. `/app/db` is the legacy v1 binary and remains
 the image's default `ENTRYPOINT` for `docker-compose.yml` compatibility; chart
 pods override the command.
 
+A `v*` git tag triggers `.github/workflows/release.yml`. That workflow runs the
+local release dry-run, builds `linux/amd64` and `linux/arm64` with Buildx, and
+pushes `ghcr.io/<owner>/<repo>:<tag>` using the short-lived `GITHUB_TOKEN`.
+Buildx attaches SBOM and provenance attestations to the image. The workflow
+also lints and packages this chart and attaches the `.tgz` and the image digest
+to the GitHub release. It does not deploy to a cluster. No release has been
+executed as part of this chart's validation.
+
 ## Install
 
 ```bash
@@ -162,14 +170,25 @@ The chart and image are checked in CI-style with:
 
 ```bash
 ./scripts/validate-release.sh          # shell, Helm, YAML; set WITH_IMAGE=1 to build
+./scripts/verify-release.sh            # release dry-run; prints the Docker command, never pushes
 make helm-lint
 make image IMAGE_REPOSITORY=distributed-db IMAGE_TAG=0.1.0
 ```
 
+`values.schema.json` validates the critical values before templates render:
+image repository/tag (an unpinned `latest` tag is rejected), meta/KV replica
+counts, TLS/mTLS and Secret names/keys, the admin-token and pgSRV auth Secret
+references, and bootstrap integer/timeout ranges. It contains references only;
+it defines no default passwords, tokens, or certificates.
+
 The validation script renders the default and bootstrap-enabled variants and
 parses every document as YAML. It skips Helm only if Helm is not installed
-(pass `REQUIRE_HELM=1` to make that fatal). Schema validation remains the
-operator's gate; for example:
+(pass `REQUIRE_HELM=1` to make that fatal). `verify-release.sh` additionally
+checks the release workflow, the multi-arch build command in dry-run mode, the
+Dockerfile and chart files, and that the values schema rejects invalid input.
+It also skips Helm when it is unavailable.
+
+Kubernetes API schema validation remains the operator's gate; for example:
 
 ```bash
 helm template ddb deploy/helm/distributed-db --namespace distributed-db | \

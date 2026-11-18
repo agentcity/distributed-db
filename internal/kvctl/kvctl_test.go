@@ -477,10 +477,10 @@ func TestRangesTableStableOrder(t *testing.T) {
 	if code != 0 || errOut != "" {
 		t.Fatalf("ranges = code %d err %q", code, errOut)
 	}
-	want := "ID\tSTART\tEND\tLEADER\tREPLICAS\tVERSION\n" +
-		"1\t\tm\tn1\tn1,n2\t2\n" +
-		"2\tm\ts\tn1\tn1,n2,n3\t3\n" +
-		"3\ts\t\tn2\tn2\t4\n"
+	want := "ID\tSTART\tEND\tLEADER\tLEADER_KNOWN\tREPLICAS\tLIVE_VOTERS\tVERSION\tSTALE\n" +
+		"1\t\tm\tn1\tyes\tn1,n2\t-\t2\tno\n" +
+		"2\tm\ts\tn1\tyes\tn1,n2,n3\t-\t3\tno\n" +
+		"3\ts\t\tn2\tyes\tn2\t-\t4\tno\n"
 	if out != want {
 		t.Fatalf("ranges table =\n%q\nwant\n%q", out, want)
 	}
@@ -498,9 +498,21 @@ func TestRangesJSON(t *testing.T) {
 		t.Fatalf("json: %v (%q)", err, out)
 	}
 	want := []rangeJSON{
-		{ID: 1, Start: "", End: "m", Leader: "n1", Replicas: []string{"n1", "n2"}, Version: 2},
-		{ID: 2, Start: "m", End: "s", Leader: "n1", Replicas: []string{"n1", "n2", "n3"}, Version: 3},
-		{ID: 3, Start: "s", End: "", Leader: "n2", Replicas: []string{"n2"}, Version: 4},
+		{
+			ID: 1, Start: "", End: "m", Leader: "n1", LeaderKnown: true,
+			Replicas: []string{"n1", "n2"}, ReplicaCount: 2, LiveVoters: []string{},
+			Version: 2, Epoch: 2,
+		},
+		{
+			ID: 2, Start: "m", End: "s", Leader: "n1", LeaderKnown: true,
+			Replicas: []string{"n1", "n2", "n3"}, ReplicaCount: 3, LiveVoters: []string{},
+			Version: 3, Epoch: 3,
+		},
+		{
+			ID: 3, Start: "s", End: "", Leader: "n2", LeaderKnown: true,
+			Replicas: []string{"n2"}, ReplicaCount: 1, LiveVoters: []string{},
+			Version: 4, Epoch: 4,
+		},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ranges json = %#v, want %#v", got, want)
@@ -514,12 +526,137 @@ func TestRangesJSONUsesEmptyReplicaArray(t *testing.T) {
 	if !strings.Contains(out, `"replicas":[]`) {
 		t.Fatalf("replicas should encode as [], got %q", out)
 	}
+	if !strings.Contains(out, `"live_voters":[]`) {
+		t.Fatalf("live_voters should encode as [], got %q", out)
+	}
+}
+
+func TestRangesHealthJSONAndTable(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{
+		{
+			ID: 1, End: []byte("m"), Leader: "n1", LeaderKnown: true,
+			Replicas: []string{"n1", "n2", "n3"}, ReplicaCount: 3,
+			LiveVoters: []string{"n1", "n2"}, Version: 5, Epoch: 5,
+		},
+		{
+			ID: 2, Start: []byte("m"), Leader: "n2", LeaderKnown: true,
+			Replicas: []string{"n2", "n3"}, ReplicaCount: 2,
+			LiveVoters: []string{"n3"}, Version: 6, Epoch: 6, Stale: true,
+		},
+	}
+
+	code, out, errOut := runCLI(t, f, "", "-meta", "m1", "ranges")
+	if code != 0 {
+		t.Fatalf("ranges = code %d err %q", code, errOut)
+	}
+	wantTable := "ID\tSTART\tEND\tLEADER\tLEADER_KNOWN\tREPLICAS\tLIVE_VOTERS\tVERSION\tSTALE\n" +
+		"1\t\tm\tn1\tyes\tn1,n2,n3\tn1,n2\t5\tno\n" +
+		"2\tm\t\tn2\tyes\tn2,n3\tn3\t6\tyes\n"
+	if out != wantTable {
+		t.Fatalf("ranges health table =\n%q\nwant\n%q", out, wantTable)
+	}
+
+	code, out, _ = runCLI(t, f, "", "-format", "json", "ranges")
+	if code != 0 {
+		t.Fatalf("ranges json code = %d", code)
+	}
+	var got []rangeJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json: %v (%q)", err, out)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ranges = %+v", got)
+	}
+	if got[0].ReplicaCount != 3 || !got[0].LeaderKnown || got[0].Stale ||
+		got[0].Epoch != 5 || len(got[0].LiveVoters) != 2 {
+		t.Fatalf("range 1 health = %+v", got[0])
+	}
+	if got[1].ReplicaCount != 2 || !got[1].LeaderKnown || !got[1].Stale ||
+		got[1].Epoch != 6 || len(got[1].LiveVoters) != 1 {
+		t.Fatalf("range 2 health = %+v", got[1])
+	}
+}
+
+func TestRangesUnknownLeaderNotFaked(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{ID: 1, Replicas: []string{"n1"}, Version: 3}}
+
+	code, out, _ := runCLI(t, f, "", "-format", "json", "ranges")
+	if code != 0 {
+		t.Fatalf("ranges json code = %d", code)
+	}
+	var got []rangeJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json: %v (%q)", err, out)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ranges = %+v", got)
+	}
+	if got[0].Leader != "" || got[0].LeaderKnown || got[0].Stale {
+		t.Fatalf("unknown leader fabricated: %+v", got[0])
+	}
+	if got[0].ReplicaCount != 1 || got[0].Epoch != 3 {
+		t.Fatalf("health = %+v", got[0])
+	}
+
+	code, out, _ = runCLI(t, f, "", "ranges")
+	if code != 0 {
+		t.Fatalf("ranges table code = %d", code)
+	}
+	if !strings.Contains(out, "1\t\t\t-\tno\tn1\t-\t3\tno") {
+		t.Fatalf("unknown leader table row = %q", out)
+	}
+}
+
+// TestRangesJSONBackwardCompatible proves the pre-health JSON shape is still
+// emittable and decodable: every original field keeps its name and type, and
+// the new fields are additive.
+func TestRangesJSONBackwardCompatible(t *testing.T) {
+	f := newFake()
+	f.ranges = []RangeInfo{{
+		ID: 1, End: []byte("m"), Leader: "n1",
+		Replicas: []string{"n1", "n2"}, Version: 2,
+	}}
+	_, out, _ := runCLI(t, f, "", "-format", "json", "ranges")
+
+	var legacy []struct {
+		ID       uint64   `json:"id"`
+		Start    string   `json:"start"`
+		End      string   `json:"end"`
+		Leader   string   `json:"leader"`
+		Replicas []string `json:"replicas"`
+		Version  uint64   `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(out), &legacy); err != nil {
+		t.Fatalf("legacy decode: %v (%q)", err, out)
+	}
+	want := []struct {
+		ID       uint64   `json:"id"`
+		Start    string   `json:"start"`
+		End      string   `json:"end"`
+		Leader   string   `json:"leader"`
+		Replicas []string `json:"replicas"`
+		Version  uint64   `json:"version"`
+	}{
+		{ID: 1, Start: "", End: "m", Leader: "n1", Replicas: []string{"n1", "n2"}, Version: 2},
+	}
+	if !reflect.DeepEqual(legacy, want) {
+		t.Fatalf("legacy fields = %#v, want %#v", legacy, want)
+	}
+	for _, key := range []string{
+		`"leader_known":`, `"replica_count":`, `"live_voters":`, `"epoch":`, `"stale":`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Fatalf("health key %s missing from %q", key, out)
+		}
+	}
 }
 
 func TestRangesEmpty(t *testing.T) {
 	f := newFake()
 	code, out, _ := runCLI(t, f, "", "ranges")
-	if code != 0 || out != "ID\tSTART\tEND\tLEADER\tREPLICAS\tVERSION\n" {
+	if code != 0 || out != "ID\tSTART\tEND\tLEADER\tLEADER_KNOWN\tREPLICAS\tLIVE_VOTERS\tVERSION\tSTALE\n" {
 		t.Fatalf("empty table = code %d out %q", code, out)
 	}
 	code, out, _ = runCLI(t, f, "", "-format", "json", "ranges")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,7 +219,7 @@ func TestKVAuditRecordsHandlerError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPolicy: %v", err)
 	}
-	interceptor := newKVAdminInterceptor(policy, auditLog)
+	interceptor := newKVAdminInterceptor(policy, auditLog, false)
 	ctx := metadata.NewIncomingContext(context.Background(),
 		metadata.Pairs("authorization", "Bearer token"))
 	_, err = interceptor(ctx, &pbv2.UpdateRangeEpochRequest{RangeId: 3, Epoch: 1},
@@ -277,6 +278,39 @@ func TestKVAdminRBACConfigValidation(t *testing.T) {
 			},
 			want: "AuditLogPath requires",
 		},
+		{
+			name: "audit required without path",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditRequired = true
+			},
+			want: "AuditRequired requires AuditLogPath",
+		},
+		{
+			name: "negative audit max bytes",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditLogMaxBytes = -1
+			},
+			want: "AuditLogMaxBytes must not be negative",
+		},
+		{
+			name: "negative audit max backups",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditLogMaxBytes = 100
+				cfg.AuditLogMaxBackups = -1
+			},
+			want: "AuditLogMaxBackups must not be negative",
+		},
+		{
+			name: "backups without rotation",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditLogMaxBackups = 2
+			},
+			want: "AuditLogMaxBackups requires AuditLogMaxBytes",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -311,5 +345,119 @@ func TestKVAdminEmptyConfigRemainsPassThrough(t *testing.T) {
 	resp, err := client.UpdateRangeEpoch(ctx, &pbv2.UpdateRangeEpochRequest{RangeId: 1, Epoch: 3})
 	if err != nil || !resp.GetSuccess() {
 		t.Fatalf("UpdateRangeEpoch with empty config = %v %+v, want success", err, resp)
+	}
+}
+
+// kvFailingAuditWriter simulates a full or unwritable audit sink.
+type kvFailingAuditWriter struct{}
+
+func (kvFailingAuditWriter) Write([]byte) (int, error) { return 0, errors.New("audit disk full") }
+
+func TestKVAuditRequiredFailsClosedOnWriteError(t *testing.T) {
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: map[string]string{"token": "admin"}})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	auditLog := audit.NewWriter(kvFailingAuditWriter{}, audit.Options{})
+	interceptor := newKVAdminInterceptor(policy, auditLog, true)
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer token"))
+
+	called := false
+	_, err = interceptor(ctx, &pbv2.UpdateRangeEpochRequest{RangeId: 1, Epoch: 1},
+		&grpc.UnaryServerInfo{FullMethod: pbv2.KVService_UpdateRangeEpoch_FullMethodName},
+		func(context.Context, any) (any, error) {
+			called = true
+			return &pbv2.UpdateRangeEpochResponse{Success: true}, nil
+		})
+	if !called {
+		t.Fatal("handler was not called; the post-handler audit check should run")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("required audit error = %v, want Unavailable", err)
+	}
+	if strings.Contains(err.Error(), "audit disk full") || strings.Contains(err.Error(), "token") {
+		t.Fatalf("fail-closed error leaked audit internals: %v", err)
+	}
+}
+
+func TestKVAuditBestEffortStillSucceedsOnWriteError(t *testing.T) {
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: map[string]string{"token": "admin"}})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	auditLog := audit.NewWriter(kvFailingAuditWriter{}, audit.Options{})
+	interceptor := newKVAdminInterceptor(policy, auditLog, false)
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer token"))
+
+	resp, err := interceptor(ctx, &pbv2.UpdateRangeEpochRequest{RangeId: 1, Epoch: 1},
+		&grpc.UnaryServerInfo{FullMethod: pbv2.KVService_UpdateRangeEpoch_FullMethodName},
+		func(context.Context, any) (any, error) {
+			return &pbv2.UpdateRangeEpochResponse{Success: true}, nil
+		})
+	if err != nil {
+		t.Fatalf("best-effort audit rejected the RPC: %v", err)
+	}
+	if !resp.(*pbv2.UpdateRangeEpochResponse).GetSuccess() {
+		t.Fatalf("best-effort response = %+v, want success", resp)
+	}
+}
+
+func TestKVAuditRequiredPreflightRejectsBrokenSink(t *testing.T) {
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: map[string]string{"token": "admin"}})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	auditLog, err := audit.Open(filepath.Join(t.TempDir(), "audit.jsonl"), audit.Options{})
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	if err := auditLog.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	interceptor := newKVAdminInterceptor(policy, auditLog, true)
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer token"))
+
+	called := false
+	_, err = interceptor(ctx, &pbv2.UpdateRangeEpochRequest{RangeId: 1, Epoch: 1},
+		&grpc.UnaryServerInfo{FullMethod: pbv2.KVService_UpdateRangeEpoch_FullMethodName},
+		func(context.Context, any) (any, error) {
+			called = true
+			return &pbv2.UpdateRangeEpochResponse{Success: true}, nil
+		})
+	if called {
+		t.Fatal("handler ran with a broken fail-closed audit sink")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("preflight error = %v, want Unavailable", err)
+	}
+}
+
+func TestKVOpenAdminAuditPropagatesRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kv-rotate-audit.jsonl")
+	l, err := openKVAdminAudit(Config{
+		AdminToken:         "rotate-token",
+		AuditLogPath:       path,
+		AuditLogMaxBytes:   64,
+		AuditLogMaxBackups: 2,
+	})
+	if err != nil {
+		t.Fatalf("openKVAdminAudit: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		if err := l.Record(audit.Event{
+			Principal: "operator", Role: "operator", Method: "/m",
+			Result: audit.ResultSuccess, ErrorClass: audit.ErrorClassNone,
+		}); err != nil {
+			t.Fatalf("Record %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("openKVAdminAudit did not enable rotation: %v", err)
 	}
 }

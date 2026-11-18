@@ -129,6 +129,14 @@ func (s *Server) splitRangeLocked(ctx context.Context, req *pbv2.MetaSplitRangeR
 		left := r
 		left.End = cloneBytes(splitKey)
 		left.Version = old.Version + 1
+		// The left range keeps the original Raft group; re-stamp a known
+		// leader hint at the new version. The right range is a fresh group,
+		// so its leader is unknown and must stay empty.
+		if left.Leader != "" {
+			left.LeaderEpoch = left.Version
+		} else {
+			left.LeaderEpoch = 0
+		}
 		right := meta.Range{
 			ID:       newID,
 			Start:    cloneBytes(splitKey),
@@ -241,6 +249,14 @@ func (s *Server) mergeRangesLocked(ctx context.Context, req *pbv2.MetaMergeRange
 			merged := r
 			merged.End = cloneBytes(right.End)
 			merged.Version = left.Version + 1
+			// The left range's group absorbs the right one; a known left
+			// leader stays meaningful at the merged version.
+			if merged.Leader != "" && containsAddr(merged.Replicas, merged.Leader) {
+				merged.LeaderEpoch = merged.Version
+			} else {
+				merged.Leader = ""
+				merged.LeaderEpoch = 0
+			}
 			next = append(next, merged)
 		case rightID:
 			// Dropped: absorbed into left.

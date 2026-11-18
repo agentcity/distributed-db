@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -309,5 +310,238 @@ func TestRecordNeverContainsCallerToken(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), token) {
 		t.Fatalf("audit record leaked a token: %s", buf.String())
+	}
+}
+
+// rotationEvent returns an event whose JSON encoding is a stable size, so
+// rotation tests can size MaxBytes deterministically.
+func rotationEvent(principal string) Event {
+	return Event{
+		Time:       fixedTime,
+		Principal:  principal,
+		Role:       "operator",
+		Method:     "/m",
+		Result:     ResultSuccess,
+		ErrorClass: ErrorClassNone,
+	}
+}
+
+func rotationLineLen(t *testing.T) int {
+	t.Helper()
+	line, err := json.Marshal(rotationEvent("p0"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return len(line) + 1 // newline
+}
+
+func readAuditLines(t *testing.T, paths ...string) []Event {
+	t.Helper()
+	var out []Event
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+			if line == "" {
+				continue
+			}
+			var e Event
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				t.Fatalf("line in %s is not JSON: %v\n%s", path, err, line)
+			}
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestRotationKeepsRecordsAcrossBackups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lineLen := rotationLineLen(t)
+	l, err := Open(path, Options{
+		Sync:       true,
+		Clock:      fixedClock,
+		MaxBytes:   int64(lineLen) + 1, // exactly one record per file
+		MaxBackups: 10,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	const records = 6
+	for i := 0; i < records; i++ {
+		if err := l.Record(rotationEvent("p" + strconv.Itoa(i))); err != nil {
+			t.Fatalf("Record %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	paths := []string{path}
+	for i := 1; i <= records; i++ {
+		paths = append(paths, path+"."+strconv.Itoa(i))
+	}
+	events := readAuditLines(t, paths...)
+	if len(events) != records {
+		t.Fatalf("retained records = %d, want %d", len(events), records)
+	}
+	seen := make(map[string]bool, records)
+	for _, e := range events {
+		seen[e.Principal] = true
+	}
+	for i := 0; i < records; i++ {
+		if p := "p" + strconv.Itoa(i); !seen[p] {
+			t.Fatalf("rotated files lost record %q; events=%+v", p, events)
+		}
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("first backup missing after rotation: %v", err)
+	}
+}
+
+func TestRotationCapsBackupsAndKeepsNewest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lineLen := rotationLineLen(t)
+	l, err := Open(path, Options{
+		Clock:      fixedClock,
+		MaxBytes:   int64(lineLen) + 1,
+		MaxBackups: 2,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		if err := l.Record(rotationEvent("p" + strconv.Itoa(i))); err != nil {
+			t.Fatalf("Record %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	events := readAuditLines(t, path, path+".1", path+".2")
+	if len(events) != 3 {
+		t.Fatalf("retained records = %d, want 3 (active + 2 backups): %+v", len(events), events)
+	}
+	want := map[string]bool{"p3": true, "p4": true, "p5": true}
+	for _, e := range events {
+		if !want[e.Principal] {
+			t.Fatalf("retained an old record %q, want only p3..p5: %+v", e.Principal, events)
+		}
+	}
+	if _, err := os.Stat(path + ".3"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup beyond MaxBackups exists: err=%v", err)
+	}
+}
+
+func TestRotationZeroBackupsKeepsOnlyActiveFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lineLen := rotationLineLen(t)
+	l, err := Open(path, Options{Clock: fixedClock, MaxBytes: int64(lineLen) + 1})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := l.Record(rotationEvent("p" + strconv.Itoa(i))); err != nil {
+			t.Fatalf("Record %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	events := readAuditLines(t, path)
+	if len(events) != 1 || events[0].Principal != "p2" {
+		t.Fatalf("active records = %+v, want only p2", events)
+	}
+	if _, err := os.Stat(path + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("MaxBackups=0 kept a backup file: err=%v", err)
+	}
+}
+
+func TestOpenRejectsNegativeRotationOptions(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Open(filepath.Join(dir, "a.jsonl"), Options{MaxBytes: -1}); err == nil {
+		t.Fatal("Open accepted negative MaxBytes")
+	}
+	if _, err := Open(filepath.Join(dir, "b.jsonl"), Options{MaxBytes: 1, MaxBackups: -1}); err == nil {
+		t.Fatal("Open accepted negative MaxBackups")
+	}
+}
+
+func TestNewWriterIgnoresRotationOptions(t *testing.T) {
+	var buf bytes.Buffer
+	l := NewWriter(&buf, Options{MaxBytes: 1, MaxBackups: 1, Clock: fixedClock})
+	for i := 0; i < 5; i++ {
+		if err := l.Record(rotationEvent("p0")); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	if got := strings.Count(buf.String(), "\n"); got != 5 {
+		t.Fatalf("NewWriter rotated a non-file sink: %d lines, want 5", got)
+	}
+}
+
+func TestHealthyTracksClosedLogger(t *testing.T) {
+	l, err := Open(filepath.Join(t.TempDir(), "audit.jsonl"), Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := l.Healthy(); err != nil {
+		t.Fatalf("Healthy open logger = %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := l.Healthy(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Healthy closed logger = %v, want ErrClosed", err)
+	}
+	var nilLogger *Logger
+	if err := nilLogger.Healthy(); err != nil {
+		t.Fatalf("nil Healthy = %v", err)
+	}
+}
+
+func TestRotationReopenFailureMarksLoggerBroken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	var reported error
+	l, err := Open(path, Options{
+		Clock:      fixedClock,
+		MaxBytes:   1,
+		MaxBackups: 1,
+		OnError:    func(err error) { reported = err },
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := l.Record(rotationEvent("p0")); err != nil {
+		t.Fatalf("first Record: %v", err)
+	}
+	// Point the logger at an unopenable path so the next rotation close
+	// succeeds but the reopen fails.
+	l.mu.Lock()
+	l.path = filepath.Join(t.TempDir(), "missing", "audit.jsonl")
+	l.mu.Unlock()
+
+	if err := l.Record(rotationEvent("p1")); err == nil {
+		t.Fatal("Record succeeded after the rotated file could not be reopened")
+	}
+	if reported == nil {
+		t.Fatal("OnError was not called for the rotation failure")
+	}
+	if err := l.Healthy(); err == nil {
+		t.Fatal("Healthy reports a broken logger as healthy")
+	}
+	// Every later record is rejected with the latched error; audit must not
+	// silently resume on a different file.
+	if err := l.Record(rotationEvent("p2")); err == nil {
+		t.Fatal("Record succeeded after the logger was marked broken")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

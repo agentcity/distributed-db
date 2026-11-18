@@ -3,6 +3,17 @@
 //	kv2 -mode=meta -addr=:9090
 //	kv2 -mode=node -id=127.0.0.1:7001 -raft-addr=127.0.0.1:7001 \
 //	    -data-dir=./data/n1 -peers=127.0.0.1:7002,127.0.0.1:7003
+//
+// Admin RBAC and audit are configured on the same command in both modes:
+//
+//	kv2 -mode=node ... \
+//	    -admin-token-roles admin=$ADMIN_TOKEN,operator=$OPERATOR_TOKEN \
+//	    -admin-mtls-roles ops-client=operator -tls-client-ca=clients.pem \
+//	    -audit-log=/var/log/kv2/admin.jsonl -audit-log-sync -audit-required
+//
+// Role maps may also come from -admin-token-roles-file or the KV2_* environment
+// variables documented by -help. Tokens are never written to help output,
+// startup logs or audit records.
 package main
 
 import (
@@ -31,7 +42,7 @@ func main() {
 	metaID := flag.String("meta-id", "", "meta node id, defaults to -addr")
 	metaPeers := flag.String("meta-peers", "", "comma-separated other meta gRPC addresses")
 	metaDataDir := flag.String("meta-data-dir", "./data/meta", "meta Raft WAL/snapshot directory")
-	adminToken := registerAdminTokenFlag(flag.CommandLine)
+	admin := registerAdminFlags(flag.CommandLine)
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
 	durability := flag.String("durability", kvserver.DurabilitySync,
 		`state-machine durability for -mode=node: "sync" (fsync every batch; production default) `+
@@ -43,9 +54,18 @@ func main() {
 	tlsCA := flag.String("tls-ca", "", "PEM CA bundle used to verify KV/meta peers (default: system roots)")
 	tlsServerName := flag.String("tls-server-name", "", "expected server name for peer certificate verification")
 	flag.Parse()
+	if err := admin.resolveEnv(flag.CommandLine); err != nil {
+		fatal(err)
+	}
 
 	log := newLogger(*logLevel)
 	tlsCfg, err := tlsOptions(*tlsCert, *tlsKey, *tlsClientCA, *tlsCA, *tlsServerName)
+	if err != nil {
+		fatal(err)
+	}
+	// Validate roles, mTLS/audit combinations and rotation settings before any
+	// listener or file is opened.
+	adminCfg, err := admin.build(tlsCfg)
 	if err != nil {
 		fatal(err)
 	}
@@ -56,7 +76,7 @@ func main() {
 		if metaIDVal == "" {
 			metaIDVal = *addr
 		}
-		metaCfg := metaServerConfig(*addr, metaIDVal, *metaDataDir, splitList(*metaPeers), log, tlsCfg, *adminToken)
+		metaCfg := metaServerConfig(*addr, metaIDVal, *metaDataDir, splitList(*metaPeers), log, tlsCfg, adminCfg)
 		srv, err := metaserver.New(metaCfg)
 		if err != nil {
 			fatal(err)
@@ -67,7 +87,9 @@ func main() {
 			fatal(err)
 		}
 		log.Info("kv2 meta started", "addr", srv.Addr(), "tls", tlsCfg.Enabled(),
-			"mtls", *tlsClientCA != "", "admin_auth", *adminToken != "")
+			"mtls", *tlsClientCA != "", "admin_auth", adminCfg.authEnabled(),
+			"admin_token_roles", len(adminCfg.tokenRoles), "admin_mtls_roles", len(adminCfg.mtlsRoles),
+			"admin_audit", adminCfg.auditLog != "", "admin_audit_required", adminCfg.auditRequired)
 		<-ctx.Done()
 		_ = srv.Stop()
 
@@ -79,16 +101,8 @@ func main() {
 			log.Warn("durability=fast: state-machine batches are not fsynced; " +
 				"not production-safe until crash tests pass")
 		}
-		srv, err := kvserver.New(kvserver.Config{
-			ID:             *id,
-			RaftAddr:       *raftAddr,
-			DataDir:        *dataDir,
-			Peers:          splitList(*peers),
-			DurabilityMode: *durability,
-			Logger:         log,
-			TLS:            tlsCfg,
-			AdminToken:     *adminToken,
-		})
+		srv, err := kvserver.New(nodeServerConfig(*id, *raftAddr, *dataDir, *durability,
+			splitList(*peers), log, tlsCfg, adminCfg))
 		if err != nil {
 			fatal(err)
 		}
@@ -98,7 +112,10 @@ func main() {
 			fatal(err)
 		}
 		log.Info("kv2 node started", "id", *id, "addr", srv.Addr(),
-			"tls", tlsCfg.Enabled(), "mtls", *tlsClientCA != "")
+			"tls", tlsCfg.Enabled(), "mtls", *tlsClientCA != "",
+			"admin_auth", adminCfg.authEnabled(),
+			"admin_token_roles", len(adminCfg.tokenRoles), "admin_mtls_roles", len(adminCfg.mtlsRoles),
+			"admin_audit", adminCfg.auditLog != "", "admin_audit_required", adminCfg.auditRequired)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -121,19 +138,51 @@ func main() {
 // auth, every node must use the same token.
 func registerAdminTokenFlag(fs *flag.FlagSet) *string {
 	return fs.String("admin-token", "",
-		"Bearer token for this server's admin RPCs "+
-			"(meta mode: SetRanges/SplitRange/MergeRanges and outbound KV admin fan-out; "+
-			"node mode: KV admin/membership RPCs); empty disables the check (development only)")
+		"admin bearer token for this server (env "+adminTokenEnv+"); "+
+			"meta mode: SetRanges/SplitRange/MergeRanges and the outbound KV admin fan-out; "+
+			"node mode: KV admin/membership RPCs; empty disables the check (development only); "+
+			"use -admin-token-roles for operator/read-only credentials")
+}
+
+// nodeServerConfig assembles the KV node configuration from flags. It is a
+// helper so tests can assert that the admin RBAC/audit flags are wired into
+// kvserver.Config without starting a listener or opening storage.
+func nodeServerConfig(id, raftAddr, dataDir, durability string, peers []string,
+	log *slog.Logger, tlsCfg grpctls.Options, admin adminConfig) kvserver.Config {
+	return kvserver.Config{
+		ID:                 id,
+		RaftAddr:           raftAddr,
+		DataDir:            dataDir,
+		Peers:              peers,
+		DurabilityMode:     durability,
+		Logger:             log,
+		TLS:                tlsCfg,
+		AdminToken:         admin.token,
+		AdminTokenRoles:    admin.tokenRoles,
+		AdminMTLSRoles:     admin.mtlsRoles,
+		AuditLogPath:       admin.auditLog,
+		AuditLogSync:       admin.auditSync,
+		AuditLogMaxBytes:   admin.auditMaxBytes,
+		AuditLogMaxBackups: admin.auditMaxBackups,
+		AuditRequired:      admin.auditRequired,
+	}
 }
 
 // metaServerConfig assembles the meta server configuration from flags. It is a
-// helper so tests can assert that -admin-token and the peer list are wired
-// into metaserver.Config without starting a listener.
-func metaServerConfig(addr, id, dataDir string, peers []string, log *slog.Logger, tlsCfg grpctls.Options, adminToken string) metaserver.Config {
+// helper so tests can assert that the admin RBAC/audit flags and the peer list
+// are wired into metaserver.Config without starting a listener.
+func metaServerConfig(addr, id, dataDir string, peers []string, log *slog.Logger, tlsCfg grpctls.Options, admin adminConfig) metaserver.Config {
 	cfg := metaserver.Config{
 		Addr: addr, ID: id, Peers: peers,
 		DataDir: dataDir, Logger: log, TLS: tlsCfg,
-		AdminToken: adminToken,
+		AdminToken:         admin.token,
+		AdminTokenRoles:    admin.tokenRoles,
+		AdminMTLSRoles:     admin.mtlsRoles,
+		AuditLogPath:       admin.auditLog,
+		AuditLogSync:       admin.auditSync,
+		AuditLogMaxBytes:   admin.auditMaxBytes,
+		AuditLogMaxBackups: admin.auditMaxBackups,
+		AuditRequired:      admin.auditRequired,
 	}
 	if len(cfg.Peers) > 0 {
 		cfg.Replicated = true

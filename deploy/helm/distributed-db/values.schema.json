@@ -1,0 +1,767 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "distributed-db Helm chart values",
+  "description": "Schema for the critical deployment and security-reference fields. It validates references to existing Secrets and rejects literal credential fields on the auth/TLS objects; it defines no default password, token or certificate.",
+  "type": "object",
+  "required": [
+    "clusterDomain",
+    "image",
+    "tls",
+    "auth",
+    "meta",
+    "kv",
+    "sqlsrv",
+    "pgsrv",
+    "bootstrap"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "clusterDomain": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+    },
+    "image": {
+      "type": "object",
+      "required": [
+        "repository",
+        "tag"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^\\s]+$"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+          "not": {
+            "enum": [
+              "latest"
+            ]
+          }
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        },
+        "pullSecrets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 253,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mtls",
+        "existingSecret",
+        "caKey",
+        "certKey",
+        "keyKey",
+        "mountPath",
+        "certManager"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mtls": {
+          "type": "boolean"
+        },
+        "existingSecret": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "caKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[-._a-zA-Z0-9]+$"
+        },
+        "certKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[-._a-zA-Z0-9]+$"
+        },
+        "keyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[-._a-zA-Z0-9]+$"
+        },
+        "mountPath": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 255,
+          "pattern": "^/[^\\s]+$"
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "issuerRef",
+            "duration",
+            "renewBefore",
+            "dnsNames"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "issuerRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "kind",
+                "group"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "kind": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "group": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "duration": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*(s|m|h)$"
+            },
+            "renewBefore": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*(s|m|h)$"
+            },
+            "dnsNames": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "enum": [
+                      true
+                    ]
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "issuerRef": {
+                    "properties": {
+                      "name": {
+                        "minLength": 1
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adminToken",
+        "pgsrv"
+      ],
+      "properties": {
+        "adminToken": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "existingSecret",
+            "key"
+          ],
+          "properties": {
+            "existingSecret": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[-._a-zA-Z0-9]+$"
+            }
+          }
+        },
+        "pgsrv": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "existingSecret",
+            "usernameKey",
+            "passwordKey"
+          ],
+          "properties": {
+            "existingSecret": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            },
+            "usernameKey": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[-._a-zA-Z0-9]+$"
+            },
+            "passwordKey": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[-._a-zA-Z0-9]+$"
+            }
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "replicaCount",
+        "port",
+        "adminToken"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "enum": [
+            3,
+            5
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "adminToken": {
+          "type": "object",
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "kv": {
+      "type": "object",
+      "required": [
+        "replicaCount",
+        "port",
+        "durability"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 5
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "durability": {
+          "type": "string",
+          "enum": [
+            "sync",
+            "fast"
+          ]
+        }
+      }
+    },
+    "sqlsrv": {
+      "type": "object",
+      "required": [
+        "replicaCount",
+        "port",
+        "auth"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "auth": {
+          "type": "object",
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "pgsrv": {
+      "type": "object",
+      "required": [
+        "replicaCount",
+        "port",
+        "metricsPort",
+        "auth"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "metricsPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "auth": {
+          "type": "object",
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "backoffLimit",
+        "activeDeadlineSeconds",
+        "ttlSecondsAfterFinished",
+        "waitTimeoutSeconds",
+        "waitIntervalSeconds",
+        "kvctlTimeout"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "backoffLimit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ttlSecondsAfterFinished": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "waitTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "waitIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "kvctlTimeout": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(s|m|h)$"
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "host",
+        "tls"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 253
+        },
+        "tls": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "secretName"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "secretName": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "enum": [
+                  true
+                ]
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "properties": {
+              "host": {
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "enum": [
+                  true
+                ]
+              },
+              "tls": {
+                "properties": {
+                  "enabled": {
+                    "enum": [
+                      true
+                    ]
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              }
+            },
+            "required": [
+              "enabled",
+              "tls"
+            ]
+          },
+          "then": {
+            "properties": {
+              "tls": {
+                "properties": {
+                  "secretName": {
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "enabled": {
+                "enum": [
+                  true
+                ]
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "tls"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "existingSecret": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "mtls": {
+                "enum": [
+                  true
+                ]
+              }
+            },
+            "required": [
+              "mtls"
+            ]
+          }
+        },
+        "required": [
+          "tls"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "enabled": {
+                "enum": [
+                  true
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "meta": {
+                "properties": {
+                  "adminToken": {
+                    "properties": {
+                      "enabled": {
+                        "enum": [
+                          true
+                        ]
+                      }
+                    },
+                    "required": [
+                      "enabled"
+                    ]
+                  }
+                },
+                "required": [
+                  "adminToken"
+                ]
+              }
+            },
+            "required": [
+              "meta"
+            ]
+          },
+          {
+            "properties": {
+              "sqlsrv": {
+                "properties": {
+                  "auth": {
+                    "properties": {
+                      "enabled": {
+                        "enum": [
+                          true
+                        ]
+                      }
+                    },
+                    "required": [
+                      "enabled"
+                    ]
+                  }
+                },
+                "required": [
+                  "auth"
+                ]
+              }
+            },
+            "required": [
+              "sqlsrv"
+            ]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "adminToken": {
+                "properties": {
+                  "existingSecret": {
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pgsrv": {
+            "properties": {
+              "auth": {
+                "properties": {
+                  "enabled": {
+                    "enum": [
+                      true
+                    ]
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              }
+            },
+            "required": [
+              "auth"
+            ]
+          }
+        },
+        "required": [
+          "pgsrv"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "enabled": {
+                "enum": [
+                  true
+                ]
+              }
+            }
+          },
+          "auth": {
+            "properties": {
+              "pgsrv": {
+                "properties": {
+                  "existingSecret": {
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "sqlsrv": {
+            "properties": {
+              "auth": {
+                "properties": {
+                  "enabled": {
+                    "enum": [
+                      true
+                    ]
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              }
+            },
+            "required": [
+              "auth"
+            ]
+          }
+        },
+        "required": [
+          "sqlsrv"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tls": {
+            "properties": {
+              "enabled": {
+                "enum": [
+                  true
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -31,7 +31,7 @@ func TestAdminTokenFlagDefaultsToEmpty(t *testing.T) {
 }
 
 func TestMetaServerConfigWiresAdminToken(t *testing.T) {
-	cfg := metaServerConfig(":9090", "meta-1", "./data/meta", nil, nil, grpctls.Options{}, "s3cret")
+	cfg := metaServerConfig(":9090", "meta-1", "./data/meta", nil, nil, grpctls.Options{}, adminConfig{token: "s3cret"})
 	if cfg.AdminToken != "s3cret" {
 		t.Fatalf("AdminToken = %q, want s3cret", cfg.AdminToken)
 	}
@@ -41,7 +41,7 @@ func TestMetaServerConfigWiresAdminToken(t *testing.T) {
 }
 
 func TestMetaServerConfigPeersEnableReplication(t *testing.T) {
-	cfg := metaServerConfig(":9090", "meta-1", "./data/meta", []string{"m2:9090"}, nil, grpctls.Options{}, "")
+	cfg := metaServerConfig(":9090", "meta-1", "./data/meta", []string{"m2:9090"}, nil, grpctls.Options{}, adminConfig{})
 	if !cfg.Replicated {
 		t.Fatal("peer list did not enable replicated mode")
 	}

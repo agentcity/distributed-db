@@ -22,6 +22,7 @@ var (
 // Handler is the receiving half of a Raft node.
 type Handler interface {
 	HandleRequestVote(ctx context.Context, req *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error)
+	HandlePreVote(ctx context.Context, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error)
 	HandleAppendEntries(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error)
 }
 
@@ -143,6 +144,8 @@ type transport struct {
 	from string
 }
 
+var _ raft.PreVoteTransport = (*transport)(nil)
+
 func (t *transport) RequestVote(ctx context.Context, peer string, req *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -155,6 +158,20 @@ func (t *transport) RequestVote(ctx context.Context, peer string, req *raft.Requ
 		return nil, err
 	}
 	return h.HandleRequestVote(ctx, req)
+}
+
+func (t *transport) PreVote(ctx context.Context, peer string, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	h, err := t.net.handler(t.from, peer)
+	if err != nil {
+		return nil, err
+	}
+	return h.HandlePreVote(ctx, req)
 }
 
 func (t *transport) AppendEntries(ctx context.Context, peer string, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {

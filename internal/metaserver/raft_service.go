@@ -26,6 +26,21 @@ func (r *raftService) node() (*raft.Node, error) {
 	return node, nil
 }
 
+func (r *raftService) PreVote(ctx context.Context, req *pbv2.PreVoteRequest) (*pbv2.PreVoteResponse, error) {
+	node, err := r.node()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := node.HandlePreVote(ctx, &raft.PreVoteRequest{
+		Term: req.GetTerm(), CandidateID: req.GetCandidateId(),
+		LastLogIndex: req.GetLastLogIndex(), LastLogTerm: req.GetLastLogTerm(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pbv2.PreVoteResponse{Term: resp.Term, VoteGranted: resp.VoteGranted}, nil
+}
+
 func (r *raftService) RequestVote(ctx context.Context, req *pbv2.RequestVoteRequest) (*pbv2.RequestVoteResponse, error) {
 	node, err := r.node()
 	if err != nil {

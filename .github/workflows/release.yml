@@ -1,0 +1,300 @@
+name: release
+
+# Release automation for a v* tag. It builds and pushes a multi-arch image to
+# GHCR, packages/lints the Helm chart, and attaches the chart archive and the
+# image digest to the GitHub release.
+#
+# This workflow is not a release itself: it only runs after a tag is pushed and
+# it never claims that the image index or chart was deployed to a cluster.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege at workflow level. The image job adds packages: write; the
+# release job adds contents: write. Every other job is read-only.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate tag and chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a v* release tag
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            echo "::error::release workflow must run from a tag, got '${GITHUB_REF_TYPE:-unset}'"
+            exit 1
+          fi
+          # Docker/GHCR tags cannot contain '+', so semver build metadata is
+          # rejected here rather than producing an invalid image reference.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::tag '$TAG' does not match v<major>.<minor>.<patch>[-prerelease]"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag '$TAG' is missing from the checkout"
+            exit 1
+          fi
+          if [[ "$(git rev-parse "$TAG^{commit}")" != "$(git rev-parse HEAD)" ]]; then
+            echo "::error::tag '$TAG' does not point at the checked-out commit"
+            exit 1
+          fi
+          version=${TAG#v}
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG (chart/image version $version)"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Local release dry-run
+        env:
+          REQUIRE_HELM: "1"
+        run: ./scripts/verify-release.sh
+
+      - name: Lint chart
+        env:
+          CHART_DIR: deploy/helm/distributed-db
+        run: |
+          set -euo pipefail
+          helm lint --strict "$CHART_DIR"
+          helm lint --strict "$CHART_DIR" --set bootstrap.enabled=true
+          helm lint --strict "$CHART_DIR" \
+            --set tls.enabled=false \
+            --set tls.mtls=false \
+            --set sqlsrv.auth.enabled=false \
+            --set pgsrv.auth.enabled=false \
+            --set meta.adminToken.enabled=false
+
+      - name: Package and render chart
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package deploy/helm/distributed-db \
+            --version "$VERSION" \
+            --app-version "$VERSION" \
+            --destination dist
+          chart_pkg=$(find dist -maxdepth 1 -name '*.tgz' -print -quit)
+          if [[ -z "$chart_pkg" ]]; then
+            echo "::error::helm package did not produce a .tgz"
+            exit 1
+          fi
+          helm show chart "$chart_pkg"
+          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          helm template distributed-db "$chart_pkg" --namespace distributed-db \
+            --set image.repository="$image_repo" \
+            --set image.tag="$TAG" > dist/rendered-release.yaml
+          helm template distributed-db "$chart_pkg" --namespace distributed-db \
+            --set bootstrap.enabled=true > dist/rendered-bootstrap.yaml
+          test -s dist/rendered-release.yaml
+          test -s dist/rendered-bootstrap.yaml
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chart
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: build and push multi-arch image
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The runtime stage runs apk for the target architecture, so arm64 needs
+      # QEMU even though Go cross-compiles without it.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # The only registry credential used here is the short-lived GITHUB_TOKEN.
+      # login-action masks it; no password is echoed or written to a file.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image reference
+        id: image
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          repo=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          if [[ -z "$repo" || -z "$TAG" ]]; then
+            echo "::error::could not derive a GHCR image reference"
+            exit 1
+          fi
+          echo "image=ghcr.io/${repo}:${TAG}" >> "$GITHUB_OUTPUT"
+
+      # Buildx writes SBOM and provenance attestations alongside the image
+      # index in GHCR; the release records the digest and platforms.
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          build-args: |
+            VERSION=${{ needs.validate.outputs.version }}
+            REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image digest and platforms
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::build-push-action returned no image digest"
+            exit 1
+          fi
+          case "$DIGEST" in
+            sha256:*) ;;
+            *)
+              echo "::error::image digest is not a sha256 digest: $DIGEST"
+              exit 1
+              ;;
+          esac
+          mkdir -p dist
+          docker buildx imagetools inspect "$IMAGE" | tee dist/image-inspect.txt
+          grep -Fq "$DIGEST" dist/image-inspect.txt
+          grep -q 'linux/amd64' dist/image-inspect.txt
+          grep -q 'linux/arm64' dist/image-inspect.txt
+          {
+            echo "image=$IMAGE"
+            echo "digest=$DIGEST"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "commit=${GITHUB_SHA}"
+            echo "platforms=linux/amd64,linux/arm64"
+            echo "provenance=buildx mode=max"
+            echo "sbom=buildx attestation"
+          } > dist/image-digest.txt
+          cat dist/image-digest.txt
+
+      - name: Upload image metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-metadata
+          path: |
+            dist/image-digest.txt
+            dist/image-inspect.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish GitHub release
+    needs:
+      - validate
+      - image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: chart
+          path: dist
+
+      - name: Download image metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: image-metadata
+          path: dist
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          charts=(dist/*.tgz)
+          if (( ${#charts[@]} != 1 )); then
+            echo "::error::expected exactly one chart archive, found ${#charts[@]}"
+            exit 1
+          fi
+          test -s dist/image-digest.txt
+          test -s dist/image-inspect.txt
+
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          assets=("${charts[@]}" dist/image-digest.txt dist/image-inspect.txt)
+
+          # Re-running the workflow updates the assets of an existing release
+          # instead of failing; it never force-moves the tag.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; updating assets only"
+            gh release upload "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "distributed-db $TAG" \
+              --generate-notes \
+              "${prerelease[@]}"
+          fi

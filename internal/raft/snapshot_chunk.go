@@ -683,6 +683,8 @@ func (n *Node) HandleInstallSnapshotChunk(ctx context.Context, req *InstallSnaps
 		}
 		n.resetElectionDeadlineLocked()
 	}
+	n.lastLeaderContact = time.Now()
+	n.abortPreVoteLocked()
 	term := n.term
 	last := n.lastIndexLocked()
 	upToDate := req.Index <= n.snapshot.Index || req.Index <= n.commitIndex

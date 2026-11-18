@@ -1,8 +1,9 @@
 # `internal/pitr` — PITR archive MVP
 
 Storage core for continuous Raft-log archiving and point-in-time restore
-planning. This package is intentionally **not** wired into the cluster and does
-not claim RPO 0.
+planning. This package reads a local Raft log store read-only and can persist a
+meta/TSO checkpoint, but it is intentionally **not** wired into a running
+cluster and does not claim RPO 0.
 
 ## Layout
 
@@ -15,7 +16,8 @@ not claim RPO 0.
 ```
 
 `manifest.json` is the atomically replaced index: cluster id, incarnation,
-timestamps, sorted segment descriptors, and per-range GC trim frontiers.
+timestamps, sorted segment descriptors, per-range GC trim frontiers, and an
+optional meta/TSO checkpoint (high-water TSO plus the range map at capture).
 
 ## Segment format v1
 
@@ -46,9 +48,30 @@ w.Close()
 r, _ := pitr.OpenReader("/archive")
 r.ReplayRange(ctx, rangeID, pitr.Target{TSO: target}, func(rec pitr.LogRecord) error { ... })
 r.Verify(ctx)
+r.CheckTargetTSO(target) // rejects a target above the checkpoint high-water
+
+// Local, read-only Raft log feed. commitIndex normally comes from
+// raft.Node.Status().CommitIndex; a compacted prefix yields *pitr.GapError.
+src, _ := pitr.NewRaftLogSource(pitr.RaftLogSourceConfig{
+    Log: fileStore, RangeID: 7,
+    CommitIndex: func() uint64 { return node.Status().CommitIndex },
+})
+adapter := &pitr.ArchiveAdapter{Writer: w, Source: src}
+adapter.FeedRange(ctx, 7, 0)
+
+// Capture and persist a meta/TSO checkpoint (Ranges is a backup.RangeLister).
+cp, _ := pitr.CaptureCheckpoint(ctx, pitr.CheckpointSource{
+    HighWater: func(ctx context.Context) (uint64, error) { return tsoHighWater(ctx) },
+    Ranges:    metaClient,
+    Barrier:   store, // optional; *mvcc.Store implements WaitApplied/AppliedTS
+})
+w.SetCheckpoint(*cp)
 
 planner, _ := pitr.NewPlanner(r)
-plan, _ := planner.Plan(ctx, baseManifest, targetTSO)
+plan, _ := planner.BuildPlan(ctx, pitr.PlanRequest{
+    Base: baseManifest, TargetTSO: targetTSO,
+    BarrierFrontier: store.AppliedTS(), // optional applied frontier bound
+})
 ```
 
 `Writer.GC(ctx, pitr.RetentionPolicy{MaxAge: 7*24*time.Hour, MaxBytes: 1<<40,
@@ -82,15 +105,22 @@ safety floor: only segments whose `MaxTSO <= ProtectTSO` may be removed.
 - retention by age and size, protection of needed segments, post-trim append;
 - restore plan ordering, target filtering, range subset, determinism/hash,
   repeated apply, missing/corrupt/trimmed range rejection;
+- local Raft log feed, commit-index clamping and a typed compacted-prefix gap
+  with the first retained index;
+- checkpoint capture/persistence/reload, range-map validation, target bounds
+  and regression rejection;
+- restore rejection above the checkpoint or barrier frontier, with the
+  explicit opt-out;
 - independent writers/readers running concurrently (no global state).
 
 ## Remaining integration work
 
-- Tail the committed Raft log prefix and handle truncation/leadership changes;
-  record the observed commit TSO (or an explicit `TSO=0` for metadata).
-- Persist and publish per-range/global safe points, TSO high-water, and the
-  meta/range-map archive. Without them the planner cannot prove a target is
-  fully archived.
+- Turn the local read-only Raft source into a tailer with leadership/epoch
+  fencing, truncation gating and restart-safe progress. A compacted prefix is a
+  hard gap today.
+- Coordinate per-range frontiers and publish a proven global safe point; the
+  checkpoint is caller-captured metadata, not a global `T_safe`, and the
+  planner's archive coverage remains a conservative heuristic.
 - Split/merge lineage, range epoch fencing, duplicate-writer arbitration.
 - Cross-range transaction reconstruction, MVCC command application, lock
   staging and resolution.

@@ -3054,6 +3054,134 @@ func (x *LogEntry) GetValue() []byte {
 	return nil
 }
 
+type PreVoteRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	CandidateId   string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	RangeId       uint64                 `protobuf:"varint,5,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreVoteRequest) Reset() {
+	*x = PreVoteRequest{}
+	mi := &file_v2_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreVoteRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreVoteRequest) ProtoMessage() {}
+
+func (x *PreVoteRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_v2_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreVoteRequest.ProtoReflect.Descriptor instead.
+func (*PreVoteRequest) Descriptor() ([]byte, []int) {
+	return file_v2_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *PreVoteRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *PreVoteRequest) GetCandidateId() string {
+	if x != nil {
+		return x.CandidateId
+	}
+	return ""
+}
+
+func (x *PreVoteRequest) GetLastLogIndex() uint64 {
+	if x != nil {
+		return x.LastLogIndex
+	}
+	return 0
+}
+
+func (x *PreVoteRequest) GetLastLogTerm() uint64 {
+	if x != nil {
+		return x.LastLogTerm
+	}
+	return 0
+}
+
+func (x *PreVoteRequest) GetRangeId() uint64 {
+	if x != nil {
+		return x.RangeId
+	}
+	return 0
+}
+
+type PreVoteResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	VoteGranted   bool                   `protobuf:"varint,2,opt,name=vote_granted,json=voteGranted,proto3" json:"vote_granted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreVoteResponse) Reset() {
+	*x = PreVoteResponse{}
+	mi := &file_v2_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreVoteResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreVoteResponse) ProtoMessage() {}
+
+func (x *PreVoteResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_v2_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreVoteResponse.ProtoReflect.Descriptor instead.
+func (*PreVoteResponse) Descriptor() ([]byte, []int) {
+	return file_v2_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *PreVoteResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *PreVoteResponse) GetVoteGranted() bool {
+	if x != nil {
+		return x.VoteGranted
+	}
+	return false
+}
+
 type AppendEntriesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
@@ -3069,7 +3197,7 @@ type AppendEntriesRequest struct {
 
 func (x *AppendEntriesRequest) Reset() {
 	*x = AppendEntriesRequest{}
-	mi := &file_v2_proto_msgTypes[46]
+	mi := &file_v2_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3081,7 +3209,7 @@ func (x *AppendEntriesRequest) String() string {
 func (*AppendEntriesRequest) ProtoMessage() {}
 
 func (x *AppendEntriesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[46]
+	mi := &file_v2_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3094,7 +3222,7 @@ func (x *AppendEntriesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppendEntriesRequest.ProtoReflect.Descriptor instead.
 func (*AppendEntriesRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{46}
+	return file_v2_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *AppendEntriesRequest) GetTerm() uint64 {
@@ -3158,7 +3286,7 @@ type AppendEntriesResponse struct {
 
 func (x *AppendEntriesResponse) Reset() {
 	*x = AppendEntriesResponse{}
-	mi := &file_v2_proto_msgTypes[47]
+	mi := &file_v2_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3170,7 +3298,7 @@ func (x *AppendEntriesResponse) String() string {
 func (*AppendEntriesResponse) ProtoMessage() {}
 
 func (x *AppendEntriesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[47]
+	mi := &file_v2_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3183,7 +3311,7 @@ func (x *AppendEntriesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppendEntriesResponse.ProtoReflect.Descriptor instead.
 func (*AppendEntriesResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{47}
+	return file_v2_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *AppendEntriesResponse) GetTerm() uint64 {
@@ -3227,7 +3355,7 @@ type SnapshotMembership struct {
 
 func (x *SnapshotMembership) Reset() {
 	*x = SnapshotMembership{}
-	mi := &file_v2_proto_msgTypes[48]
+	mi := &file_v2_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3239,7 +3367,7 @@ func (x *SnapshotMembership) String() string {
 func (*SnapshotMembership) ProtoMessage() {}
 
 func (x *SnapshotMembership) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[48]
+	mi := &file_v2_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3252,7 +3380,7 @@ func (x *SnapshotMembership) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotMembership.ProtoReflect.Descriptor instead.
 func (*SnapshotMembership) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{48}
+	return file_v2_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *SnapshotMembership) GetVoters() []string {
@@ -3302,7 +3430,7 @@ type Snapshot struct {
 
 func (x *Snapshot) Reset() {
 	*x = Snapshot{}
-	mi := &file_v2_proto_msgTypes[49]
+	mi := &file_v2_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3314,7 +3442,7 @@ func (x *Snapshot) String() string {
 func (*Snapshot) ProtoMessage() {}
 
 func (x *Snapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[49]
+	mi := &file_v2_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3327,7 +3455,7 @@ func (x *Snapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Snapshot.ProtoReflect.Descriptor instead.
 func (*Snapshot) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{49}
+	return file_v2_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *Snapshot) GetIndex() uint64 {
@@ -3370,7 +3498,7 @@ type InstallSnapshotRequest struct {
 
 func (x *InstallSnapshotRequest) Reset() {
 	*x = InstallSnapshotRequest{}
-	mi := &file_v2_proto_msgTypes[50]
+	mi := &file_v2_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3382,7 +3510,7 @@ func (x *InstallSnapshotRequest) String() string {
 func (*InstallSnapshotRequest) ProtoMessage() {}
 
 func (x *InstallSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[50]
+	mi := &file_v2_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3395,7 +3523,7 @@ func (x *InstallSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstallSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*InstallSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{50}
+	return file_v2_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *InstallSnapshotRequest) GetTerm() uint64 {
@@ -3437,7 +3565,7 @@ type InstallSnapshotResponse struct {
 
 func (x *InstallSnapshotResponse) Reset() {
 	*x = InstallSnapshotResponse{}
-	mi := &file_v2_proto_msgTypes[51]
+	mi := &file_v2_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3449,7 +3577,7 @@ func (x *InstallSnapshotResponse) String() string {
 func (*InstallSnapshotResponse) ProtoMessage() {}
 
 func (x *InstallSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[51]
+	mi := &file_v2_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3462,7 +3590,7 @@ func (x *InstallSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstallSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*InstallSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{51}
+	return file_v2_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *InstallSnapshotResponse) GetTerm() uint64 {
@@ -3523,7 +3651,7 @@ type InstallSnapshotChunkRequest struct {
 
 func (x *InstallSnapshotChunkRequest) Reset() {
 	*x = InstallSnapshotChunkRequest{}
-	mi := &file_v2_proto_msgTypes[52]
+	mi := &file_v2_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3535,7 +3663,7 @@ func (x *InstallSnapshotChunkRequest) String() string {
 func (*InstallSnapshotChunkRequest) ProtoMessage() {}
 
 func (x *InstallSnapshotChunkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[52]
+	mi := &file_v2_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3548,7 +3676,7 @@ func (x *InstallSnapshotChunkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstallSnapshotChunkRequest.ProtoReflect.Descriptor instead.
 func (*InstallSnapshotChunkRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{52}
+	return file_v2_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *InstallSnapshotChunkRequest) GetRangeId() uint64 {
@@ -3651,7 +3779,7 @@ type InstallSnapshotChunkResponse struct {
 
 func (x *InstallSnapshotChunkResponse) Reset() {
 	*x = InstallSnapshotChunkResponse{}
-	mi := &file_v2_proto_msgTypes[53]
+	mi := &file_v2_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3663,7 +3791,7 @@ func (x *InstallSnapshotChunkResponse) String() string {
 func (*InstallSnapshotChunkResponse) ProtoMessage() {}
 
 func (x *InstallSnapshotChunkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[53]
+	mi := &file_v2_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3676,7 +3804,7 @@ func (x *InstallSnapshotChunkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstallSnapshotChunkResponse.ProtoReflect.Descriptor instead.
 func (*InstallSnapshotChunkResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{53}
+	return file_v2_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *InstallSnapshotChunkResponse) GetTerm() uint64 {
@@ -3723,7 +3851,7 @@ type SetRangesRequest struct {
 
 func (x *SetRangesRequest) Reset() {
 	*x = SetRangesRequest{}
-	mi := &file_v2_proto_msgTypes[54]
+	mi := &file_v2_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3735,7 +3863,7 @@ func (x *SetRangesRequest) String() string {
 func (*SetRangesRequest) ProtoMessage() {}
 
 func (x *SetRangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[54]
+	mi := &file_v2_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3748,7 +3876,7 @@ func (x *SetRangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRangesRequest.ProtoReflect.Descriptor instead.
 func (*SetRangesRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{54}
+	return file_v2_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *SetRangesRequest) GetRanges() []*RangeInfo {
@@ -3768,7 +3896,7 @@ type SetRangesResponse struct {
 
 func (x *SetRangesResponse) Reset() {
 	*x = SetRangesResponse{}
-	mi := &file_v2_proto_msgTypes[55]
+	mi := &file_v2_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3780,7 +3908,7 @@ func (x *SetRangesResponse) String() string {
 func (*SetRangesResponse) ProtoMessage() {}
 
 func (x *SetRangesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[55]
+	mi := &file_v2_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3793,7 +3921,7 @@ func (x *SetRangesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRangesResponse.ProtoReflect.Descriptor instead.
 func (*SetRangesResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{55}
+	return file_v2_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *SetRangesResponse) GetSuccess() bool {
@@ -3820,7 +3948,7 @@ type MetaSplitRangeRequest struct {
 
 func (x *MetaSplitRangeRequest) Reset() {
 	*x = MetaSplitRangeRequest{}
-	mi := &file_v2_proto_msgTypes[56]
+	mi := &file_v2_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3832,7 +3960,7 @@ func (x *MetaSplitRangeRequest) String() string {
 func (*MetaSplitRangeRequest) ProtoMessage() {}
 
 func (x *MetaSplitRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[56]
+	mi := &file_v2_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3845,7 +3973,7 @@ func (x *MetaSplitRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetaSplitRangeRequest.ProtoReflect.Descriptor instead.
 func (*MetaSplitRangeRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{56}
+	return file_v2_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *MetaSplitRangeRequest) GetRangeId() uint64 {
@@ -3873,7 +4001,7 @@ type MetaSplitRangeResponse struct {
 
 func (x *MetaSplitRangeResponse) Reset() {
 	*x = MetaSplitRangeResponse{}
-	mi := &file_v2_proto_msgTypes[57]
+	mi := &file_v2_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3885,7 +4013,7 @@ func (x *MetaSplitRangeResponse) String() string {
 func (*MetaSplitRangeResponse) ProtoMessage() {}
 
 func (x *MetaSplitRangeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[57]
+	mi := &file_v2_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3898,7 +4026,7 @@ func (x *MetaSplitRangeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetaSplitRangeResponse.ProtoReflect.Descriptor instead.
 func (*MetaSplitRangeResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{57}
+	return file_v2_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *MetaSplitRangeResponse) GetSuccess() bool {
@@ -3932,7 +4060,7 @@ type MetaMergeRangesRequest struct {
 
 func (x *MetaMergeRangesRequest) Reset() {
 	*x = MetaMergeRangesRequest{}
-	mi := &file_v2_proto_msgTypes[58]
+	mi := &file_v2_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3944,7 +4072,7 @@ func (x *MetaMergeRangesRequest) String() string {
 func (*MetaMergeRangesRequest) ProtoMessage() {}
 
 func (x *MetaMergeRangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[58]
+	mi := &file_v2_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3957,7 +4085,7 @@ func (x *MetaMergeRangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetaMergeRangesRequest.ProtoReflect.Descriptor instead.
 func (*MetaMergeRangesRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{58}
+	return file_v2_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *MetaMergeRangesRequest) GetLeftRangeId() uint64 {
@@ -3984,7 +4112,7 @@ type MetaMergeRangesResponse struct {
 
 func (x *MetaMergeRangesResponse) Reset() {
 	*x = MetaMergeRangesResponse{}
-	mi := &file_v2_proto_msgTypes[59]
+	mi := &file_v2_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3996,7 +4124,7 @@ func (x *MetaMergeRangesResponse) String() string {
 func (*MetaMergeRangesResponse) ProtoMessage() {}
 
 func (x *MetaMergeRangesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[59]
+	mi := &file_v2_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4009,7 +4137,7 @@ func (x *MetaMergeRangesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetaMergeRangesResponse.ProtoReflect.Descriptor instead.
 func (*MetaMergeRangesResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{59}
+	return file_v2_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *MetaMergeRangesResponse) GetSuccess() bool {
@@ -4034,7 +4162,7 @@ type LeaderRequest struct {
 
 func (x *LeaderRequest) Reset() {
 	*x = LeaderRequest{}
-	mi := &file_v2_proto_msgTypes[60]
+	mi := &file_v2_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4046,7 +4174,7 @@ func (x *LeaderRequest) String() string {
 func (*LeaderRequest) ProtoMessage() {}
 
 func (x *LeaderRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[60]
+	mi := &file_v2_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4059,7 +4187,7 @@ func (x *LeaderRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeaderRequest.ProtoReflect.Descriptor instead.
 func (*LeaderRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{60}
+	return file_v2_proto_rawDescGZIP(), []int{62}
 }
 
 type LeaderResponse struct {
@@ -4072,7 +4200,7 @@ type LeaderResponse struct {
 
 func (x *LeaderResponse) Reset() {
 	*x = LeaderResponse{}
-	mi := &file_v2_proto_msgTypes[61]
+	mi := &file_v2_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4084,7 +4212,7 @@ func (x *LeaderResponse) String() string {
 func (*LeaderResponse) ProtoMessage() {}
 
 func (x *LeaderResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[61]
+	mi := &file_v2_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4097,7 +4225,7 @@ func (x *LeaderResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeaderResponse.ProtoReflect.Descriptor instead.
 func (*LeaderResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{61}
+	return file_v2_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *LeaderResponse) GetLeader() string {
@@ -4123,7 +4251,7 @@ type GetRangeRequest struct {
 
 func (x *GetRangeRequest) Reset() {
 	*x = GetRangeRequest{}
-	mi := &file_v2_proto_msgTypes[62]
+	mi := &file_v2_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4135,7 +4263,7 @@ func (x *GetRangeRequest) String() string {
 func (*GetRangeRequest) ProtoMessage() {}
 
 func (x *GetRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[62]
+	mi := &file_v2_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4148,7 +4276,7 @@ func (x *GetRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRangeRequest.ProtoReflect.Descriptor instead.
 func (*GetRangeRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{62}
+	return file_v2_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *GetRangeRequest) GetKey() []byte {
@@ -4172,7 +4300,7 @@ type RangeInfo struct {
 
 func (x *RangeInfo) Reset() {
 	*x = RangeInfo{}
-	mi := &file_v2_proto_msgTypes[63]
+	mi := &file_v2_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4184,7 +4312,7 @@ func (x *RangeInfo) String() string {
 func (*RangeInfo) ProtoMessage() {}
 
 func (x *RangeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[63]
+	mi := &file_v2_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4197,7 +4325,7 @@ func (x *RangeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeInfo.ProtoReflect.Descriptor instead.
 func (*RangeInfo) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{63}
+	return file_v2_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *RangeInfo) GetId() uint64 {
@@ -4250,7 +4378,7 @@ type ListRangesRequest struct {
 
 func (x *ListRangesRequest) Reset() {
 	*x = ListRangesRequest{}
-	mi := &file_v2_proto_msgTypes[64]
+	mi := &file_v2_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4262,7 +4390,7 @@ func (x *ListRangesRequest) String() string {
 func (*ListRangesRequest) ProtoMessage() {}
 
 func (x *ListRangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[64]
+	mi := &file_v2_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4275,7 +4403,7 @@ func (x *ListRangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRangesRequest.ProtoReflect.Descriptor instead.
 func (*ListRangesRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{64}
+	return file_v2_proto_rawDescGZIP(), []int{66}
 }
 
 type ListRangesResponse struct {
@@ -4287,7 +4415,7 @@ type ListRangesResponse struct {
 
 func (x *ListRangesResponse) Reset() {
 	*x = ListRangesResponse{}
-	mi := &file_v2_proto_msgTypes[65]
+	mi := &file_v2_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4299,7 +4427,7 @@ func (x *ListRangesResponse) String() string {
 func (*ListRangesResponse) ProtoMessage() {}
 
 func (x *ListRangesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[65]
+	mi := &file_v2_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4312,7 +4440,7 @@ func (x *ListRangesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRangesResponse.ProtoReflect.Descriptor instead.
 func (*ListRangesResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{65}
+	return file_v2_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *ListRangesResponse) GetRanges() []*RangeInfo {
@@ -4331,7 +4459,7 @@ type AllocTSRequest struct {
 
 func (x *AllocTSRequest) Reset() {
 	*x = AllocTSRequest{}
-	mi := &file_v2_proto_msgTypes[66]
+	mi := &file_v2_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4343,7 +4471,7 @@ func (x *AllocTSRequest) String() string {
 func (*AllocTSRequest) ProtoMessage() {}
 
 func (x *AllocTSRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[66]
+	mi := &file_v2_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4356,7 +4484,7 @@ func (x *AllocTSRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AllocTSRequest.ProtoReflect.Descriptor instead.
 func (*AllocTSRequest) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{66}
+	return file_v2_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *AllocTSRequest) GetCount() int32 {
@@ -4376,7 +4504,7 @@ type AllocTSResponse struct {
 
 func (x *AllocTSResponse) Reset() {
 	*x = AllocTSResponse{}
-	mi := &file_v2_proto_msgTypes[67]
+	mi := &file_v2_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4388,7 +4516,7 @@ func (x *AllocTSResponse) String() string {
 func (*AllocTSResponse) ProtoMessage() {}
 
 func (x *AllocTSResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_v2_proto_msgTypes[67]
+	mi := &file_v2_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4401,7 +4529,7 @@ func (x *AllocTSResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AllocTSResponse.ProtoReflect.Descriptor instead.
 func (*AllocTSResponse) Descriptor() ([]byte, []int) {
-	return file_v2_proto_rawDescGZIP(), []int{67}
+	return file_v2_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *AllocTSResponse) GetStart() uint64 {
@@ -4643,7 +4771,16 @@ const file_v2_proto_rawDesc = "" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04type\x18\x03 \x01(\tR\x04type\x12\x10\n" +
 	"\x03key\x18\x04 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x05 \x01(\fR\x05value\"\xfb\x01\n" +
+	"\x05value\x18\x05 \x01(\fR\x05value\"\xac\x01\n" +
+	"\x0ePreVoteRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
+	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12$\n" +
+	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x19\n" +
+	"\brange_id\x18\x05 \x01(\x04R\arangeId\"H\n" +
+	"\x0fPreVoteResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xfb\x01\n" +
 	"\x14AppendEntriesRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12$\n" +
@@ -4774,9 +4911,10 @@ const file_v2_proto_rawDesc = "" +
 	"\rRemoveReplica\x12\x1a.dbv2.RemoveReplicaRequest\x1a\x1b.dbv2.RemoveReplicaResponse\x12?\n" +
 	"\n" +
 	"Membership\x12\x17.dbv2.MembershipRequest\x1a\x18.dbv2.MembershipResponse\x12Q\n" +
-	"\x10UpdateRangeEpoch\x12\x1d.dbv2.UpdateRangeEpochRequest\x1a\x1e.dbv2.UpdateRangeEpochResponse2\x8b\x03\n" +
+	"\x10UpdateRangeEpoch\x12\x1d.dbv2.UpdateRangeEpochRequest\x1a\x1e.dbv2.UpdateRangeEpochResponse2\xc3\x03\n" +
 	"\vRaftService\x12B\n" +
-	"\vRequestVote\x12\x18.dbv2.RequestVoteRequest\x1a\x19.dbv2.RequestVoteResponse\x12H\n" +
+	"\vRequestVote\x12\x18.dbv2.RequestVoteRequest\x1a\x19.dbv2.RequestVoteResponse\x126\n" +
+	"\aPreVote\x12\x14.dbv2.PreVoteRequest\x1a\x15.dbv2.PreVoteResponse\x12H\n" +
 	"\rAppendEntries\x12\x1a.dbv2.AppendEntriesRequest\x1a\x1b.dbv2.AppendEntriesResponse\x12N\n" +
 	"\x0fInstallSnapshot\x12\x1c.dbv2.InstallSnapshotRequest\x1a\x1d.dbv2.InstallSnapshotResponse\x12]\n" +
 	"\x14InstallSnapshotChunk\x12!.dbv2.InstallSnapshotChunkRequest\x1a\".dbv2.InstallSnapshotChunkResponse\x12?\n" +
@@ -4805,7 +4943,7 @@ func file_v2_proto_rawDescGZIP() []byte {
 	return file_v2_proto_rawDescData
 }
 
-var file_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 68)
+var file_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 70)
 var file_v2_proto_goTypes = []any{
 	(*GetRequest)(nil),                   // 0: dbv2.GetRequest
 	(*GetResponse)(nil),                  // 1: dbv2.GetResponse
@@ -4853,28 +4991,30 @@ var file_v2_proto_goTypes = []any{
 	(*RequestVoteRequest)(nil),           // 43: dbv2.RequestVoteRequest
 	(*RequestVoteResponse)(nil),          // 44: dbv2.RequestVoteResponse
 	(*LogEntry)(nil),                     // 45: dbv2.LogEntry
-	(*AppendEntriesRequest)(nil),         // 46: dbv2.AppendEntriesRequest
-	(*AppendEntriesResponse)(nil),        // 47: dbv2.AppendEntriesResponse
-	(*SnapshotMembership)(nil),           // 48: dbv2.SnapshotMembership
-	(*Snapshot)(nil),                     // 49: dbv2.Snapshot
-	(*InstallSnapshotRequest)(nil),       // 50: dbv2.InstallSnapshotRequest
-	(*InstallSnapshotResponse)(nil),      // 51: dbv2.InstallSnapshotResponse
-	(*InstallSnapshotChunkRequest)(nil),  // 52: dbv2.InstallSnapshotChunkRequest
-	(*InstallSnapshotChunkResponse)(nil), // 53: dbv2.InstallSnapshotChunkResponse
-	(*SetRangesRequest)(nil),             // 54: dbv2.SetRangesRequest
-	(*SetRangesResponse)(nil),            // 55: dbv2.SetRangesResponse
-	(*MetaSplitRangeRequest)(nil),        // 56: dbv2.MetaSplitRangeRequest
-	(*MetaSplitRangeResponse)(nil),       // 57: dbv2.MetaSplitRangeResponse
-	(*MetaMergeRangesRequest)(nil),       // 58: dbv2.MetaMergeRangesRequest
-	(*MetaMergeRangesResponse)(nil),      // 59: dbv2.MetaMergeRangesResponse
-	(*LeaderRequest)(nil),                // 60: dbv2.LeaderRequest
-	(*LeaderResponse)(nil),               // 61: dbv2.LeaderResponse
-	(*GetRangeRequest)(nil),              // 62: dbv2.GetRangeRequest
-	(*RangeInfo)(nil),                    // 63: dbv2.RangeInfo
-	(*ListRangesRequest)(nil),            // 64: dbv2.ListRangesRequest
-	(*ListRangesResponse)(nil),           // 65: dbv2.ListRangesResponse
-	(*AllocTSRequest)(nil),               // 66: dbv2.AllocTSRequest
-	(*AllocTSResponse)(nil),              // 67: dbv2.AllocTSResponse
+	(*PreVoteRequest)(nil),               // 46: dbv2.PreVoteRequest
+	(*PreVoteResponse)(nil),              // 47: dbv2.PreVoteResponse
+	(*AppendEntriesRequest)(nil),         // 48: dbv2.AppendEntriesRequest
+	(*AppendEntriesResponse)(nil),        // 49: dbv2.AppendEntriesResponse
+	(*SnapshotMembership)(nil),           // 50: dbv2.SnapshotMembership
+	(*Snapshot)(nil),                     // 51: dbv2.Snapshot
+	(*InstallSnapshotRequest)(nil),       // 52: dbv2.InstallSnapshotRequest
+	(*InstallSnapshotResponse)(nil),      // 53: dbv2.InstallSnapshotResponse
+	(*InstallSnapshotChunkRequest)(nil),  // 54: dbv2.InstallSnapshotChunkRequest
+	(*InstallSnapshotChunkResponse)(nil), // 55: dbv2.InstallSnapshotChunkResponse
+	(*SetRangesRequest)(nil),             // 56: dbv2.SetRangesRequest
+	(*SetRangesResponse)(nil),            // 57: dbv2.SetRangesResponse
+	(*MetaSplitRangeRequest)(nil),        // 58: dbv2.MetaSplitRangeRequest
+	(*MetaSplitRangeResponse)(nil),       // 59: dbv2.MetaSplitRangeResponse
+	(*MetaMergeRangesRequest)(nil),       // 60: dbv2.MetaMergeRangesRequest
+	(*MetaMergeRangesResponse)(nil),      // 61: dbv2.MetaMergeRangesResponse
+	(*LeaderRequest)(nil),                // 62: dbv2.LeaderRequest
+	(*LeaderResponse)(nil),               // 63: dbv2.LeaderResponse
+	(*GetRangeRequest)(nil),              // 64: dbv2.GetRangeRequest
+	(*RangeInfo)(nil),                    // 65: dbv2.RangeInfo
+	(*ListRangesRequest)(nil),            // 66: dbv2.ListRangesRequest
+	(*ListRangesResponse)(nil),           // 67: dbv2.ListRangesResponse
+	(*AllocTSRequest)(nil),               // 68: dbv2.AllocTSRequest
+	(*AllocTSResponse)(nil),              // 69: dbv2.AllocTSResponse
 }
 var file_v2_proto_depIdxs = []int32{
 	3,  // 0: dbv2.ScanResponse.kvs:type_name -> dbv2.KV
@@ -4882,11 +5022,11 @@ var file_v2_proto_depIdxs = []int32{
 	7,  // 2: dbv2.PrewriteRequest.mutations:type_name -> dbv2.Mutation
 	7,  // 3: dbv2.CommitSingleRequest.mutations:type_name -> dbv2.Mutation
 	45, // 4: dbv2.AppendEntriesRequest.entries:type_name -> dbv2.LogEntry
-	48, // 5: dbv2.Snapshot.membership:type_name -> dbv2.SnapshotMembership
-	49, // 6: dbv2.InstallSnapshotRequest.snapshot:type_name -> dbv2.Snapshot
-	48, // 7: dbv2.InstallSnapshotChunkRequest.membership:type_name -> dbv2.SnapshotMembership
-	63, // 8: dbv2.SetRangesRequest.ranges:type_name -> dbv2.RangeInfo
-	63, // 9: dbv2.ListRangesResponse.ranges:type_name -> dbv2.RangeInfo
+	50, // 5: dbv2.Snapshot.membership:type_name -> dbv2.SnapshotMembership
+	51, // 6: dbv2.InstallSnapshotRequest.snapshot:type_name -> dbv2.Snapshot
+	50, // 7: dbv2.InstallSnapshotChunkRequest.membership:type_name -> dbv2.SnapshotMembership
+	65, // 8: dbv2.SetRangesRequest.ranges:type_name -> dbv2.RangeInfo
+	65, // 9: dbv2.ListRangesResponse.ranges:type_name -> dbv2.RangeInfo
 	0,  // 10: dbv2.KVService.Get:input_type -> dbv2.GetRequest
 	2,  // 11: dbv2.KVService.Scan:input_type -> dbv2.ScanRequest
 	5,  // 12: dbv2.KVService.ScanForBackup:input_type -> dbv2.ScanForBackupRequest
@@ -4909,52 +5049,54 @@ var file_v2_proto_depIdxs = []int32{
 	39, // 29: dbv2.KVService.Membership:input_type -> dbv2.MembershipRequest
 	37, // 30: dbv2.KVService.UpdateRangeEpoch:input_type -> dbv2.UpdateRangeEpochRequest
 	43, // 31: dbv2.RaftService.RequestVote:input_type -> dbv2.RequestVoteRequest
-	46, // 32: dbv2.RaftService.AppendEntries:input_type -> dbv2.AppendEntriesRequest
-	50, // 33: dbv2.RaftService.InstallSnapshot:input_type -> dbv2.InstallSnapshotRequest
-	52, // 34: dbv2.RaftService.InstallSnapshotChunk:input_type -> dbv2.InstallSnapshotChunkRequest
-	41, // 35: dbv2.RaftService.TimeoutNow:input_type -> dbv2.TimeoutNowRequest
-	66, // 36: dbv2.MetaService.AllocTS:input_type -> dbv2.AllocTSRequest
-	62, // 37: dbv2.MetaService.GetRange:input_type -> dbv2.GetRangeRequest
-	64, // 38: dbv2.MetaService.ListRanges:input_type -> dbv2.ListRangesRequest
-	60, // 39: dbv2.MetaService.Leader:input_type -> dbv2.LeaderRequest
-	54, // 40: dbv2.MetaService.SetRanges:input_type -> dbv2.SetRangesRequest
-	56, // 41: dbv2.MetaService.SplitRange:input_type -> dbv2.MetaSplitRangeRequest
-	58, // 42: dbv2.MetaService.MergeRanges:input_type -> dbv2.MetaMergeRangesRequest
-	1,  // 43: dbv2.KVService.Get:output_type -> dbv2.GetResponse
-	4,  // 44: dbv2.KVService.Scan:output_type -> dbv2.ScanResponse
-	6,  // 45: dbv2.KVService.ScanForBackup:output_type -> dbv2.ScanForBackupResponse
-	9,  // 46: dbv2.KVService.Prewrite:output_type -> dbv2.PrewriteResponse
-	11, // 47: dbv2.KVService.Commit:output_type -> dbv2.CommitResponse
-	13, // 48: dbv2.KVService.CommitSingle:output_type -> dbv2.CommitSingleResponse
-	15, // 49: dbv2.KVService.Rollback:output_type -> dbv2.RollbackResponse
-	17, // 50: dbv2.KVService.CheckTxnStatus:output_type -> dbv2.CheckTxnStatusResponse
-	19, // 51: dbv2.KVService.ResolveLock:output_type -> dbv2.ResolveLockResponse
-	21, // 52: dbv2.KVService.SplitRange:output_type -> dbv2.SplitRangeResponse
-	23, // 53: dbv2.KVService.MergeRanges:output_type -> dbv2.MergeRangesResponse
-	25, // 54: dbv2.KVService.RangeStats:output_type -> dbv2.RangeStatsResponse
-	27, // 55: dbv2.KVService.Status:output_type -> dbv2.StatusResponse
-	29, // 56: dbv2.KVService.TransferLeader:output_type -> dbv2.TransferLeaderResponse
-	31, // 57: dbv2.KVService.AddReplica:output_type -> dbv2.AddReplicaResponse
-	40, // 58: dbv2.KVService.AddLearner:output_type -> dbv2.MembershipResponse
-	40, // 59: dbv2.KVService.PromoteReplica:output_type -> dbv2.MembershipResponse
-	40, // 60: dbv2.KVService.RemoveVoter:output_type -> dbv2.MembershipResponse
-	36, // 61: dbv2.KVService.RemoveReplica:output_type -> dbv2.RemoveReplicaResponse
-	40, // 62: dbv2.KVService.Membership:output_type -> dbv2.MembershipResponse
-	38, // 63: dbv2.KVService.UpdateRangeEpoch:output_type -> dbv2.UpdateRangeEpochResponse
-	44, // 64: dbv2.RaftService.RequestVote:output_type -> dbv2.RequestVoteResponse
-	47, // 65: dbv2.RaftService.AppendEntries:output_type -> dbv2.AppendEntriesResponse
-	51, // 66: dbv2.RaftService.InstallSnapshot:output_type -> dbv2.InstallSnapshotResponse
-	53, // 67: dbv2.RaftService.InstallSnapshotChunk:output_type -> dbv2.InstallSnapshotChunkResponse
-	42, // 68: dbv2.RaftService.TimeoutNow:output_type -> dbv2.TimeoutNowResponse
-	67, // 69: dbv2.MetaService.AllocTS:output_type -> dbv2.AllocTSResponse
-	63, // 70: dbv2.MetaService.GetRange:output_type -> dbv2.RangeInfo
-	65, // 71: dbv2.MetaService.ListRanges:output_type -> dbv2.ListRangesResponse
-	61, // 72: dbv2.MetaService.Leader:output_type -> dbv2.LeaderResponse
-	55, // 73: dbv2.MetaService.SetRanges:output_type -> dbv2.SetRangesResponse
-	57, // 74: dbv2.MetaService.SplitRange:output_type -> dbv2.MetaSplitRangeResponse
-	59, // 75: dbv2.MetaService.MergeRanges:output_type -> dbv2.MetaMergeRangesResponse
-	43, // [43:76] is the sub-list for method output_type
-	10, // [10:43] is the sub-list for method input_type
+	46, // 32: dbv2.RaftService.PreVote:input_type -> dbv2.PreVoteRequest
+	48, // 33: dbv2.RaftService.AppendEntries:input_type -> dbv2.AppendEntriesRequest
+	52, // 34: dbv2.RaftService.InstallSnapshot:input_type -> dbv2.InstallSnapshotRequest
+	54, // 35: dbv2.RaftService.InstallSnapshotChunk:input_type -> dbv2.InstallSnapshotChunkRequest
+	41, // 36: dbv2.RaftService.TimeoutNow:input_type -> dbv2.TimeoutNowRequest
+	68, // 37: dbv2.MetaService.AllocTS:input_type -> dbv2.AllocTSRequest
+	64, // 38: dbv2.MetaService.GetRange:input_type -> dbv2.GetRangeRequest
+	66, // 39: dbv2.MetaService.ListRanges:input_type -> dbv2.ListRangesRequest
+	62, // 40: dbv2.MetaService.Leader:input_type -> dbv2.LeaderRequest
+	56, // 41: dbv2.MetaService.SetRanges:input_type -> dbv2.SetRangesRequest
+	58, // 42: dbv2.MetaService.SplitRange:input_type -> dbv2.MetaSplitRangeRequest
+	60, // 43: dbv2.MetaService.MergeRanges:input_type -> dbv2.MetaMergeRangesRequest
+	1,  // 44: dbv2.KVService.Get:output_type -> dbv2.GetResponse
+	4,  // 45: dbv2.KVService.Scan:output_type -> dbv2.ScanResponse
+	6,  // 46: dbv2.KVService.ScanForBackup:output_type -> dbv2.ScanForBackupResponse
+	9,  // 47: dbv2.KVService.Prewrite:output_type -> dbv2.PrewriteResponse
+	11, // 48: dbv2.KVService.Commit:output_type -> dbv2.CommitResponse
+	13, // 49: dbv2.KVService.CommitSingle:output_type -> dbv2.CommitSingleResponse
+	15, // 50: dbv2.KVService.Rollback:output_type -> dbv2.RollbackResponse
+	17, // 51: dbv2.KVService.CheckTxnStatus:output_type -> dbv2.CheckTxnStatusResponse
+	19, // 52: dbv2.KVService.ResolveLock:output_type -> dbv2.ResolveLockResponse
+	21, // 53: dbv2.KVService.SplitRange:output_type -> dbv2.SplitRangeResponse
+	23, // 54: dbv2.KVService.MergeRanges:output_type -> dbv2.MergeRangesResponse
+	25, // 55: dbv2.KVService.RangeStats:output_type -> dbv2.RangeStatsResponse
+	27, // 56: dbv2.KVService.Status:output_type -> dbv2.StatusResponse
+	29, // 57: dbv2.KVService.TransferLeader:output_type -> dbv2.TransferLeaderResponse
+	31, // 58: dbv2.KVService.AddReplica:output_type -> dbv2.AddReplicaResponse
+	40, // 59: dbv2.KVService.AddLearner:output_type -> dbv2.MembershipResponse
+	40, // 60: dbv2.KVService.PromoteReplica:output_type -> dbv2.MembershipResponse
+	40, // 61: dbv2.KVService.RemoveVoter:output_type -> dbv2.MembershipResponse
+	36, // 62: dbv2.KVService.RemoveReplica:output_type -> dbv2.RemoveReplicaResponse
+	40, // 63: dbv2.KVService.Membership:output_type -> dbv2.MembershipResponse
+	38, // 64: dbv2.KVService.UpdateRangeEpoch:output_type -> dbv2.UpdateRangeEpochResponse
+	44, // 65: dbv2.RaftService.RequestVote:output_type -> dbv2.RequestVoteResponse
+	47, // 66: dbv2.RaftService.PreVote:output_type -> dbv2.PreVoteResponse
+	49, // 67: dbv2.RaftService.AppendEntries:output_type -> dbv2.AppendEntriesResponse
+	53, // 68: dbv2.RaftService.InstallSnapshot:output_type -> dbv2.InstallSnapshotResponse
+	55, // 69: dbv2.RaftService.InstallSnapshotChunk:output_type -> dbv2.InstallSnapshotChunkResponse
+	42, // 70: dbv2.RaftService.TimeoutNow:output_type -> dbv2.TimeoutNowResponse
+	69, // 71: dbv2.MetaService.AllocTS:output_type -> dbv2.AllocTSResponse
+	65, // 72: dbv2.MetaService.GetRange:output_type -> dbv2.RangeInfo
+	67, // 73: dbv2.MetaService.ListRanges:output_type -> dbv2.ListRangesResponse
+	63, // 74: dbv2.MetaService.Leader:output_type -> dbv2.LeaderResponse
+	57, // 75: dbv2.MetaService.SetRanges:output_type -> dbv2.SetRangesResponse
+	59, // 76: dbv2.MetaService.SplitRange:output_type -> dbv2.MetaSplitRangeResponse
+	61, // 77: dbv2.MetaService.MergeRanges:output_type -> dbv2.MetaMergeRangesResponse
+	44, // [44:78] is the sub-list for method output_type
+	10, // [10:44] is the sub-list for method input_type
 	10, // [10:10] is the sub-list for extension type_name
 	10, // [10:10] is the sub-list for extension extendee
 	0,  // [0:10] is the sub-list for field type_name
@@ -4971,7 +5113,7 @@ func file_v2_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v2_proto_rawDesc), len(file_v2_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   68,
+			NumMessages:   70,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

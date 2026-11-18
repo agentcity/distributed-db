@@ -2,6 +2,7 @@ package meta_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -552,5 +553,222 @@ func TestSetRangesRejectsGapsAndDuplicates(t *testing.T) {
 		if err := meta.New().SetRanges(tc); err == nil {
 			t.Errorf("case %d: SetRanges accepted invalid map", i)
 		}
+	}
+}
+
+func metaTestLeaderRanges() []meta.Range {
+	return []meta.Range{{
+		ID: 1, Start: nil, End: nil,
+		Replicas: []string{"n1", "n2", "n3"}, Version: 1,
+	}}
+}
+
+func TestMetaRefreshLeaderEpoch(t *testing.T) {
+	c := meta.New()
+	if err := c.SetRanges(metaTestLeaderRanges()); err != nil {
+		t.Fatalf("SetRanges: %v", err)
+	}
+
+	if err := c.RefreshLeader(1, "n1", 1); err != nil {
+		t.Fatalf("RefreshLeader: %v", err)
+	}
+	r := metaTestMustRange(t, c, nil)
+	if r.Leader != "n1" || r.LeaderEpoch != 1 || !r.LeaderKnown() || r.LeaderStale() {
+		t.Fatalf("range after refresh = %+v", r)
+	}
+
+	// Epoch 0 means "no epoch assertion" and is accepted conservatively.
+	if err := c.RefreshLeader(1, "n2", 0); err != nil {
+		t.Fatalf("RefreshLeader zero epoch: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "n2" || r.LeaderEpoch != 1 {
+		t.Fatalf("zero epoch refresh = %+v", r)
+	}
+
+	// An epoch that does not match the descriptor is stale. The previous hint
+	// is cleared rather than published as current.
+	err := c.RefreshLeader(1, "n1", 2)
+	if !errors.Is(err, meta.ErrStaleLeader) {
+		t.Fatalf("RefreshLeader error = %v, want ErrStaleLeader", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("stale refresh left hint %+v, want cleared", r)
+	}
+
+	// A stale epoch must clear an existing hint even when a leader is passed.
+	if err := c.UpdateLeader(1, "n1"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+	if err := c.RefreshLeader(1, "n2", 99); !errors.Is(err, meta.ErrStaleLeader) {
+		t.Fatalf("RefreshLeader stale error = %v, want ErrStaleLeader", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("stale epoch kept hint %+v, want cleared", r)
+	}
+
+	if err := c.RefreshLeader(1, "n2", 1); err != nil {
+		t.Fatalf("RefreshLeader current epoch: %v", err)
+	}
+	if err := c.ClearLeader(1); err != nil {
+		t.Fatalf("ClearLeader: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("ClearLeader left hint %+v", r)
+	}
+	if err := c.RefreshLeader(999, "n1", 1); err == nil {
+		t.Fatal("RefreshLeader unknown range returned nil error")
+	}
+}
+
+func TestMetaSetRangesClearsStaleLeader(t *testing.T) {
+	c := meta.New()
+	if err := c.SetRanges(metaTestLeaderRanges()); err != nil {
+		t.Fatalf("SetRanges: %v", err)
+	}
+	if err := c.UpdateLeader(1, "n1"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+
+	// Omitting the leader on an epoch change clears the old hint.
+	ranges := metaTestLeaderRanges()
+	ranges[0].Version = 2
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges epoch change: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("epoch change kept stale hint %+v", r)
+	}
+
+	// A hint from the previous epoch is cleared even when it names the same
+	// leader, unless the caller explicitly re-stamps it.
+	if err := c.UpdateLeader(1, "n1"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+	ranges = metaTestLeaderRanges()
+	ranges[0].Version = 3
+	ranges[0].Leader = "n1"
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges unstamped same leader: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("unstamped hint survived epoch change: %+v", r)
+	}
+
+	// An explicit stale epoch is also rejected and cleared.
+	if err := c.UpdateLeader(1, "n2"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+	ranges = metaTestLeaderRanges()
+	ranges[0].Version = 4
+	ranges[0].Leader = "n2"
+	ranges[0].LeaderEpoch = 3
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges explicit stale epoch: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("explicit stale epoch kept hint %+v", r)
+	}
+}
+
+func TestMetaSetRangesPreservesLiveLeader(t *testing.T) {
+	c := meta.New()
+	if err := c.SetRanges(metaTestLeaderRanges()); err != nil {
+		t.Fatalf("SetRanges: %v", err)
+	}
+	if err := c.UpdateLeader(1, "n1"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+
+	// A read-modify-write round trip that omits Leader on the same version
+	// must not lose the hint.
+	ranges := metaTestLeaderRanges()
+	ranges[0].Leader = ""
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges round trip: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "n1" || r.LeaderEpoch != 1 {
+		t.Fatalf("round trip lost hint: %+v", r)
+	}
+
+	// A same-version update preserves or replaces the hint without needing an
+	// explicit epoch.
+	ranges = metaTestLeaderRanges()
+	ranges[0].Leader = "n2"
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges same version: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "n2" || r.LeaderEpoch != 1 {
+		t.Fatalf("same version hint = %+v", r)
+	}
+
+	// A group-preserving membership change carries the same leader forward at
+	// the new version only when it re-stamps the hint at that version.
+	ranges = metaTestLeaderRanges()
+	ranges[0].Leader = "n2"
+	ranges[0].LeaderEpoch = 2
+	ranges[0].Version = 2
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges same leader new version: %v", err)
+	}
+	r := metaTestMustRange(t, c, nil)
+	if r.Leader != "n2" || r.LeaderEpoch != 2 || r.LeaderStale() {
+		t.Fatalf("same leader across version = %+v", r)
+	}
+
+	// A leader that is no longer a replica is cleared.
+	ranges = metaTestLeaderRanges()
+	ranges[0].Replicas = []string{"n2", "n3"}
+	ranges[0].Leader = "n1"
+	ranges[0].Version = 3
+	if err := c.SetRanges(ranges); err != nil {
+		t.Fatalf("SetRanges leader removed: %v", err)
+	}
+	if r := metaTestMustRange(t, c, nil); r.Leader != "" || r.LeaderEpoch != 0 {
+		t.Fatalf("non-replica leader kept: %+v", r)
+	}
+}
+
+func TestMetaSplitMergeLeaderHints(t *testing.T) {
+	c := meta.New()
+	if err := c.SetRanges(metaTestLeaderRanges()); err != nil {
+		t.Fatalf("SetRanges: %v", err)
+	}
+	if err := c.UpdateLeader(1, "n1"); err != nil {
+		t.Fatalf("UpdateLeader: %v", err)
+	}
+
+	left, right, err := c.Split(1, []byte("m"))
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	if left.Leader != "n1" || left.LeaderEpoch != left.Version || left.LeaderStale() {
+		t.Fatalf("left hint after split = %+v", left)
+	}
+	if right.Leader != "" || right.LeaderEpoch != 0 {
+		t.Fatalf("new right range invented leader %+v", right)
+	}
+
+	merged, err := c.Merge(1, right.ID)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if merged.Leader != "n1" || merged.LeaderEpoch != merged.Version || merged.LeaderStale() {
+		t.Fatalf("merged hint = %+v", merged)
+	}
+}
+
+func TestMetaRangeHealth(t *testing.T) {
+	r := meta.Range{
+		ID: 1, Replicas: []string{"n1", "n2"}, Leader: "n1",
+		LeaderEpoch: 7, Version: 7,
+	}
+	h := r.Health()
+	if h.ReplicaCount != 2 || !h.LeaderKnown || h.LeaderEpoch != 7 || h.Epoch != 7 || h.Stale {
+		t.Fatalf("health = %+v", h)
+	}
+	r.Version = 8
+	h = r.Health()
+	if !h.Stale || h.LeaderEpoch == h.Epoch {
+		t.Fatalf("stale health = %+v", h)
 	}
 }

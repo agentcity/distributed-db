@@ -10,6 +10,7 @@ import (
 	pbv2 "distributed-db/internal/pb/v2"
 	"distributed-db/internal/pbconv"
 	"distributed-db/internal/raft"
+	"distributed-db/internal/version"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -23,9 +24,20 @@ import (
 // meta servers and development clusters. A Transport built with NewWithTLS
 // uses the supplied client credentials for every peer dial; there is no
 // plaintext fallback once TLS is configured.
+//
+// Every peer dial also carries the protocol version handshake metadata. The
+// observed peer versions are exposed through PeerProtocol, ProtocolRecords and
+// NegotiatedVersion; a peer that answers without handshake metadata is treated
+// as the legacy protocol version.
 type Transport struct {
 	// creds is nil for plaintext transports and non-nil for TLS transports.
 	creds credentials.TransportCredentials
+
+	// protocol records the negotiated version of every Raft peer. The
+	// handshake metadata is attached to every peer dial, so a mixed-version
+	// cluster can be inspected through PeerProtocol even before an election.
+	protocol     *version.Registry
+	protocolOpts []grpc.DialOption
 
 	mu      sync.Mutex
 	clients map[string]pbv2.RaftServiceClient
@@ -49,8 +61,15 @@ func NewWithTLS(clientTLS grpctls.ClientOptions) (*Transport, error) {
 }
 
 func newTransport(creds credentials.TransportCredentials) *Transport {
+	protocol := version.NewRegistry()
+	handshake := version.NewClientHandshake(protocol)
 	return &Transport{
-		creds:   creds,
+		creds:    creds,
+		protocol: protocol,
+		protocolOpts: []grpc.DialOption{
+			grpc.WithChainUnaryInterceptor(handshake.Unary()),
+			grpc.WithChainStreamInterceptor(handshake.Stream()),
+		},
 		clients: make(map[string]pbv2.RaftServiceClient),
 		conns:   make(map[string]*grpc.ClientConn),
 	}
@@ -68,7 +87,10 @@ func (t *Transport) client(peer string) (pbv2.RaftServiceClient, error) {
 		// always carries non-nil creds.
 		creds = insecure.NewCredentials()
 	}
-	cc, err := grpc.NewClient(peer, grpc.WithTransportCredentials(creds))
+	opts := make([]grpc.DialOption, 0, len(t.protocolOpts)+1)
+	opts = append(opts, grpc.WithTransportCredentials(creds))
+	opts = append(opts, t.protocolOpts...)
+	cc, err := grpc.NewClient(peer, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("raftgrpc: dial %s: %w", peer, err)
 	}
@@ -94,6 +116,22 @@ func (t *Transport) RequestVote(ctx context.Context, peer string, req *raft.Requ
 	return &raft.RequestVoteResponse{
 		Term: resp.GetTerm(), VoteGranted: resp.GetVoteGranted(),
 	}, nil
+}
+
+// PreVote implements raft.PreVoteTransport.
+func (t *Transport) PreVote(ctx context.Context, peer string, req *raft.PreVoteRequest) (*raft.PreVoteResponse, error) {
+	c, err := t.client(peer)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.PreVote(ctx, &pbv2.PreVoteRequest{
+		Term: req.Term, CandidateId: req.CandidateID,
+		LastLogIndex: req.LastLogIndex, LastLogTerm: req.LastLogTerm,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raft.PreVoteResponse{Term: resp.GetTerm(), VoteGranted: resp.GetVoteGranted()}, nil
 }
 
 // AppendEntries implements raft.Transport.
@@ -151,6 +189,47 @@ func (t *Transport) Close() {
 	}
 	t.conns = nil
 	t.clients = nil
+}
+
+// PeerProtocol returns the most recent protocol handshake record for a Raft
+// peer. The record is populated by the client-side handshake interceptor on
+// every RPC, so it reflects the peer version observed on the last exchange.
+func (t *Transport) PeerProtocol(peer string) (version.PeerRecord, bool) {
+	if t == nil {
+		return version.PeerRecord{}, false
+	}
+	return t.protocol.Lookup(peer)
+}
+
+// ProtocolRecords returns all observed Raft peer handshake records sorted by
+// address. It is safe to call concurrently with RPCs and Close.
+func (t *Transport) ProtocolRecords() []version.PeerRecord {
+	if t == nil {
+		return nil
+	}
+	return t.protocol.Snapshot()
+}
+
+// NegotiatedVersion returns the peer version from the most recent compatible
+// Raft handshake.
+func (t *Transport) NegotiatedVersion() (version.Version, bool) {
+	if t == nil {
+		return version.Version{}, false
+	}
+	var best version.PeerRecord
+	found := false
+	for _, rec := range t.protocol.Snapshot() {
+		if !rec.Compatible {
+			continue
+		}
+		if !found || rec.LastSeen.After(best.LastSeen) {
+			best, found = rec, true
+		}
+	}
+	if !found {
+		return version.Version{}, false
+	}
+	return best.PeerVersion, true
 }
 
 var _ raft.Transport = (*Transport)(nil)

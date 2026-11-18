@@ -64,6 +64,19 @@ type Node struct {
 	leaderID         string
 	electionDeadline time.Time
 	votes            map[string]bool
+	// lastLeaderContact is the last time a leader RPC (AppendEntries or
+	// InstallSnapshot) was accepted from a leader. It bounds the pre-vote
+	// lease: a follower refuses to pre-vote for a candidate while it has heard
+	// from a leader within ElectionTimeoutMin. A zero value means no leader has
+	// been heard from, so there is no lease to protect.
+	lastLeaderContact time.Time
+	// preVoteRound identifies the in-flight pre-vote attempt and invalidates
+	// responses from an older round. preVotes holds the grants collected for
+	// that round (including the local node) and is nil when no pre-vote is in
+	// progress. Neither value is persisted: a pre-vote never changes the term
+	// or vote.
+	preVoteRound uint64
+	preVotes     map[string]bool
 	// voters and learners are the mutable Raft membership. voters is C_new
 	// (the current voter set outside a joint configuration) and includes this
 	// node when it is a voter. votersOld is C_old and is non-empty exactly
@@ -1188,6 +1201,8 @@ func (n *Node) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRe
 		}
 		n.resetElectionDeadlineLocked()
 	}
+	n.lastLeaderContact = time.Now()
+	n.abortPreVoteLocked()
 	upToDate := req.Snapshot.Index <= n.snapshot.Index || req.Snapshot.Index <= n.commitIndex
 	term := n.term
 	n.mu.Unlock()
@@ -1285,8 +1300,82 @@ func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 		}
 		n.votedFor = req.CandidateID
 	}
+	// A node that grants a real vote must not keep soliciting pre-votes in the
+	// same term; the response that triggered this grant may arrive later.
+	n.abortPreVoteLocked()
 	n.resetElectionDeadlineLocked()
 	return &RequestVoteResponse{Term: n.term, VoteGranted: true}, nil
+}
+
+// HandlePreVote implements the PreVote RPC receiver. A grant is advisory: it
+// never persists a term or a vote and never changes the local term, even when
+// the request carries a higher one. That is what stops an isolated or removed
+// replica from inflating terms: it cannot campaign until a quorum grants a
+// pre-vote, and a cluster with a live leader denies the grant.
+//
+// A grant is refused when:
+//   - the candidate is not a voter in the latest electoral configuration
+//     (including both C_old and C_new while joint);
+//   - this node is the leader, or has heard from a leader within
+//     ElectionTimeoutMin (the election lease);
+//   - the candidate's log is not at least as up to date as this node's.
+func (n *Node) HandlePreVote(ctx context.Context, req *PreVoteRequest) (*PreVoteResponse, error) {
+	if req == nil {
+		return nil, errors.New("raft: nil PreVoteRequest")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped {
+		return nil, ErrStopped
+	}
+	if req.Term < n.term {
+		return &PreVoteResponse{Term: n.term}, nil
+	}
+	electorate := n.electoralConfigLocked()
+	if req.CandidateID == "" || !configVotingMember(electorate, req.CandidateID) {
+		return &PreVoteResponse{Term: n.term, VoteGranted: false}, nil
+	}
+	// Mirror HandleRequestVote: a learner never answers a solicitation. A
+	// removed voter still answers, because peers that have not applied the
+	// final entry may still count its grant; the candidate's own quorum rule
+	// ensures that grant cannot manufacture a majority.
+	if !configVotingMember(electorate, n.cfg.ID) && n.isLearnerLocked(n.cfg.ID) {
+		return &PreVoteResponse{Term: n.term, VoteGranted: false}, nil
+	}
+	if n.preVoteLeaseActiveLocked(time.Now()) {
+		return &PreVoteResponse{Term: n.term, VoteGranted: false}, nil
+	}
+	lastIndex := n.lastIndexLocked()
+	lastTerm := n.lastLogTermLocked()
+	upToDate := req.LastLogTerm > lastTerm ||
+		(req.LastLogTerm == lastTerm && req.LastLogIndex >= lastIndex)
+	return &PreVoteResponse{Term: n.term, VoteGranted: upToDate}, nil
+}
+
+// preVoteLeaseActiveLocked reports whether this node must refuse pre-votes
+// because it still trusts a recent leader. A leader always refuses; a follower
+// refuses for ElectionTimeoutMin after the last accepted leader RPC. Caller
+// holds mu.
+func (n *Node) preVoteLeaseActiveLocked(now time.Time) bool {
+	if n.role == Leader {
+		return true
+	}
+	if n.lastLeaderContact.IsZero() {
+		return false
+	}
+	return now.Sub(n.lastLeaderContact) < n.cfg.ElectionTimeoutMin
+}
+
+// abortPreVoteLocked invalidates the in-flight pre-vote round so late grants
+// cannot start a real election. Caller holds mu.
+func (n *Node) abortPreVoteLocked() {
+	n.preVoteRound++
+	n.preVotes = nil
 }
 
 // HandleAppendEntries implements the RPC receiver. Entries (and any conflict
@@ -1320,6 +1409,11 @@ func (n *Node) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 		}
 		n.resetElectionDeadlineLocked()
 	}
+	// Only a term-valid leader reaches this point. Remember the contact so a
+	// pre-vote from a partitioned or removed candidate is refused while this
+	// node's leader lease is live.
+	n.lastLeaderContact = time.Now()
+	n.abortPreVoteLocked()
 
 	prev := req.PrevLogIndex
 	last := n.lastIndexLocked()
@@ -1654,7 +1748,7 @@ func (n *Node) electionLoop(ctx context.Context) {
 		case Follower, Candidate:
 			if !now.Before(n.electionDeadline) {
 				n.mu.Unlock()
-				n.beginElection()
+				n.beginElection(false)
 				continue
 			}
 		}
@@ -1662,7 +1756,30 @@ func (n *Node) electionLoop(ctx context.Context) {
 	}
 }
 
-func (n *Node) beginElection() {
+// beginElection starts a campaign. Unless force is set — an election
+// explicitly requested by the current leader through TimeoutNow — a node whose
+// transport supports PreVote first runs a pre-vote round. It increments its
+// term and starts a real election only after a quorum of pre-votes, so an
+// isolated or removed replica cannot raise the cluster term.
+func (n *Node) beginElection(force bool) {
+	if !force && n.transportSupportsPreVote() {
+		n.beginPreVote()
+		return
+	}
+	n.startElection()
+}
+
+func (n *Node) transportSupportsPreVote() bool {
+	if n.tr == nil {
+		return false
+	}
+	_, ok := n.tr.(PreVoteTransport)
+	return ok
+}
+
+// beginPreVote solicits pre-votes for n.term+1 without persisting or adopting
+// that term. If a quorum grants, the node starts a real election.
+func (n *Node) beginPreVote() {
 	n.mu.Lock()
 	if n.stopped || n.role == Leader {
 		n.mu.Unlock()
@@ -1676,13 +1793,78 @@ func (n *Node) beginElection() {
 		n.mu.Unlock()
 		return
 	}
+	n.abortPreVoteLocked()
+	round := n.preVoteRound
+	n.preVotes = map[string]bool{n.cfg.ID: true}
+	n.resetElectionDeadlineLocked()
+	req := &PreVoteRequest{
+		Term:         n.term + 1,
+		CandidateID:  n.cfg.ID,
+		LastLogIndex: n.lastIndexLocked(),
+		LastLogTerm:  n.lastLogTermLocked(),
+	}
+	peers := n.electoralVotersExceptSelfLocked()
+	n.wg.Add(len(peers))
+	n.mu.Unlock()
+
+	for _, peer := range peers {
+		go func(peer string) {
+			defer n.wg.Done()
+			n.requestPreVote(peer, req, round)
+		}(peer)
+	}
+
+	// A single-node cluster (whose pre-vote quorum is itself) can start the
+	// real election without waiting for a response.
+	n.mu.Lock()
+	if n.preVotes != nil && n.preVoteRound == round && n.role != Leader &&
+		n.selfIsElectoralVoterLocked() && n.preVoteQuorumLocked() {
+		voteReq, votePeers, ok := n.startElectionLocked()
+		n.mu.Unlock()
+		if ok {
+			n.launchRequestVote(voteReq, votePeers)
+		}
+		return
+	}
+	n.mu.Unlock()
+}
+
+// startElection starts a real election immediately, bypassing PreVote. It is
+// used for the legacy path (transports without PreVote) and for elections
+// explicitly requested by a live leader, whose lease would otherwise reject the
+// pre-vote.
+func (n *Node) startElection() {
+	n.mu.Lock()
+	if n.stopped || n.role == Leader {
+		n.mu.Unlock()
+		return
+	}
+	if !n.selfIsElectoralVoterLocked() {
+		n.resetElectionDeadlineLocked()
+		n.mu.Unlock()
+		return
+	}
+	req, peers, ok := n.startElectionLocked()
+	n.mu.Unlock()
+	if ok {
+		n.launchRequestVote(req, peers)
+	}
+}
+
+// startElectionLocked increments and persists the term, records the self-vote
+// and registers the replication goroutines in the node's wait group. Caller
+// must hold mu and must launch the returned peers after unlocking.
+func (n *Node) startElectionLocked() (*RequestVoteRequest, []string, bool) {
+	if n.stopped || n.role == Leader || !n.selfIsElectoralVoterLocked() {
+		return nil, nil, false
+	}
+	n.abortPreVoteLocked()
 	oldTerm, oldVotedFor := n.term, n.votedFor
 	newTerm := n.term + 1
 	if err := n.store.SaveMeta(newTerm, n.cfg.ID); err != nil {
 		n.logger.Error("raft: persist candidacy failed", "id", n.cfg.ID, "error", err)
 		n.term, n.votedFor = oldTerm, oldVotedFor
-		n.mu.Unlock()
-		return
+		return nil, nil, false
 	}
 	n.term = newTerm
 	n.votedFor = n.cfg.ID
@@ -1700,22 +1882,68 @@ func (n *Node) beginElection() {
 	}
 	peers := n.electoralVotersExceptSelfLocked()
 	n.wg.Add(len(peers))
-	n.mu.Unlock()
+	return req, peers, true
+}
 
+func (n *Node) launchRequestVote(req *RequestVoteRequest, peers []string) {
 	for _, peer := range peers {
 		go func(peer string) {
 			defer n.wg.Done()
-			n.requestVote(peer, req, newTerm)
+			n.requestVote(peer, req, req.Term)
 		}(peer)
 	}
 
 	// A single-node cluster (or one that already has a quorum via previous
 	// grants) becomes leader immediately.
 	n.mu.Lock()
-	if n.role == Candidate && n.term == newTerm && n.voteQuorumLocked() {
+	if n.role == Candidate && n.term == req.Term && n.selfIsElectoralVoterLocked() && n.voteQuorumLocked() {
 		n.becomeLeaderLocked()
 	}
 	n.mu.Unlock()
+}
+
+// requestPreVote delivers one pre-vote and, on a quorum, turns the round into
+// a real election. Late grants from a superseded round are discarded.
+func (n *Node) requestPreVote(peer string, req *PreVoteRequest, round uint64) {
+	tr, ok := n.tr.(PreVoteTransport)
+	if !ok {
+		return
+	}
+	ctx, cancel := n.rpcContext(n.voteTimeout())
+	defer cancel()
+	resp, err := tr.PreVote(ctx, peer, req)
+	if err != nil || resp == nil {
+		return
+	}
+	n.mu.Lock()
+	if n.stopped || n.preVotes == nil || n.preVoteRound != round {
+		n.mu.Unlock()
+		return
+	}
+	if resp.Term > n.term {
+		// A peer is already in a newer term. Adopt it so this node stops
+		// soliciting at a stale term; adoptTerm invalidates the round and does
+		// not grant a vote.
+		if err := n.adoptTermLocked(resp.Term, ""); err != nil {
+			n.logger.Error("raft: adopt higher term failed", "id", n.cfg.ID, "error", err)
+		}
+		n.mu.Unlock()
+		return
+	}
+	if !resp.VoteGranted {
+		n.mu.Unlock()
+		return
+	}
+	n.preVotes[peer] = true
+	if !n.preVoteQuorumLocked() {
+		n.mu.Unlock()
+		return
+	}
+	voteReq, votePeers, ok := n.startElectionLocked()
+	n.mu.Unlock()
+	if ok {
+		n.launchRequestVote(voteReq, votePeers)
+	}
 }
 
 func (n *Node) requestVote(peer string, req *RequestVoteRequest, electionTerm uint64) {
@@ -1754,6 +1982,7 @@ func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
 	n.leaderID = n.cfg.ID
 	n.leaderNoopIndex = 0
+	n.abortPreVoteLocked()
 	// A joint configuration is still an in-progress change: keep the gate
 	// closed and let the finalizer complete it (when AutoFinalize is set).
 	n.configInFlight = n.isJointLocked() || n.pendingConfigLocked()
@@ -2227,6 +2456,7 @@ func (n *Node) stepDownWithErrorLocked(leaderID string, pendingErr error) {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.votes = nil
+	n.abortPreVoteLocked()
 	n.configInFlight = false
 	n.finalInFlight = false
 	// Pending proposals can no longer be completed on this node. Failing them
@@ -2251,6 +2481,7 @@ func (n *Node) adoptTermLocked(term uint64, leaderID string) error {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.votes = nil
+	n.abortPreVoteLocked()
 	n.configInFlight = false
 	n.finalInFlight = false
 	n.failPendingLocked(ErrNotLeader)

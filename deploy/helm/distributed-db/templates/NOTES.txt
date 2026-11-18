@@ -9,6 +9,9 @@ real cluster as part of its validation.
 --------------------------------------------------------------------------
 1. Preconditions (the chart does not create these)
 --------------------------------------------------------------------------
+The chart's values.schema.json validates these fields before rendering. It
+rejects an unpinned "latest" image tag and empty required Secret references.
+
 * Image: {{ include "distributed-db.image" . }}
   Built from the repository Dockerfile as one multi-binary image:
   /app/kv2, /app/sqlsrv, /app/pgsrv, /app/kvctl, /app/kvbackup,
@@ -16,6 +19,9 @@ real cluster as part of its validation.
   published registry image. Publish it and override image.repository/tag:
     make image IMAGE_REPOSITORY=<registry>/distributed-db IMAGE_TAG=<tag>
     make image-push IMAGE_REPOSITORY=<registry>/distributed-db IMAGE_TAG=<tag>
+  When the repository's release workflow runs for a v* tag, it publishes a
+  multi-arch image to GHCR and records the image digest in the GitHub release.
+  Pin image.tag to that release tag; no release is executed by this install.
 * TLS Secret: {{ .Values.tls.existingSecret }}
   Keys: {{ .Values.tls.caKey }}, {{ .Values.tls.certKey }}, {{ .Values.tls.keyKey }}.
   SANs must cover the meta/kv headless wildcards and the meta, sqlsrv and pgsrv

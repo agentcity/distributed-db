@@ -95,6 +95,12 @@ func newRangeGroup(cfg Config, shared storage.Engine, rc RangeConfig, peerCreds 
 	if shared == nil {
 		return nil, fmt.Errorf("kvserver: range %d: shared storage engine is nil", rc.ID)
 	}
+	// Validate every local admin intent before opening/repairing anything. A
+	// corrupt journal must fail closed: guessing between finalize and abort can
+	// lose the right half or leave a range frozen.
+	if _, err := loadAdminIntents(cfg.DataDir); err != nil {
+		return nil, fmt.Errorf("kvserver: range %d: %w", rc.ID, err)
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}

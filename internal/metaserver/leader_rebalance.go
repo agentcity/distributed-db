@@ -151,6 +151,7 @@ func (s *Server) RebalanceLeaders(ctx context.Context) (int, error) {
 			continue
 		}
 
+		s.rememberLeaderHint(st.r.ID, bestTarget, st.r.Version)
 		counts[st.leader]--
 		counts[bestTarget]++
 		states[best].leader = bestTarget
@@ -205,6 +206,7 @@ func (s *Server) queryRangeLeader(ctx context.Context, r meta.Range) (string, er
 			continue
 		}
 		if strings.EqualFold(resp.GetRole(), "leader") {
+			s.rememberLeaderHint(r.ID, addr, r.Version)
 			return addr, nil
 		}
 		if len(hint) == 0 && resp.GetLeader() != "" && slices.Contains(r.Replicas, resp.GetLeader()) {
@@ -212,6 +214,7 @@ func (s *Server) queryRangeLeader(ctx context.Context, r meta.Range) (string, er
 		}
 	}
 	if hint != "" {
+		s.rememberLeaderHint(r.ID, hint, r.Version)
 		return hint, nil
 	}
 	if lastErr == nil {

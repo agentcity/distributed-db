@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"distributed-db/internal/model"
@@ -30,6 +32,16 @@ import (
 //     generation and enough bounds to finish or abort the operation after a
 //     crash. It is written by the apply loop, so a restart can tell a stale
 //     prepare (already resolved) from an operation that is genuinely in flight.
+//   - A per-source-range adminIntent journal file next to ranges.json. It makes
+//     the local map publication crash-consistent: the intent is fsynced before
+//     the data cut / map publish and again afterwards, and recovery compares it
+//     with the local ranges.json to decide finalize vs abort. This closes the
+//     local window only. Meta publication remains a separate coordinator step;
+//     this process cannot observe whether meta's range map was applied, so a
+//     crash after ranges.json was published (but before the coordinator's meta
+//     update) is finalized locally and still depends on the scheduler retry to
+//     publish the same layout to meta. There is deliberately no distributed
+//     commit across meta and the range hosts in this stage.
 //
 // Remaining gaps (deliberately not implemented in this file):
 //
@@ -147,6 +159,360 @@ type adminRecord struct {
 	// range's retained log. It lets replay reproduce the generation timeline
 	// even though the log may start after a snapshot.
 	Gens []genStep `json:"gens,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Durable local admin intent (stage 1: no distributed 2PC)
+// ---------------------------------------------------------------------------
+//
+// adminIntent is a per-source-range journal record written next to
+// ranges.json. It is the local counterpart of the meta range-map transition:
+// the meta map is only published after every replica returned success, and
+// every replica publishes its local ranges.json before returning. Therefore a
+// restart can decide safely from the local map file alone:
+//
+//   - local ranges.json already reflects the intent's target layout -> the
+//     transition is final; clean up leftovers and unfreeze;
+//   - local ranges.json still reflects the old layout -> the transition was
+//     never acknowledged; abort it, restoring the right half from the durable
+//     child copy when a split had already cut the parent.
+//
+// The intent is written with the same temp-file+fsync+rename discipline as
+// ranges.json and is advanced before/after the range-map publication, so at
+// every crash point one of the two decisions above is valid. This closes the
+// local meta<->ranges.json window without pretending the meta map and the
+// local map form a distributed transaction: meta publication is still a
+// separate step performed by the scheduler after all replicas succeed.
+const (
+	adminIntentVersion = 1
+
+	adminIntentPhasePrepared          = "prepared"
+	adminIntentPhaseCopyDone          = "copy_done"
+	adminIntentPhaseMapPublishPending = "map_publish_pending"
+	adminIntentPhaseDone              = "done"
+	adminIntentPhaseAborted           = "aborted"
+
+	adminIntentFilePrefix = "admin-intent-"
+	adminIntentFileSuffix = ".json"
+)
+
+// adminIntent is the durable, per-range record of a split/merge local stage.
+// The JSON field names are part of the on-disk format; keep them stable.
+type adminIntent struct {
+	Version int    `json:"version"`
+	Op      string `json:"op"`
+	Phase   string `json:"phase"`
+
+	// RangeID is the source range: the split parent or the merge left range.
+	// RightID is the new child range for a split or the absorbed right range
+	// for a merge.
+	RangeID uint64 `json:"range_id"`
+	RightID uint64 `json:"right_id,omitempty"`
+
+	// Bounds before the operation. End is the source range's old end (nil
+	// means the end of the keyspace). SplitKey is the split point; RightStart
+	// and RightEnd are the right range's bounds (for a split these mirror
+	// SplitKey/End).
+	Start      []byte `json:"start,omitempty"`
+	End        []byte `json:"end,omitempty"`
+	SplitKey   []byte `json:"split_key,omitempty"`
+	RightStart []byte `json:"right_start,omitempty"`
+	RightEnd   []byte `json:"right_end,omitempty"`
+
+	// Epoch is the source range epoch before the operation (the range version
+	// meta currently has) and NewEpoch is the epoch the local map is published
+	// with.
+	Epoch    uint64 `json:"epoch,omitempty"`
+	NewEpoch uint64 `json:"new_epoch,omitempty"`
+
+	// Generation is the freeze generation established by the prepare
+	// barrier. Recovery raises the in-memory generation to at least this
+	// value so stale writes replayed from the Raft log stay rejected.
+	Generation uint64 `json:"generation,omitempty"`
+
+	// UpdatedAt is advisory status/audit data; it is not used for recovery.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
+// AdminIntentStatus is the public, read-only view of an adminIntent exposed to
+// kvctl/metrics. It intentionally aliases the durable record so no conversion
+// can silently drop a field.
+type AdminIntentStatus = adminIntent
+
+// PendingIntents returns the local split/merge intents that have not reached a
+// terminal phase yet. A corrupt on-disk record is reported through the server
+// log and omitted here (New fails closed on it before serving); callers that
+// need the error should use AdminIntentStatuses.
+func (s *Server) PendingIntents() []AdminIntentStatus {
+	intents, err := s.AdminIntentStatuses()
+	if err != nil {
+		if s.log != nil {
+			s.log.Warn("read pending admin intents", "error", err)
+		}
+		return nil
+	}
+	out := make([]AdminIntentStatus, 0, len(intents))
+	for _, in := range intents {
+		switch in.Phase {
+		case adminIntentPhaseDone, adminIntentPhaseAborted:
+			continue
+		default:
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// AdminIntentStatuses returns every durable local intent, including terminal
+// phases retained until the next recovery pass.
+func (s *Server) AdminIntentStatuses() ([]AdminIntentStatus, error) {
+	return loadAdminIntents(s.cfg.DataDir)
+}
+
+// PendingIntentCount is the metric-friendly form of PendingIntents.
+func (s *Server) PendingIntentCount() int { return len(s.PendingIntents()) }
+
+// adminIntentPath returns the per-range intent file path. One file per source
+// range avoids a shared journal and keeps per-range updates independent.
+func adminIntentPath(dataDir string, rangeID uint64) string {
+	return filepath.Join(dataDir, fmt.Sprintf("%s%d%s", adminIntentFilePrefix, rangeID, adminIntentFileSuffix))
+}
+
+// adminIntentTempPath is the deterministic temp file used by the atomic write
+// below. Admin operations for one range are serialized by adminMu, so a fixed
+// name is safe and lets recovery remove a crash-left temp file.
+func adminIntentTempPath(dataDir string, rangeID uint64) string {
+	return adminIntentPath(dataDir, rangeID) + ".tmp"
+}
+
+// validateAdminIntent rejects a record that cannot drive recovery. Unknown
+// versions/phases/ops are corrupt for this build: fail closed instead of
+// guessing whether to finalize or abort.
+func validateAdminIntent(in adminIntent) error {
+	if in.Version != 0 && in.Version != adminIntentVersion {
+		return fmt.Errorf("unsupported version %d", in.Version)
+	}
+	if in.RangeID == 0 {
+		return fmt.Errorf("range_id is zero")
+	}
+	switch in.Op {
+	case adminKindSplit:
+		if in.RightID == 0 {
+			return fmt.Errorf("split intent has no right range id")
+		}
+		if len(in.SplitKey) == 0 {
+			return fmt.Errorf("split intent has no split key")
+		}
+		if in.Start != nil && bytes.Compare(in.SplitKey, in.Start) <= 0 {
+			return fmt.Errorf("split key %q is not after range start %q", in.SplitKey, in.Start)
+		}
+		if in.End != nil && bytes.Compare(in.SplitKey, in.End) >= 0 {
+			return fmt.Errorf("split key %q is not before range end %q", in.SplitKey, in.End)
+		}
+	case adminKindMerge:
+		if in.RightID == 0 {
+			return fmt.Errorf("merge intent has no right range id")
+		}
+		if in.RightID == in.RangeID {
+			return fmt.Errorf("merge intent has identical left/right range id %d", in.RangeID)
+		}
+		if in.End != nil && in.RightStart != nil && !bytes.Equal(in.End, in.RightStart) {
+			return fmt.Errorf("merge right start %q does not match left end %q", in.RightStart, in.End)
+		}
+		if in.RightStart != nil && in.RightEnd != nil && bytes.Compare(in.RightEnd, in.RightStart) <= 0 {
+			return fmt.Errorf("merge right range [%q,%q) is empty", in.RightStart, in.RightEnd)
+		}
+	default:
+		return fmt.Errorf("unknown op %q", in.Op)
+	}
+	switch in.Phase {
+	case adminIntentPhasePrepared, adminIntentPhaseCopyDone,
+		adminIntentPhaseMapPublishPending, adminIntentPhaseDone, adminIntentPhaseAborted:
+	default:
+		return fmt.Errorf("unknown phase %q", in.Phase)
+	}
+	return nil
+}
+
+// readAdminIntent loads and validates one range's intent. A missing file is
+// (zero, false, nil); malformed or semantically invalid content is an error so
+// group construction can fail closed.
+func readAdminIntent(dataDir string, rangeID uint64) (adminIntent, bool, error) {
+	path := adminIntentPath(dataDir, rangeID)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return adminIntent{}, false, nil
+	}
+	if err != nil {
+		return adminIntent{}, false, fmt.Errorf("kvserver: read admin intent %s: %w", path, err)
+	}
+	var in adminIntent
+	if err := json.Unmarshal(data, &in); err != nil {
+		return adminIntent{}, false, fmt.Errorf("kvserver: corrupt admin intent %s: %w", path, err)
+	}
+	if err := validateAdminIntent(in); err != nil {
+		return adminIntent{}, false, fmt.Errorf("kvserver: corrupt admin intent %s: %w", path, err)
+	}
+	return in, true, nil
+}
+
+// writeAdminIntent atomically replaces one range's intent and fsyncs both the
+// file and its directory. Callers that want the old record to remain valid
+// until the new one is durable get that for free from rename.
+func writeAdminIntent(dataDir string, in adminIntent) error {
+	if err := validateAdminIntent(in); err != nil {
+		return fmt.Errorf("kvserver: invalid admin intent: %w", err)
+	}
+	in.Version = adminIntentVersion
+	in.UpdatedAt = time.Now().UTC()
+	data, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("kvserver: encode admin intent: %w", err)
+	}
+	if err := writeFileAtomic(adminIntentPath(dataDir, in.RangeID), data, 0o644); err != nil {
+		return fmt.Errorf("kvserver: persist admin intent for range %d: %w", in.RangeID, err)
+	}
+	return nil
+}
+
+// clearAdminIntent removes one range's intent (and any crash-left temp file).
+// A missing record is success so recovery/cleanup is idempotent.
+func clearAdminIntent(dataDir string, rangeID uint64) error {
+	path := adminIntentPath(dataDir, rangeID)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("kvserver: remove admin intent %s: %w", path, err)
+	}
+	_ = os.Remove(adminIntentTempPath(dataDir, rangeID))
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("kvserver: fsync data dir after admin intent clear: %w", err)
+	}
+	return nil
+}
+
+// loadAdminIntents scans the data directory for per-range intents. Every file
+// is validated; a corrupt record aborts the scan so New can fail closed. The
+// result is ordered by source range ID for stable status output.
+func loadAdminIntents(dataDir string) ([]adminIntent, error) {
+	entries, err := os.ReadDir(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kvserver: list admin intents: %w", err)
+	}
+	out := make([]adminIntent, 0, 4)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, adminIntentFilePrefix) ||
+			!strings.HasSuffix(name, adminIntentFileSuffix) {
+			continue
+		}
+		rawID := strings.TrimSuffix(strings.TrimPrefix(name, adminIntentFilePrefix), adminIntentFileSuffix)
+		id, err := strconv.ParseUint(rawID, 10, 64)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("kvserver: corrupt admin intent file name %q", name)
+		}
+		in, ok, err := readAdminIntent(dataDir, id)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		if in.RangeID != id {
+			return nil, fmt.Errorf("kvserver: admin intent %s records range %d", name, in.RangeID)
+		}
+		out = append(out, in)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RangeID < out[j].RangeID })
+	return out, nil
+}
+
+// writeFileAtomic writes data to a temp file in the target directory, fsyncs
+// it, renames it over path and fsyncs the directory. The rename is the commit
+// point: readers see either the old or the new complete file, never a torn
+// mix. It is used for both ranges.json and the intent journal.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(dir)
+}
+
+// syncDir makes a rename durable. Directory fsync is supported on the
+// platforms this server targets; callers surface the error because a range-map
+// transition must not be acknowledged before the rename is durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// persistRangesAtomicLocked is the durable range-map writer used by
+// rebuildRangeOrderErr. Caller holds hostMu. Unlike the historical helper it
+// fsyncs the temp file and the parent directory, so the map file cannot be
+// lost after a split/merge was acknowledged.
+func (s *Server) persistRangesAtomicLocked() error {
+	data, err := json.Marshal(s.cfg.Ranges)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(s.cfg.DataDir, "ranges.json"), data, 0o644)
+}
+
+// writeAdminIntent / clearAdminIntent are rangeGroup convenience wrappers so
+// split/merge code does not have to carry dataDir and rangeID separately.
+func (g *rangeGroup) writeAdminIntent(in adminIntent) error {
+	return writeAdminIntent(g.dataDir, in)
+}
+
+func (g *rangeGroup) clearAdminIntent() error {
+	return clearAdminIntent(g.dataDir, g.cfg.ID)
+}
+
+// abortAdminIntent records a terminal abort without deleting the record. A
+// failed operation may leave partial data; keeping the aborted intent lets the
+// next restart run the same idempotent abort/restore path before clearing it.
+func (g *rangeGroup) abortAdminIntent(in *adminIntent) {
+	in.Phase = adminIntentPhaseAborted
+	if err := g.writeAdminIntent(*in); err != nil && g.log != nil {
+		g.log.Warn("persist aborted admin intent", "range", g.cfg.ID, "error", err)
+	}
+}
+
+// currentGeneration returns the freeze generation to stamp into an intent.
+func (m *stateMachine) currentGeneration() uint64 {
+	m.splitMu.RLock()
+	defer m.splitMu.RUnlock()
+	return m.freezeGen
 }
 
 // hostedGroup returns the group with exactly id, or nil. Unlike groupForID it
@@ -802,7 +1168,18 @@ func maxUint64(a, b uint64) uint64 {
 // not published is aborted: copied data is removed (or, for a split whose
 // parent cut already happened, restored from the durable child copy) and the
 // range is left writable. A transition that was published is marked finished.
+//
+// The local adminIntent is validated first (a corrupt record fails closed) and
+// then reconciled after the replicated admin record. The two records describe
+// the same operation from different angles: the admin record is replicated and
+// owns the freeze/generation timeline, while the intent is the local map-
+// publication journal. Running both keeps old crash images (no intent) working
+// and makes repeated recovery idempotent.
 func recoverAdminState(g *rangeGroup) error {
+	intent, hasIntent, err := readAdminIntent(g.dataDir, g.cfg.ID)
+	if err != nil {
+		return err
+	}
 	rec, ok, err := g.sm.readAdminRecord()
 	if err != nil {
 		return err
@@ -814,17 +1191,159 @@ func recoverAdminState(g *rangeGroup) error {
 		if marker, err := g.engine.Get(rangeSplitCopyKey); err == nil && len(marker) > 0 {
 			_ = g.engine.Delete(rangeSplitCopyKey)
 		}
-		return nil
+	} else {
+		switch rec.Kind {
+		case adminKindSplit:
+			if err := recoverSplit(g, rec); err != nil {
+				return err
+			}
+		case adminKindMerge:
+			if err := recoverMerge(g, rec); err != nil {
+				return err
+			}
+		default:
+			// Unknown/newer record: clear it rather than freezing the range.
+			if err := g.sm.recoverAdminAborted(rec); err != nil {
+				return err
+			}
+		}
 	}
-	switch rec.Kind {
+	if hasIntent {
+		return recoverAdminIntent(g, intent)
+	}
+	return nil
+}
+
+// recoverAdminIntent reconciles the local intent with the just-loaded local
+// range map. The decision is made from the map file, which every replica makes
+// durable before acknowledging a split/merge to the meta scheduler:
+//
+//   - target layout present -> finalize (clean leftovers, unfreeze);
+//   - old layout present    -> abort (restore the right half for a split,
+//     remove copied records for a merge, discard scratch state, unfreeze).
+//
+// Every step is idempotent. The terminal phase is fsynced before the journal
+// file is removed, so a crash during recovery merely repeats the same path.
+func recoverAdminIntent(g *rangeGroup, in adminIntent) error {
+	if in.RangeID != g.cfg.ID {
+		return fmt.Errorf("kvserver: admin intent %s for range %d found while recovering range %d",
+			adminIntentPath(g.dataDir, in.RangeID), in.RangeID, g.cfg.ID)
+	}
+	// A crash during the atomic write may have left the temp file behind; the
+	// committed file is authoritative.
+	_ = os.Remove(adminIntentTempPath(g.dataDir, g.cfg.ID))
+
+	finished := false
+	switch in.Op {
 	case adminKindSplit:
-		return recoverSplit(g, rec)
+		published := len(in.SplitKey) > 0 && bytes.Equal(g.cfg.End, in.SplitKey)
+		if published {
+			finished = true
+			// The child is live. Only its recovery marker and any scratch raft
+			// log left by a failed earlier attempt are disposable.
+			child := storage.Prefix(g.shared, rangePrefix(in.RightID))
+			if marker, err := child.Get(rangeSplitCopyKey); err == nil && len(marker) > 0 {
+				_ = child.Delete(rangeSplitCopyKey)
+			}
+		} else {
+			// The parent may already have cut the right half. The durable child
+			// copy is the only complete copy in that case; restore it before
+			// discarding the scratch prefix.
+			copied, err := childCopyComplete(g.shared, in.RightID)
+			if err != nil {
+				return err
+			}
+			if copied {
+				if err := copyPrefixRecords(g.shared, in.RightID, g.cfg.ID, true); err != nil {
+					return fmt.Errorf("kvserver: recover split intent for range %d: restore right half: %w", g.cfg.ID, err)
+				}
+			}
+			discardScratchChild(g.dataDir, g.shared, in.RightID)
+		}
 	case adminKindMerge:
-		return recoverMerge(g, rec)
+		// RightEnd may be nil for a merge that absorbs the end of the keyspace;
+		// bytes.Equal still distinguishes the old left end (non-nil, equal to
+		// RightStart) from the published wider end (nil).
+		published := in.RightID != 0 && bytes.Equal(g.cfg.End, in.RightEnd)
+		if published {
+			finished = true
+			// The left range owns the merged keyspace; the right prefix/log are
+			// redundant and must be removed idempotently.
+			if err := deletePrefixRecords(g.shared, in.RightID); err != nil {
+				return fmt.Errorf("kvserver: recover merge intent for range %d: discard right prefix: %w", g.cfg.ID, err)
+			}
+			discardRangeRaftLog(g.dataDir, in.RightID)
+			g.markMerged(in.RightID)
+		} else {
+			// The merge was not published. Remove records this left range
+			// copied from the right range; the right range still owns them.
+			if err := g.store.DeleteRange(in.RightStart, in.RightEnd); err != nil {
+				return fmt.Errorf("kvserver: recover merge intent for range %d: remove copied right half: %w", g.cfg.ID, err)
+			}
+		}
 	default:
-		// Unknown/newer record: clear it rather than freezing the range.
-		return g.sm.recoverAdminAborted(rec)
+		return fmt.Errorf("kvserver: admin intent for range %d has unknown op %q", g.cfg.ID, in.Op)
 	}
+
+	if err := g.sm.recoverIntentState(in, finished); err != nil {
+		return err
+	}
+	if finished {
+		in.Phase = adminIntentPhaseDone
+		if g.log != nil {
+			g.log.Info("finalized published admin intent after restart",
+				"range", g.cfg.ID, "op", in.Op, "right", in.RightID)
+		}
+	} else {
+		in.Phase = adminIntentPhaseAborted
+		if g.log != nil {
+			g.log.Warn("aborted unpublished admin intent after restart",
+				"range", g.cfg.ID, "op", in.Op, "right", in.RightID, "phase", in.Phase)
+		}
+	}
+	if err := g.writeAdminIntent(in); err != nil {
+		return err
+	}
+	return g.clearAdminIntent()
+}
+
+// recoverIntentState writes the terminal local admin record implied by the
+// intent and clears every freeze marker. It raises the freeze generation to at
+// least the value the intent observed, so stale writes replayed from the Raft
+// log remain rejected after a restart.
+func (m *stateMachine) recoverIntentState(in adminIntent, finished bool) error {
+	m.splitMu.Lock()
+	defer m.splitMu.Unlock()
+	gen := in.Generation
+	if in.NewEpoch > 0 && in.NewEpoch-1 > gen {
+		gen = in.NewEpoch - 1
+	}
+	if gen > m.freezeGen {
+		m.freezeGen = gen
+	}
+	m.adminKind = in.Op
+	if finished {
+		m.adminPhase = adminPhaseFinished
+		m.finishApplied = true
+	} else {
+		m.adminPhase = adminPhaseAborted
+		m.finishApplied = false
+	}
+	switch in.Op {
+	case adminKindSplit:
+		m.adminSplitKey = cloneBytes(in.SplitKey)
+		m.splitNewID = in.RightID
+		m.splitOldEnd = cloneBytes(in.End)
+	case adminKindMerge:
+		m.mergeRightStart = cloneBytes(in.RightStart)
+		m.mergeRightEnd = cloneBytes(in.RightEnd)
+	}
+	m.splitKey = nil
+	m.mergeLeft, m.mergeRight = 0, 0
+	m.localKind = ""
+	m.localDone = false
+	m.abortPending = false
+	return m.persistLocked()
 }
 
 func recoverSplit(g *rangeGroup, rec adminRecord) error {
@@ -886,7 +1405,9 @@ func recoverMerge(g *rangeGroup, rec adminRecord) error {
 		}
 		return nil
 	}
-	merged := len(rec.RightEnd) > 0 && bytes.Equal(g.cfg.End, rec.RightEnd)
+	// RightEnd is legitimately nil when the merged right range is unbounded;
+	// compare it directly so a published merge of the last range is finalized.
+	merged := rec.Right != 0 && bytes.Equal(g.cfg.End, rec.RightEnd)
 	if merged {
 		// The left range already covers the right end: the merge completed on
 		// this host. The right prefix is redundant; remove it idempotently.
@@ -1215,9 +1736,31 @@ func (s *Server) splitLocalLocked(ctx context.Context, g *rangeGroup, splitKey [
 	}
 	rangeID := g.cfg.ID
 	s.hostMu.RLock()
+	oldStart := cloneBytes(g.cfg.Start)
 	oldEnd := cloneBytes(g.cfg.End)
 	oldEpoch := g.cfg.Epoch
 	s.hostMu.RUnlock()
+
+	// Journal the local intent before touching data. The prepared phase is
+	// enough for recovery to decide from ranges.json alone; later phases make
+	// the crash point explicit for status and for the restore path.
+	intent := adminIntent{
+		Op: adminKindSplit, Phase: adminIntentPhasePrepared,
+		RangeID: rangeID, RightID: newID,
+		Start: oldStart, End: oldEnd,
+		SplitKey: cloneBytes(splitKey), RightStart: cloneBytes(splitKey), RightEnd: cloneBytes(oldEnd),
+		Epoch: oldEpoch, NewEpoch: oldEpoch + 1,
+		Generation: g.sm.currentGeneration(),
+	}
+	if err := g.writeAdminIntent(intent); err != nil {
+		return nil, fmt.Errorf("kvserver: split range %d: %w", rangeID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			g.abortAdminIntent(&intent)
+		}
+	}()
 
 	// A previous attempt against this range ID may have left a partial child
 	// prefix or Raft log from a process that crashed before publishing the
@@ -1260,6 +1803,18 @@ func (s *Server) splitLocalLocked(ctx context.Context, g *rangeGroup, splitKey [
 		cleanup()
 		return nil, fmt.Errorf("kvserver: split range %d: mark copy: %w", rangeID, err)
 	}
+	// The copy marker is the evidence recovery uses to restore the right half
+	// after a parent cut. Flush again so the marker itself is durable before
+	// the parent is modified.
+	if err := newGroup.engine.Flush(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("kvserver: split range %d: flush copy marker: %w", rangeID, err)
+	}
+	intent.Phase = adminIntentPhaseCopyDone
+	if err := g.writeAdminIntent(intent); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("kvserver: split range %d: %w", rangeID, err)
+	}
 	if err := newGroup.start(context.Background()); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("kvserver: split range %d: start new group: %w", rangeID, err)
@@ -1267,6 +1822,10 @@ func (s *Server) splitLocalLocked(ctx context.Context, g *rangeGroup, splitKey [
 
 	// The new group owns the right side; the old one keeps only the left.
 	if err := g.store.DeleteRange(splitKey, oldEnd); err != nil {
+		// The child copy is still durable and marked. Restore the right half
+		// before discarding the scratch prefix so a partial delete cannot lose
+		// acknowledged data.
+		_ = copyPrefixRecords(g.shared, newID, rangeID, true)
 		cleanup()
 		return nil, fmt.Errorf("kvserver: split range %d: delete right: %w", rangeID, err)
 	}
@@ -1288,6 +1847,18 @@ func (s *Server) splitLocalLocked(ctx context.Context, g *rangeGroup, splitKey [
 			s.log.Warn("split finish did not replicate; settling locally",
 				"range", rangeID, "new_range", newID, "error", finishErr)
 		}
+	}
+
+	// The map publication is the local commit point. Advance the intent and
+	// fsync it before the in-memory map update / ranges.json write; recovery
+	// then sees either the old map (abort) or the new map (finalize), never an
+	// unjournaled cut.
+	intent.Phase = adminIntentPhaseMapPublishPending
+	intent.Generation = g.sm.currentGeneration()
+	if err := g.writeAdminIntent(intent); err != nil {
+		_ = copyPrefixRecords(g.shared, newID, rangeID, true)
+		cleanup()
+		return nil, fmt.Errorf("kvserver: split range %d: %w", rangeID, err)
 	}
 
 	// Publish the new range map in one hostMu critical section so readers that
@@ -1326,6 +1897,19 @@ func (s *Server) splitLocalLocked(ctx context.Context, g *rangeGroup, splitKey [
 	_ = g.sm.markLocalAdminDone()
 	if !g.sm.adminFinishApplied() {
 		g.sm.forceFinishedSplit()
+	}
+
+	// Record the terminal phase, then remove the journal record. A crash
+	// between these two steps leaves a "done" intent; recovery sees the new
+	// map and finalizes/clears it idempotently.
+	intent.Phase = adminIntentPhaseDone
+	intent.Generation = g.sm.currentGeneration()
+	if err := g.writeAdminIntent(intent); err != nil {
+		return nil, fmt.Errorf("kvserver: split range %d: record completed intent: %w", rangeID, err)
+	}
+	committed = true
+	if err := g.clearAdminIntent(); err != nil {
+		s.log.Warn("clear completed split intent", "range", rangeID, "error", err)
 	}
 
 	// Host-local split can compact the old log because no other replica needs
@@ -1460,6 +2044,27 @@ func (s *Server) mergeLocalLocked(ctx context.Context, left, right *rangeGroup, 
 		Left: left.cfg.ID, Right: rightID,
 		RightStart: cloneBytes(right.cfg.Start), RightEnd: rightEnd,
 	}
+
+	// Journal the local intent on the surviving (left) range before copying.
+	// The right range disappears from ranges.json on success, so the left
+	// record is the one a restart can rely on.
+	intent := adminIntent{
+		Op: adminKindMerge, Phase: adminIntentPhasePrepared,
+		RangeID: left.cfg.ID, RightID: rightID,
+		Start: cloneBytes(left.cfg.Start), End: cloneBytes(left.cfg.End),
+		RightStart: cloneBytes(right.cfg.Start), RightEnd: cloneBytes(rightEnd),
+		Epoch: left.cfg.Epoch, NewEpoch: left.cfg.Epoch + 1,
+		Generation: left.sm.currentGeneration(),
+	}
+	if err := left.writeAdminIntent(intent); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			left.abortAdminIntent(&intent)
+		}
+	}()
 	batch := 0
 	if err := right.store.StreamRange(nil, nil, 1024, func(records []mvcc.Record) error {
 		if right.mergeCopyHook != nil {
@@ -1476,6 +2081,10 @@ func (s *Server) mergeLocalLocked(ctx context.Context, left, right *rangeGroup, 
 	// removed: after the map update they are the only copy in this host.
 	if err := left.engine.Flush(); err != nil {
 		return nil, fmt.Errorf("kvserver: merge: flush copy: %w", err)
+	}
+	intent.Phase = adminIntentPhaseCopyDone
+	if err := left.writeAdminIntent(intent); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: %w", err)
 	}
 
 	// Stop the right group before publishing the wider left end. Once stop
@@ -1494,6 +2103,15 @@ func (s *Server) mergeLocalLocked(ctx context.Context, left, right *rangeGroup, 
 			s.log.Warn("merge finish did not replicate; settling locally",
 				"left", left.cfg.ID, "right", rightID, "error", finishErr)
 		}
+	}
+
+	// Fsync the pending map-publication intent before the local commit point.
+	// A crash after this write but before ranges.json is updated aborts the
+	// merge; a crash after the update finalizes it.
+	intent.Phase = adminIntentPhaseMapPublishPending
+	intent.Generation = left.sm.currentGeneration()
+	if err := left.writeAdminIntent(intent); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: %w", err)
 	}
 
 	s.hostMu.Lock()
@@ -1525,6 +2143,19 @@ func (s *Server) mergeLocalLocked(ctx context.Context, left, right *rangeGroup, 
 		s.log.Warn("merge: discard right prefix failed", "left", left.cfg.ID, "right", rightID, "error", err)
 	}
 	discardRangeRaftLog(left.dataDir, rightID)
+
+	// The wider map and the absorbed data are durable. Record the terminal
+	// phase and clear the journal; a crash between the two leaves a "done"
+	// intent that restart finalizes idempotently.
+	intent.Phase = adminIntentPhaseDone
+	intent.Generation = left.sm.currentGeneration()
+	if err := left.writeAdminIntent(intent); err != nil {
+		return nil, fmt.Errorf("kvserver: merge: record completed intent: %w", err)
+	}
+	committed = true
+	if err := left.clearAdminIntent(); err != nil {
+		s.log.Warn("clear completed merge intent", "left", left.cfg.ID, "error", err)
+	}
 	if stopErr != nil {
 		return nil, fmt.Errorf("kvserver: merge: stop right: %w", stopErr)
 	}
@@ -1572,7 +2203,10 @@ func (s *Server) rebuildRangeOrderErr() error {
 		g := s.groups[id]
 		s.cfg.Ranges = append(s.cfg.Ranges, g.cfg)
 	}
-	return s.persistRangesLocked()
+	// The map file is the local authority recovery compares intents against.
+	// Use the fsynced atomic writer (temp+rename+dir sync) rather than the
+	// historical helper so an acknowledged split/merge cannot lose ranges.json.
+	return s.persistRangesAtomicLocked()
 }
 
 // ---------------------------------------------------------------------------

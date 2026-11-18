@@ -42,6 +42,10 @@ type Op struct {
 
 // RangeInfo describes one range in the meta range map. Start is inclusive and
 // End is exclusive; nil boundaries mean the range is unbounded on that side.
+//
+// LeaderKnown, ReplicaCount, LiveVoters, Epoch and Stale are health fields.
+// They are best-effort: LiveVoters is populated only when the backend can
+// probe KV Status, and a leader is never synthesized when unknown.
 type RangeInfo struct {
 	ID       uint64
 	Start    []byte
@@ -49,6 +53,12 @@ type RangeInfo struct {
 	Replicas []string
 	Leader   string
 	Version  uint64
+
+	LeaderKnown  bool
+	ReplicaCount int
+	LiveVoters   []string
+	Epoch        uint64
+	Stale        bool
 }
 
 // BackupOptions configures one logical backup.
@@ -141,7 +151,7 @@ Commands:
   txn [-file ops.txt]       atomic transaction; stdin: put/delete lines
   shell                     interactive shell (data commands only)
   ping                      check meta/TSO connectivity
-  ranges                    list meta ranges (meta only)
+  ranges                    list meta ranges with leader and live health (meta only)
   init-ranges               bootstrap a fresh single-range meta with KV replicas
   status                    show meta leader, term and range counts (meta only)
   split <range-id> <key>    split a range at key (meta only)
@@ -164,7 +174,10 @@ Global flags:
   -tls-server-name NAME     expected server name for certificate verification
   -admin-token TOKEN        Bearer token for meta/KV admin RPCs (env KVCTL_ADMIN_TOKEN; never printed)
 
-  ranges and status are read-only and never send the admin token. init-ranges,
+  ranges and status are read-only and never send the admin token. ranges also
+  probes each replica's read-only KVService.Status (best-effort, bounded) to
+  fill LEADER, LEADER_KNOWN, LIVE_VOTERS and STALE. Unreachable replicas leave
+  those columns "-" and never fabricate a leader. init-ranges,
   split, merge and decommission are admin operations; when the meta or KV
   server was started with -admin-token, pass -admin-token or set
   KVCTL_ADMIN_TOKEN. decommission sends it on TransferLeader, PromoteReplica,
@@ -544,13 +557,22 @@ func (r *Runner) executeTxn(ctx context.Context, b Backend, cfg Config, args []s
 	return 0
 }
 
+// rangeJSON keeps the original id/start/end/leader/replicas/version fields
+// unchanged for backward compatibility and adds health fields. leader is still
+// emitted even when unknown (empty), while leader_known distinguishes an
+// unknown leader from a genuinely empty one.
 type rangeJSON struct {
-	ID       uint64   `json:"id"`
-	Start    string   `json:"start"`
-	End      string   `json:"end"`
-	Leader   string   `json:"leader"`
-	Replicas []string `json:"replicas"`
-	Version  uint64   `json:"version"`
+	ID           uint64   `json:"id"`
+	Start        string   `json:"start"`
+	End          string   `json:"end"`
+	Leader       string   `json:"leader"`
+	LeaderKnown  bool     `json:"leader_known"`
+	Replicas     []string `json:"replicas"`
+	ReplicaCount int      `json:"replica_count"`
+	LiveVoters   []string `json:"live_voters"`
+	Version      uint64   `json:"version"`
+	Epoch        uint64   `json:"epoch"`
+	Stale        bool     `json:"stale"`
 }
 
 func (r *Runner) executeRanges(ctx context.Context, b Backend, cfg Config, args []string) int {
@@ -568,28 +590,93 @@ func (r *Runner) executeRanges(ctx context.Context, b Backend, cfg Config, args 
 	if cfg.Format == "json" {
 		out := make([]rangeJSON, 0, len(infos))
 		for _, info := range infos {
-			replicas := info.Replicas
-			if replicas == nil {
-				replicas = []string{}
-			}
-			out = append(out, rangeJSON{
-				ID:       info.ID,
-				Start:    display(info.Start, cfg.Hex),
-				End:      display(info.End, cfg.Hex),
-				Leader:   info.Leader,
-				Replicas: replicas,
-				Version:  info.Version,
-			})
+			out = append(out, rangeJSONFromInfo(info, cfg))
 		}
 		return r.writeJSON(out)
 	}
-	fmt.Fprintln(r.out(), "ID\tSTART\tEND\tLEADER\tREPLICAS\tVERSION")
+	fmt.Fprintln(r.out(), "ID\tSTART\tEND\tLEADER\tLEADER_KNOWN\tREPLICAS\tLIVE_VOTERS\tVERSION\tSTALE")
 	for _, info := range infos {
-		fmt.Fprintf(r.out(), "%d\t%s\t%s\t%s\t%s\t%d\n",
+		v := rangeHealth(info)
+		leader := info.Leader
+		if leader == "" {
+			leader = "-"
+		}
+		live := "-"
+		if v.liveVoters != nil {
+			live = strings.Join(v.liveVoters, ",")
+			if live == "" {
+				live = "-"
+			}
+		}
+		fmt.Fprintf(r.out(), "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			info.ID, display(info.Start, cfg.Hex), display(info.End, cfg.Hex),
-			info.Leader, strings.Join(info.Replicas, ","), info.Version)
+			leader, yesNo(v.leaderKnown), strings.Join(info.Replicas, ","),
+			live, v.epoch, yesNo(v.stale))
 	}
 	return 0
+}
+
+// rangeHealthValues is the normalized health view used by both output formats.
+// Missing backend health fields fall back to values derivable from the
+// descriptor, so a backend that cannot probe still reports replica count,
+// leader-known and epoch truthfully.
+type rangeHealthValues struct {
+	leaderKnown  bool
+	replicaCount int
+	liveVoters   []string
+	epoch        uint64
+	stale        bool
+}
+
+func rangeHealth(info RangeInfo) rangeHealthValues {
+	leaderKnown := info.LeaderKnown || info.Leader != ""
+	replicaCount := info.ReplicaCount
+	if replicaCount == 0 {
+		replicaCount = len(info.Replicas)
+	}
+	epoch := info.Epoch
+	if epoch == 0 {
+		epoch = info.Version
+	}
+	return rangeHealthValues{
+		leaderKnown:  leaderKnown,
+		replicaCount: replicaCount,
+		liveVoters:   info.LiveVoters,
+		epoch:        epoch,
+		stale:        info.Stale,
+	}
+}
+
+func rangeJSONFromInfo(info RangeInfo, cfg Config) rangeJSON {
+	v := rangeHealth(info)
+	replicas := info.Replicas
+	if replicas == nil {
+		replicas = []string{}
+	}
+	live := v.liveVoters
+	if live == nil {
+		live = []string{}
+	}
+	return rangeJSON{
+		ID:           info.ID,
+		Start:        display(info.Start, cfg.Hex),
+		End:          display(info.End, cfg.Hex),
+		Leader:       info.Leader,
+		LeaderKnown:  v.leaderKnown,
+		Replicas:     replicas,
+		ReplicaCount: v.replicaCount,
+		LiveVoters:   live,
+		Version:      info.Version,
+		Epoch:        v.epoch,
+		Stale:        v.stale,
+	}
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
 }
 
 type initRangesJSON struct {

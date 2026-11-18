@@ -44,10 +44,19 @@ type PlanRequest struct {
 	// Ranges optionally restricts the plan to a subset of base range ids. An
 	// empty slice means every range in the base manifest.
 	Ranges []uint64
+	// BarrierFrontier is the highest TSO through which a commit-lease/apply
+	// barrier proves that registered commits are visible. Zero means the
+	// caller supplies no frontier. When set, it is an additional upper bound:
+	// RestoreToTS rejects a target above min(checkpoint, archive coverage,
+	// BarrierFrontier) unless AllowUnprovenTarget is set. A caller normally
+	// obtains the value from backup.LeaseBarrier.AppliedFrontier after a
+	// successful WaitApplied.
+	BarrierFrontier uint64
 	// AllowUnprovenTarget lets RestoreToTS execute a target above the newest
-	// TSO observed in the archive. BuildPlan treats that as a warning because
-	// archive completeness cannot be proven; RestoreToTS rejects it by default
-	// with ErrArchiveIncomplete. It has no effect on BuildPlan.
+	// TSO observed in the archive or above the advertised checkpoint/barrier
+	// frontier. BuildPlan treats that as a warning because completeness cannot
+	// be proven; RestoreToTS rejects it by default with ErrArchiveIncomplete.
+	// It has no effect on BuildPlan.
 	AllowUnprovenTarget bool
 }
 
@@ -86,8 +95,11 @@ func (p *Planner) Plan(ctx context.Context, base *backup.Manifest, targetTSO uin
 
 // BuildPlan validates the requested range coverage and produces ordered
 // records. It rejects a target before the base, an unknown needed range, a
-// trimmed prefix that may contain records after the base, and any missing,
-// corrupt or non-contiguous required segment discovered while reading.
+// needed range absent from the archive checkpoint, a trimmed prefix that may
+// contain records after the base, and any missing, corrupt or non-contiguous
+// required segment discovered while reading. A target above the advertised
+// safe high-water is recorded as a warning; RestoreToTS turns that into a
+// fail-closed error unless PlanRequest.AllowUnprovenTarget is set.
 func (p *Planner) BuildPlan(ctx context.Context, req PlanRequest) (*Plan, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -114,6 +126,17 @@ func (p *Planner) BuildPlan(ctx context.Context, req PlanRequest) (*Plan, error)
 	needed, err := neededRanges(baseRanges, req.Ranges)
 	if err != nil {
 		return nil, err
+	}
+	if cp := p.reader.manifest.Checkpoint; cp != nil {
+		// The checkpoint range map is the meta view captured with the safe
+		// high-water. Without split/merge lineage, a needed base range that is
+		// absent from it cannot be proven covered, so the plan fails closed.
+		for _, id := range needed {
+			if !cp.HasRange(id) {
+				return nil, fmt.Errorf("%w: needed range %d is absent from checkpoint tso %d",
+					ErrRangeMismatch, id, cp.TSO)
+			}
+		}
 	}
 	plan := &Plan{
 		Format:        PlanFormatName,
@@ -204,9 +227,13 @@ func (p *Planner) BuildPlan(ctx context.Context, req PlanRequest) (*Plan, error)
 		plan.Warnings = append(plan.Warnings,
 			fmt.Sprintf("archive range %d is not in the base range map; skipped (split/merge lineage is not implemented)", id))
 	}
-	if latest := archiveMaxTSO(p.reader.manifest); latest == 0 || req.TargetTSO > latest {
-		plan.Warnings = append(plan.Warnings,
-			fmt.Sprintf("target tso %d exceeds newest observed archived tso %d; archive completeness is not proven", req.TargetTSO, latest))
+	if req.TargetTSO > req.Base.SnapshotTS {
+		high := advertisedHighWater(p.reader.manifest, req.BarrierFrontier)
+		if high == 0 || req.TargetTSO > high {
+			plan.Warnings = append(plan.Warnings,
+				fmt.Sprintf("target tso %d exceeds advertised safe high-water %d (checkpoint/archive/barrier); archive completeness is not proven",
+					req.TargetTSO, high))
+		}
 	}
 
 	if err := finishPlan(plan); err != nil {
@@ -276,12 +303,14 @@ type RestoreResult struct {
 // are absent from the base, resolve cross-range locks, or perform an atomic
 // cluster cutover.
 //
-// A target above the newest TSO observed for any needed range is rejected
-// with ErrArchiveIncomplete before the sink sees any record unless
-// PlanRequest.AllowUnprovenTarget is set. Gaps, missing segments and corrupt
-// segments found while building the plan are returned before any sink call.
-// A sink error stops the replay and is returned with the confirmed Applied
-// count; there is no rollback.
+// A target above the safe high-water (the smallest of the archive checkpoint,
+// per-needed-range archive coverage and PlanRequest.BarrierFrontier) is
+// rejected with ErrArchiveIncomplete before the sink sees any record unless
+// PlanRequest.AllowUnprovenTarget is set. A target at or below the base is
+// always allowed because the base snapshot is independently complete. Gaps,
+// missing segments and corrupt segments found while building the plan are
+// returned before any sink call. A sink error stops the replay and is returned
+// with the confirmed Applied count; there is no rollback.
 func (p *Planner) RestoreToTS(ctx context.Context, req PlanRequest, sink RestoreSink) (*RestoreResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -294,9 +323,9 @@ func (p *Planner) RestoreToTS(ctx context.Context, req PlanRequest, sink Restore
 		return nil, err
 	}
 	if req.TargetTSO > plan.BaseTSO && !req.AllowUnprovenTarget {
-		latest := coverageTSO(p.reader.manifest, plan.NeededRanges)
+		latest := restoreHighWater(p.reader.manifest, plan.NeededRanges, req.BarrierFrontier)
 		if latest == 0 || req.TargetTSO > latest {
-			return nil, fmt.Errorf("%w: target %d, newest observed archived tso %d across needed ranges",
+			return nil, fmt.Errorf("%w: target %d, safe high-water %d across needed ranges (checkpoint, archive coverage, barrier frontier)",
 				ErrArchiveIncomplete, req.TargetTSO, latest)
 		}
 	}

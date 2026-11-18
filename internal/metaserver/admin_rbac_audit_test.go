@@ -3,6 +3,7 @@ package metaserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"distributed-db/internal/audit"
@@ -17,6 +19,7 @@ import (
 	"distributed-db/internal/grpctls/testutil"
 	"distributed-db/internal/meta"
 	pbv2 "distributed-db/internal/pb/v2"
+	"distributed-db/internal/rbac"
 )
 
 const (
@@ -266,6 +269,39 @@ func TestMetaAdminRBACConfigValidation(t *testing.T) {
 			},
 			want: "AuditLogPath requires",
 		},
+		{
+			name: "audit required without path",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditRequired = true
+			},
+			want: "AuditRequired requires AuditLogPath",
+		},
+		{
+			name: "negative audit max bytes",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditLogMaxBytes = -1
+			},
+			want: "AuditLogMaxBytes must not be negative",
+		},
+		{
+			name: "negative audit max backups",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditLogMaxBytes = 100
+				cfg.AuditLogMaxBackups = -1
+			},
+			want: "AuditLogMaxBackups must not be negative",
+		},
+		{
+			name: "backups without rotation",
+			mutate: func(cfg *Config) {
+				cfg.AdminToken = "secret-token"
+				cfg.AuditLogMaxBackups = 2
+			},
+			want: "AuditLogMaxBackups requires AuditLogMaxBytes",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,5 +338,121 @@ func TestMetaAdminEmptyConfigRemainsPassThrough(t *testing.T) {
 	resp, err := cl.SetRanges(ctx, setRangesRequest(3))
 	if err != nil || !resp.GetSuccess() {
 		t.Fatalf("SetRanges with empty config = %v %+v, want success", err, resp)
+	}
+}
+
+// metaFailingAuditWriter simulates a full or unwritable audit sink.
+type metaFailingAuditWriter struct{}
+
+func (metaFailingAuditWriter) Write([]byte) (int, error) {
+	return 0, errors.New("meta audit disk full")
+}
+
+func TestMetaAuditRequiredFailsClosedOnWriteError(t *testing.T) {
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: map[string]string{"token": "admin"}})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	auditLog := audit.NewWriter(metaFailingAuditWriter{}, audit.Options{})
+	interceptor := newMetaAdminInterceptor(policy, auditLog, true)
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer token"))
+
+	called := false
+	_, err = interceptor(ctx, setRangesRequest(2),
+		&grpc.UnaryServerInfo{FullMethod: pbv2.MetaService_SetRanges_FullMethodName},
+		func(context.Context, any) (any, error) {
+			called = true
+			return &pbv2.SetRangesResponse{Success: true}, nil
+		})
+	if !called {
+		t.Fatal("handler was not called; the post-handler audit check should run")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("required audit error = %v, want Unavailable", err)
+	}
+	if strings.Contains(err.Error(), "disk full") || strings.Contains(err.Error(), "token") {
+		t.Fatalf("fail-closed error leaked audit internals: %v", err)
+	}
+}
+
+func TestMetaAuditBestEffortStillSucceedsOnWriteError(t *testing.T) {
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: map[string]string{"token": "admin"}})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	auditLog := audit.NewWriter(metaFailingAuditWriter{}, audit.Options{})
+	interceptor := newMetaAdminInterceptor(policy, auditLog, false)
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer token"))
+
+	resp, err := interceptor(ctx, setRangesRequest(2),
+		&grpc.UnaryServerInfo{FullMethod: pbv2.MetaService_SetRanges_FullMethodName},
+		func(context.Context, any) (any, error) {
+			return &pbv2.SetRangesResponse{Success: true}, nil
+		})
+	if err != nil {
+		t.Fatalf("best-effort audit rejected the RPC: %v", err)
+	}
+	if !resp.(*pbv2.SetRangesResponse).GetSuccess() {
+		t.Fatalf("best-effort response = %+v, want success", resp)
+	}
+}
+
+func TestMetaAuditRequiredPreflightRejectsBrokenSink(t *testing.T) {
+	policy, err := rbac.NewPolicy(rbac.Config{Tokens: map[string]string{"token": "admin"}})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	auditLog, err := audit.Open(filepath.Join(t.TempDir(), "audit.jsonl"), audit.Options{})
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	if err := auditLog.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	interceptor := newMetaAdminInterceptor(policy, auditLog, true)
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer token"))
+
+	called := false
+	_, err = interceptor(ctx, setRangesRequest(2),
+		&grpc.UnaryServerInfo{FullMethod: pbv2.MetaService_SetRanges_FullMethodName},
+		func(context.Context, any) (any, error) {
+			called = true
+			return &pbv2.SetRangesResponse{Success: true}, nil
+		})
+	if called {
+		t.Fatal("handler ran with a broken fail-closed audit sink")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("preflight error = %v, want Unavailable", err)
+	}
+}
+
+func TestMetaOpenAdminAuditPropagatesRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-rotate-audit.jsonl")
+	l, err := openMetaAdminAudit(Config{
+		AdminToken:         "rotate-token",
+		AuditLogPath:       path,
+		AuditLogMaxBytes:   64,
+		AuditLogMaxBackups: 2,
+	})
+	if err != nil {
+		t.Fatalf("openMetaAdminAudit: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		if err := l.Record(audit.Event{
+			Principal: "operator", Role: "operator", Method: "/m",
+			Result: audit.ResultSuccess, ErrorClass: audit.ErrorClassNone,
+		}); err != nil {
+			t.Fatalf("Record %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("openMetaAdminAudit did not enable rotation: %v", err)
 	}
 }
