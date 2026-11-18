@@ -35,7 +35,7 @@ liveness/доступность, **C** — capacity. Вероятность — 
 
 | # | Отказ | Класс | Blast radius | Вероятность | Доказательство |
 |---|---|---|---|---|---|
-| R1 | Joint/restart stress нестабилен, 1000 changes gated; decommission CLI есть, но stress/e2e под failover не доказан | S | кластер: ошибка оператора | средняя | [kvserver/decommission.go](../../internal/kvserver/decommission.go), [raft/joint.go](../../internal/raft/joint.go) |
+| R1 | 1000-change stress стабилен и в CI; нет pre-vote и multi-host stress; decommission под failover не доказан | S | кластер: ошибка оператора | средняя | [kvserver/decommission.go](../../internal/kvserver/decommission.go), [raft/joint.go](../../internal/raft/joint.go) |
 | R2 | Joint quorum реализован, но configInFlight/lease и snapshot install требуют multi-host проверки | S | range: потеря конфигурации | низкая–средняя | [raft/joint.go](../../internal/raft/joint.go) |
 | R3 | meta/Raft divergence: `AddReplica` ранний возврат по `containsAddr`; `RemoveReplica` меняет Raft раньше карты | S (control plane) | range: карта врёт, починки нет | средняя | [metaserver/membership.go:58](../../internal/metaserver/membership.go#L58), [:162](../../internal/metaserver/membership.go#L162) |
 | R4 | Split/merge finish реплицирован, но meta↔ranges.json переход не атомарен; crash в окне оставляет старую карту | S/D | range (оба ребёнка) | средняя при crash | [kvserver/split.go](../../internal/kvserver/split.go), [service.go](../../internal/kvserver/service.go) |
@@ -73,7 +73,7 @@ RPO 0 недостижим: `durability=sync` защищает только от
 
 | Область | Что есть | Чего нет |
 |---|---|---|
-| Membership | joint consensus, config snapshot/epoch, decommission CLI/orchestration | 1000-change stress нестабилен и gated; нет multi-host |
+| Membership | joint consensus, config snapshot/epoch, decommission CLI/orchestration, 1000-change CI stress | нет pre-vote/multi-host |
 | Crash | 1 узел, 32 ключа, SIGKILL, sync/fast | нет power-loss, краха в 2PC/split/snapshot, ENOSPC, slow disk |
 | 2PC | recovery после commit primary, commit-incomplete, resolver, response loss | нет смерти клиента с осиротевшим secondary-локом, нет краха во время commit |
 | Split/merge | freeze/unfreeze, generation-check, duplicate finish, copy-failure | нет краха/рестарта с prepare в логе, replicated clear, расхождения реплик |
@@ -84,7 +84,7 @@ RPO 0 недостижим: `durability=sync` защищает только от
 
 | # | Инвестиция | Зачем | Эффект | Оценка |
 |---|---|---|---|---|
-| 1 | Починить joint/restart stress; 1000 changes в CI | R1/R2 | закрывает операционный блокер G2 | 4–6 pw |
+| 1 | Pre-vote + multi-host joint stress | R1/R2 | закрывает остаточный G2-риск | 4–6 pw |
 | 2 | Lifecycle hardening: GC memory/range, snapshot leadership gate, Raft WAL ENOSPC | R7/R8 | держит RTO и диск на 100+ ГБ | 3–4 pw |
 | 3 | Атомарный split/merge: split как реплицированная запись, снапшот ребёнка от лидера, идемпотентное завершение и разморозка | R4/R5 | убирает потерю ack и расхождение реплик | 4–6 pw |
 | 4 | Crash/chaos-контур: инъекции в 2PC/commit/snapshot/split, ENOSPC, power-loss, 72 ч soak, linearizability checker | нет доказательств для G1/G6 | превращает «зелёный CI» в проверяемые инварианты | 4–6 pw |

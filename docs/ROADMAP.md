@@ -228,7 +228,7 @@ SQL:
 
 Не закрыто:
 
-- joint/restart stress, 1000 changes в CI, meta↔map atomicity;
+- pre-vote/multi-host joint stress, meta↔map atomicity;
 - PITR integration, restore drills;
 - TLS/auth fail-closed, KV admin auth, RBAC/audit/encryption at rest;
 - rolling upgrade/operator, SLO p99 и 1 ТБ soak;

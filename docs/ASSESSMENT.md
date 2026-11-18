@@ -104,7 +104,7 @@ DBaaS и не замена PostgreSQL.
    pgwire — один статический пользователь;
    v1 HTTP имеет Basic Auth/TLS, edgehash — TLS/Bearer.
 6. Membership safety: joint consensus, config snapshot, decommission CLI и
-   orchestration есть; 1000-change stress нестабилен и gated.
+   orchestration есть; 1000-change stress в CI; нет pre-vote.
 7. Rolling upgrade/rollback и совместимость протоколов.
 8. Multi-AZ/geo placement и capacity-aware rebalance.
 

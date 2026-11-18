@@ -56,8 +56,8 @@
 
 Сейчас: joint consensus C_old,new, config snapshot/epoch, decommission
 orchestration + `kvctl decommission` и meta fan-out token реализованы.
-1000-change stress есть, но по умолчанию gated (`RAFT_JOINT_STRESS=1`) и
-показывает редкую расходимость под нагрузкой; multi-host проверки нет.
+1000-change stress стабилен (3× race), включён отдельным CI job;
+multi-host проверки и pre-vote нет.
 
 Реализовать:
 
@@ -216,7 +216,7 @@ TLS/Bearer.
 
 Не закрыто:
 
-- 1000 random changes под failover: stress gated и пока нестабилен;
+- pre-vote; multi-host stress; decommission под failover;
 - PITR integration (Raft WAL/meta/TSO/isolated restore); backup barrier
   wired, но нужен drill;
 - fail-closed TLS, admin-listener, audit rotation/fail-closed, at-rest;
@@ -226,7 +226,7 @@ TLS/Bearer.
 
 ## 7. Ближайшие 2–4 недели
 
-1. Починить joint/restart convergence stress; 1000 changes в CI.
+1. Pre-vote и multi-host joint stress; decommission под failover.
 2. Meta↔range-map atomic split/merge (distributed 2PC).
 3. PITR WAL/meta/TSO integration + restore drill.
 4. Fail-closed TLS, admin-listener, audit rotation/at-rest.

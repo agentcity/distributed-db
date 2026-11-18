@@ -119,7 +119,7 @@ crash-atomic cache. Mobile SDK — scaffold: не собран и не пров�
 1. **Membership safety**
    - joint consensus и config snapshot есть;
    - decommission orchestration есть, но не подключён к RPC/CLI;
-   - нет 1000 random changes под failover и политики замены узла;
+   - 1000 random changes в CI есть; нет pre-vote и политики замены узла;
    - удалённый узел может хранить stale state.
 
 2. **Данные и восстановление**

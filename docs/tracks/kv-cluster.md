@@ -57,7 +57,7 @@ v1 и v2 — разные кластеры и разные бинари. Не з
 - Membership: learner → voter → remove, single-server change; изменения
   сериализуются. `kvctl decommission` снимает реплику через
   transfer/promote/remove и обновляет meta range map; capacity-политика и
-  1000 random changes не закрыты.
+  1000 random changes в CI; pre-vote/multi-host не закрыты.
 - Backup/restore — логический (`cmd/kvbackup`, TLS/admin-token); PITR archive
   MVP и adapter-seam есть, но runtime integration и restore drills нет.
 
