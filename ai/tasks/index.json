@@ -316,5 +316,11 @@
     "title": "Joint consensus convergence",
     "status": "done",
     "file": "0053-joint-convergence.md"
+  },
+  {
+    "id": "0054",
+    "title": "Sprint 2 — code-only hardening",
+    "status": "in_progress",
+    "file": "0054-code-only-sprint.md"
   }
 ]
