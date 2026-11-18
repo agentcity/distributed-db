@@ -1,8 +1,7 @@
 # Оценка предложения и план спринтов
 
 - Дата: 2026-11-18
-- Контекст: после safety/recovery wave (joint consensus, split recovery,
-  ScanForBackup, PITR archive MVP, admin auth).
+- Контекст: после Sprint 1, Docker-спринта и фикса joint convergence.
 - Планирование: **8 субагентов на спринт**, 4 недели на спринт.
 
 ## 1. Вердикт
@@ -22,11 +21,11 @@ decommission, RBAC/audit. Edgehash остаётся **встроенным ко�
 
 | # | Предложение | Факт | Вердикт | Приоритет |
 |---|---|---|---|---|
-| 1 | Joint Consensus | Уже есть: C_old,new, joint quorum, auto-finalize, snapshot/epoch. Нет 1000 random changes, e2e через gRPC, decommission RPC/CLI | **Принять частично**: не переписывать, а доказать и закрыть decommission | P0 |
+| 1 | Joint Consensus | C_old,new, joint quorum, snapshot/epoch, decommission CLI, 1000-change stress (3× race) и CI job | **Закрыто по stress**; остались pre-vote и multi-host | P0 |
 | 2 | Per-chunk CRC снапшотов | Есть общий CRC32 всего снапшота и incremental CRC потока; проверка — в конце. Per-chunk CRC нет | **Принять**: defense-in-depth, ранний отказ, меньше IO при битом чанке. Не safety-critical: общий CRC уже не даёт установить битый снапшот | P1 |
 | 3 | Edgehash как отдельная сборка | Bloom+Merkle+Ed25519, HTTP/cache, TLS/Bearer; mobile — каркас; рецептов Workers/Nginx/Envoy нет | **Не выделять в продукт.** Оставить в репо; опциональный `cmd/edgehash` build — идея на подумать | P2 |
-| 4 | Soak 72 ч / 100 ГБ–1 ТБ / p99 | Есть loopback-бенчи и 1 ТБ harness; реального 1 ТБ и 72 ч прогона нет. 8.6k tx/s — loopback pipeline, не SLO | **Принять, P0**: это главный недостающий evidence | P0 |
-| 5 | mTLS + RBAC + audit | mTLS/TLS есть opt-in; RBAC/audit/at-rest нет; KV admin token есть, но meta fan-out его не передаёт | **Принять с поправкой**: mTLS не «доделать», а сделать fail-closed; RBAC/audit — новое | P0 |
+| 4 | Soak 72 ч / 100 ГБ–1 ТБ / p99 | Harness готов (`test/soak_test.go`), реального 1 ТБ и 72 ч прогона нет. 8.6k tx/s — loopback pipeline, не SLO | **Принять, P0**: главный недостающий evidence | P0 |
+| 5 | mTLS + RBAC + audit | TLS/mTLS, RBAC/audit MVP, admin token и meta fan-out есть; нет fail-closed, CLI wiring, rotation, at-rest | **Принять с поправкой**: включить и ужесточить, не писать заново | P0 |
 | 6 | Разделить roadmap на треки и туториалы | Сейчас один ROADMAP; документация уже без исторических цифр | **Принять, P2**: полезно для community, но после safety/evidence | P2 |
 
 ### 2.1 Что в предложении неверно
@@ -76,7 +75,15 @@ decommission, RBAC/audit. Edgehash остаётся **встроенным ко�
 
 ## 4. Спринты по 8 субагентов
 
-### Sprint 1 — Evidence & closure (4 недели)
+### Статус
+
+- **Sprint 1 — закрыт:** joint stress/fix, decommission CLI, PITR adapter/barrier,
+  per-chunk CRC, RBAC/audit MVP, kvbackup TLS, soak harness, docs tracks.
+- **Docker-спринт — закрыт:** multi-arch image, demo/cluster compose,
+  bootstrap, quickstart.
+- **Joint convergence — исправлен:** 1000 changes 3× race, CI job.
+
+### Sprint 1 — Evidence & closure (закрыт, 4 недели)
 
 | # | Срез | Владелец-пакет | Выход |
 |---|---|---|---|
@@ -96,29 +103,29 @@ decommission, RBAC/audit. Edgehash остаётся **встроенным ко�
 
 | # | Срез | Выход |
 |---|---|---|
-| 1 | 72 ч soak на 3–5 узлах, memory/WAL/compaction | p99/leaks отчёт |
-| 2 | 1 ТБ multi-host, Linux/NVMe, YCSB/TPC-C-like | SLO-отчёт |
-| 3 | Restore drill: RPO/RTO, isolated restore, PITR | drill report |
-| 4 | RBAC enforcement + audit export + key rotation | security tests |
-| 5 | Per-chunk CRC chaos: corrupt/loss/latency | fail-closed тесты |
-| 6 | `kvbackup` TLS/admin-token production path | restore через TLS |
-| 7 | Optional edgehash build spike (timeboxed, no product split) | build/README note |
-| 8 | Mobile SDK: pinning/Bearer/offline | alpha SDK |
+| 1 | 72 ч soak на 3–5 узлах: memory/GC/WAL/compaction/p99 | отчёт с графиками |
+| 2 | 1 ТБ multi-host на Linux/NVMe, YCSB/TPC-C-like | SLO-отчёт |
+| 3 | PITR: Raft WAL/meta/TSO archive, 1PC barrier wiring, isolated restore | restore-to-TS + drill |
+| 4 | Pre-vote + multi-host joint stress + decommission под failover | G2 evidence |
+| 5 | Fail-closed TLS, RBAC CLI wiring, audit rotation/export, at-rest | security tests |
+| 6 | Meta↔range-map atomic split/merge (distributed 2PC) | crash-consistent split |
+| 7 | Registry publish + Helm install/upgrade/rollback на реальном кластере | release report |
+| 8 | `kvctl ranges`/status: заполнять leader и health, убрать пустой LEADER | truthful status |
 
-Критерий выхода: G1/G3/G6 evidence, security gaps P0 закрыты или явно
-перечислены; edgehash примеры воспроизводимы.
+Критерий выхода: G1/G3/G6 evidence; security P0 закрыты или перечислены;
+реальный кластер развёрнут и обновлён.
 
 ### Sprint 3 — Product & community (4 недели)
 
 | # | Срез | Выход |
 |---|---|---|
-| 1 | Optional edgehash build packaging (not a product) | convenience build |
-| 2 | Edgehash integrated benchmarks/limits | отчёт |
-| 3 | SQL 5-minute quickstart | tutorial |
-| 4 | Edgehash integrated quickstart | tutorial |
-| 5 | Multi-arch image + chart install/upgrade/rollback | release |
-| 6 | Protocol versioning / mixed-version test | compatibility report |
-| 7 | CONTRIBUTING/RFC templates | docs |
+| 1 | Protocol versioning / mixed-version rolling upgrade | compatibility report |
+| 2 | Multi-AZ placement/operator, decommission policy | ops runbook |
+| 3 | SQL: AND/OR, >2 JOIN, NULL/DECIMAL, pg_catalog/JDBC | SQL scope decision |
+| 4 | Edgehash integrated benchmarks/limits (not a product) | отчёт |
+| 5 | SQL 5-minute and Docker 2-minute tutorials refresh | tutorials |
+| 6 | CONTRIBUTING/RFC templates | docs |
+| 7 | Backup/restore drill automation | CI drill |
 | 8 | Final production gate audit | scorecard |
 
 ## 5. Зависимости и риски
