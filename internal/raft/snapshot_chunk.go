@@ -882,6 +882,19 @@ func (n *Node) finishSnapshotChunk(recv *snapshotChunkRecv) (*InstallSnapshotChu
 		Membership: cloneMembership(recv.membership),
 	}
 	if err := n.RestoreSnapshotStream(meta, recv.file); err != nil {
+		if errors.Is(err, ErrStaleSnapshotMembership) {
+			// Same rule as the unary install: a snapshot whose membership is
+			// older than the local configuration adds no prefix when the log
+			// already reaches its index. Acknowledge coverage so the leader
+			// switches to AppendEntries instead of retrying this snapshot.
+			n.mu.Lock()
+			covered := recv.index <= n.lastIndexLocked()
+			term := n.term
+			n.mu.Unlock()
+			if covered {
+				return &InstallSnapshotChunkResponse{Term: term, Success: true, LastIndex: recv.index}, nil
+			}
+		}
 		return nil, err
 	}
 	n.mu.Lock()

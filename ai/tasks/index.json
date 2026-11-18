@@ -310,5 +310,11 @@
     "title": "Sprint 2 — Docker multi-arch и Compose",
     "status": "done",
     "file": "0052-docker-sprint.md"
+  },
+  {
+    "id": "0053",
+    "title": "Joint consensus convergence",
+    "status": "done",
+    "file": "0053-joint-convergence.md"
   }
 ]

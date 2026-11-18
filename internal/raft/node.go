@@ -1200,6 +1200,21 @@ func (n *Node) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRe
 		return &InstallSnapshotResponse{Term: term, Success: true, LastIndex: last}, nil
 	}
 	if err := n.RestoreSnapshot(req.Snapshot); err != nil {
+		if errors.Is(err, ErrStaleSnapshotMembership) {
+			// The local configuration is newer than the snapshot's
+			// membership, so installing it would move the configuration
+			// backwards. If the local log already reaches the snapshot index,
+			// the prefix is covered and the leader can reconcile the suffix
+			// with AppendEntries; reporting failure here would leave the
+			// leader re-sending the same stale snapshot forever.
+			n.mu.Lock()
+			covered := req.Snapshot.Index <= n.lastIndexLocked()
+			term := n.term
+			n.mu.Unlock()
+			if covered {
+				return &InstallSnapshotResponse{Term: term, Success: true, LastIndex: req.Snapshot.Index}, nil
+			}
+		}
 		return nil, err
 	}
 	n.mu.Lock()
@@ -1243,7 +1258,16 @@ func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	// the candidate still needs majorities of both sets to win, so this is the
 	// standard joint-consensus election rule.
 	electorate := n.electoralConfigLocked()
-	if !configVotingMember(electorate, req.CandidateID) || !configVotingMember(electorate, n.cfg.ID) {
+	if !configVotingMember(electorate, req.CandidateID) {
+		return &RequestVoteResponse{Term: n.term, VoteGranted: false}, nil
+	}
+	// A learner never votes. A removed voter, however, must still answer: when
+	// this node already applied the final entry of a joint change it is no
+	// longer a voter, but peers that have not learned the final commit still
+	// need a C_old majority to elect the leader that will deliver it. Their
+	// candidate counts a vote only from members of its own electoral
+	// configuration, so a removed node's grant cannot manufacture a quorum.
+	if !configVotingMember(electorate, n.cfg.ID) && n.isLearnerLocked(n.cfg.ID) {
 		return &RequestVoteResponse{Term: n.term, VoteGranted: false}, nil
 	}
 	lastIndex := n.lastIndexLocked()
@@ -1897,6 +1921,20 @@ func (n *Node) sendAppendEntries(leaderCtx context.Context, peer string, term ui
 			newNext = next - 1
 		} else {
 			newNext = 1
+		}
+	}
+	// A conflict at or below the compacted prefix means the follower may
+	// already hold the snapshot boundary: a follower reports the snapshot
+	// index when the conflicting term also covers that snapshot. Probe with
+	// AppendEntries from snapshot.Index+1 first instead of repeating
+	// InstallSnapshot, which the follower would answer as "already covered"
+	// and the leader would loop on forever. Only when that boundary probe
+	// itself fails does the follower actually need the payload.
+	if snapIndex > 0 && newNext <= snapIndex {
+		if prev == snapIndex {
+			newNext = snapIndex
+		} else {
+			newNext = snapIndex + 1
 		}
 	}
 	oldNext := n.nextIndex[peer]

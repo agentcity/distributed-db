@@ -318,24 +318,7 @@ func (s *jointStress) waitOneLeader(ids []string, timeout time.Duration) (*raft.
 	}
 	for _, id := range ids {
 		if node := s.c.nodes[id]; node != nil {
-			st := node.Status()
-			votedFor := ""
-			if persisted, err := s.c.stores[id].Load(); err == nil {
-				votedFor = persisted.VotedFor
-			}
-			s.logf("no-leader status %s: role=%s term=%d votedFor=%q learner=%v leader=%q joint=%v voters=%v old=%v new=%v epoch=%d commit=%d applied=%d",
-				id, st.Role, st.Term, votedFor, st.Learner, st.Leader, st.Joint, st.Voters, st.VotersOld, st.VotersNew, st.ConfigEpoch, st.CommitIndex, st.LastApplied)
-			if persisted, err := s.c.stores[id].Load(); err == nil {
-				lastTerm := uint64(0)
-				if n := len(persisted.Entries); n > 0 {
-					lastTerm = persisted.Entries[n-1].Term
-				}
-				lastIndex := uint64(0)
-				if n := len(persisted.Entries); n > 0 {
-					lastIndex = persisted.Entries[n-1].Index
-				}
-				s.logf("no-leader log %s: lastIndex=%d lastTerm=%d entries=%d", id, lastIndex, lastTerm, len(persisted.Entries))
-			}
+			s.logNodeState(id)
 		}
 	}
 	s.logf("no-leader config: voters=%v learners=%v old=%v new=%v", s.voters, s.learners, s.oldVoters, s.newVoters)
@@ -346,6 +329,74 @@ func (s *jointStress) waitOneLeader(ids []string, timeout time.Duration) (*raft.
 func (s *jointStress) stableLeader(ids []string) (*raft.Node, string) {
 	s.t.Helper()
 	return s.c.waitLeader(ids, stressLeaderTimeout)
+}
+
+// logNodeState emits the applied configuration, the installed snapshot and the
+// tail of the durable log for one node. It is called only when a convergence or
+// leader wait fails, to make whether the replica is behind on replication or on
+// configuration recovery visible in the failure log.
+func (s *jointStress) logNodeState(id string) {
+	s.t.Helper()
+	node := s.c.nodes[id]
+	if node == nil {
+		s.logf("state %s: no node", id)
+		return
+	}
+	st := node.Status()
+	votedFor := ""
+	lastTerm := uint64(0)
+	store := s.c.stores[id]
+	var persisted raft.PersistentState
+	haveLog := false
+	if store != nil {
+		if p, err := store.Load(); err == nil {
+			persisted = p
+			haveLog = true
+			votedFor = p.VotedFor
+			if n := len(p.Entries); n > 0 {
+				lastTerm = p.Entries[n-1].Term
+			}
+		}
+	}
+	s.logf("state %s: role=%s term=%d votedFor=%q leader=%q learner=%v joint=%v voters=%v old=%v new=%v learners=%v epoch=%d last=%d lastTerm=%d commit=%d applied=%d",
+		id, st.Role, st.Term, votedFor, st.Leader, st.Learner, st.Joint,
+		st.Voters, st.VotersOld, st.VotersNew, st.Learners, st.ConfigEpoch,
+		st.LastIndex, lastTerm, st.CommitIndex, st.LastApplied)
+	if store != nil {
+		if meta, rc, err := store.OpenSnapshot(); err == nil {
+			if rc != nil {
+				_ = rc.Close()
+			}
+			snapEpoch := uint64(0)
+			var snapVoters, snapOld, snapLearners []string
+			if meta.Membership != nil {
+				snapEpoch = meta.Membership.ConfigEpoch
+				snapVoters = meta.Membership.Voters
+				snapOld = meta.Membership.VotersOld
+				snapLearners = meta.Membership.Learners
+			}
+			s.logf("state %s snapshot: index=%d term=%d epoch=%d voters=%v old=%v learners=%v",
+				id, meta.Index, meta.Term, snapEpoch, snapVoters, snapOld, snapLearners)
+		}
+	}
+	if !haveLog {
+		return
+	}
+	from := len(persisted.Entries) - 6
+	if from < 0 {
+		from = 0
+	}
+	for _, e := range persisted.Entries[from:] {
+		if e.Type == raft.CommandJointConfig || e.Type == raft.CommandFinalConfig {
+			data, err := raft.DecodeConfigEntry(e.Value)
+			if err == nil {
+				s.logf("state %s entry %d term=%d type=%s epoch=%d old=%v voters=%v learners=%v auto=%v",
+					id, e.Index, e.Term, e.Type, data.Epoch, data.VotersOld, data.Voters, data.Learners, data.AutoFinalize)
+				continue
+			}
+		}
+		s.logf("state %s entry %d term=%d type=%s key=%q", id, e.Index, e.Term, e.Type, e.Key)
+	}
 }
 
 // requireMembersConverged waits until every member reports the leader's final
@@ -377,9 +428,7 @@ func (s *jointStress) requireMembersConverged(leader *raft.Node, wantVoters, wan
 		}
 		if time.Now().After(deadline) {
 			for _, id := range members {
-				st := s.c.nodes[id].Status()
-				s.logf("convergence status %s: role=%s term=%d leader=%q learner=%v joint=%v voters=%v learners=%v epoch=%d last=%d commit=%d applied=%d want epoch=%d applied>=%d",
-					id, st.Role, st.Term, st.Leader, st.Learner, st.Joint, st.Voters, st.Learners, st.ConfigEpoch, st.LastIndex, st.CommitIndex, st.LastApplied, wantEpoch, lastUser)
+				s.logNodeState(id)
 			}
 			s.t.Fatalf("members %v did not converge within %v", members, stressPhaseTimeout)
 		}
@@ -467,9 +516,7 @@ func (s *jointStress) retryChange(name string, autoLeave bool, done func(raft.St
 				s.voters, s.learners, s.oldVoters, s.newVoters)
 			for _, id := range s.pool {
 				if node := s.c.nodes[id]; node != nil {
-					st := node.Status()
-					s.logf("retry-timeout status %s: role=%s term=%d joint=%v voters=%v learners=%v old=%v new=%v epoch=%d commit=%d applied=%d",
-						id, st.Role, st.Term, st.Joint, st.Voters, st.Learners, st.VotersOld, st.VotersNew, st.ConfigEpoch, st.CommitIndex, st.LastApplied)
+					s.logNodeState(id)
 				}
 			}
 			s.t.Fatalf("%s did not complete within %v: %v", name, stressOpTimeout, lastErr)
