@@ -328,5 +328,11 @@
     "title": "Актуализация оценки проекта",
     "status": "done",
     "file": "0055-assessment-refresh.md"
+  },
+  {
+    "id": "0056",
+    "title": "Nightly chaos meta-scheduler flake",
+    "status": "done",
+    "file": "0056-ci-nightly-flake.md"
   }
 ]

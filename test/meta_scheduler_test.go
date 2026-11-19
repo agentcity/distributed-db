@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,9 +34,9 @@ func TestV2MetaSchedulerSplitMerge(t *testing.T) {
 		ms, err := metaserver.New(metaserver.Config{
 			Addr: addr, ID: addr, Peers: peers, DataDir: t.TempDir(), Replicated: true,
 			Ranges:             []meta.Range{{ID: 1, Start: nil, End: nil, Replicas: kvAddrs, Version: 1}},
-			ElectionTimeoutMin: 120 * time.Millisecond,
-			ElectionTimeoutMax: 240 * time.Millisecond,
-			HeartbeatInterval:  25 * time.Millisecond,
+			ElectionTimeoutMin: 500 * time.Millisecond,
+			ElectionTimeoutMax: 1 * time.Second,
+			HeartbeatInterval:  50 * time.Millisecond,
 			Logger:             v2Logger(),
 		})
 		if err != nil {
@@ -50,6 +51,31 @@ func TestV2MetaSchedulerSplitMerge(t *testing.T) {
 	metaLeader := waitMetaLeader(t, metas)
 	sched := metaClient(t, metaLeader.Addr())
 
+	// A split/merge mutates replicas before publishing the range map via the
+	// meta leader. If meta leadership moves during that window (common on a
+	// slow CI runner), the map apply fails with "not meta leader". The
+	// operations are idempotent, so follow the current leader and retry
+	// instead of treating a transient election as a split failure.
+	retryMeta := func(op string, call func() (bool, string)) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			ok, msg := call()
+			if ok {
+				return
+			}
+			if !strings.Contains(msg, "not meta leader") {
+				t.Fatalf("%s: %s", op, msg)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: no stable meta leader: %s", op, msg)
+			}
+			time.Sleep(50 * time.Millisecond)
+			metaLeader = waitMetaLeader(t, metas)
+			sched = metaClient(t, metaLeader.Addr())
+		}
+	}
+
 	nodes := make([]*v2Node, 0, 3)
 	for i, addr := range kvAddrs {
 		peers := make([]string, 0, 2)
@@ -60,9 +86,9 @@ func TestV2MetaSchedulerSplitMerge(t *testing.T) {
 		}
 		cfg := kvserver.Config{
 			ID: addr, RaftAddr: addr, DataDir: t.TempDir(), Peers: peers, RangeID: 1,
-			ElectionTimeoutMin: 120 * time.Millisecond,
-			ElectionTimeoutMax: 240 * time.Millisecond,
-			HeartbeatInterval:  25 * time.Millisecond,
+			ElectionTimeoutMin: 500 * time.Millisecond,
+			ElectionTimeoutMax: 1 * time.Second,
+			HeartbeatInterval:  50 * time.Millisecond,
 			CacheSize:          8 << 20, MemTableSize: 4 << 20,
 			Logger: v2Logger(),
 		}
@@ -104,10 +130,18 @@ func TestV2MetaSchedulerSplitMerge(t *testing.T) {
 	put("m", "middle")
 	put("z", "right")
 
-	split, err := sched.SplitRange(ctx, &pbv2.MetaSplitRangeRequest{RangeId: 1, SplitKey: []byte("m")})
-	if err != nil || !split.GetSuccess() {
-		t.Fatalf("meta split: %v %+v", err, split)
-	}
+	var split *pbv2.MetaSplitRangeResponse
+	retryMeta("meta split", func() (bool, string) {
+		var err error
+		split, err = sched.SplitRange(ctx, &pbv2.MetaSplitRangeRequest{RangeId: 1, SplitKey: []byte("m")})
+		if err != nil {
+			return false, err.Error()
+		}
+		if split.GetSuccess() {
+			return true, ""
+		}
+		return false, split.GetError()
+	})
 	newID := split.GetNewRangeId()
 	if newID == 0 {
 		t.Fatal("meta split returned no new range id")
@@ -146,10 +180,16 @@ func TestV2MetaSchedulerSplitMerge(t *testing.T) {
 	get(client2, "m", "middle")
 	get(client2, "z", "right")
 
-	merge, err := sched.MergeRanges(ctx, &pbv2.MetaMergeRangesRequest{LeftRangeId: 1, RightRangeId: newID})
-	if err != nil || !merge.GetSuccess() {
-		t.Fatalf("meta merge: %v %+v", err, merge)
-	}
+	retryMeta("meta merge", func() (bool, string) {
+		merge, err := sched.MergeRanges(ctx, &pbv2.MetaMergeRangesRequest{LeftRangeId: 1, RightRangeId: newID})
+		if err != nil {
+			return false, err.Error()
+		}
+		if merge.GetSuccess() {
+			return true, ""
+		}
+		return false, merge.GetError()
+	})
 	client3, err := v2client.New(metaLeader.Addr(), kvAddrs)
 	if err != nil {
 		t.Fatalf("client3: %v", err)
