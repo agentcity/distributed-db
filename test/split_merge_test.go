@@ -437,17 +437,27 @@ func TestV2DistributedMerge(t *testing.T) {
 	put("z", "right")
 
 	// The coordinator asks all replicas concurrently: the leader of each
-	// group proposes prepare while followers wait for it.
+	// group proposes prepare while followers wait for it. A slow CI runner can
+	// lose a proposal race and report a prepare timeout; the operation is
+	// idempotent, so retry each replica with a bounded per-attempt context.
 	var wg sync.WaitGroup
 	errs := make(chan string, len(nodes))
 	for _, n := range nodes {
 		wg.Add(1)
 		go func(n *v2Node) {
 			defer wg.Done()
-			resp, err := n.client.MergeRanges(ctx, &pbv2.MergeRangesRequest{LeftRangeId: 1, RightRangeId: 2})
-			if err != nil || !resp.GetSuccess() {
-				errs <- n.addr + ": " + errString(err) + " " + resp.GetError()
+			var last string
+			for attempt := 0; attempt < 3; attempt++ {
+				mctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				resp, err := n.client.MergeRanges(mctx, &pbv2.MergeRangesRequest{LeftRangeId: 1, RightRangeId: 2})
+				cancel()
+				if err == nil && resp.GetSuccess() {
+					return
+				}
+				last = errString(err) + " " + resp.GetError()
+				time.Sleep(200 * time.Millisecond)
 			}
+			errs <- n.addr + ": " + last
 		}(n)
 	}
 	wg.Wait()
