@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,9 +22,9 @@ type membershipFake struct {
 	pbv2.UnimplementedKVServiceServer
 
 	addr        string
-	failAdd     bool
-	failPromote bool
-	failRemove  bool
+	failAdd     atomic.Bool
+	failPromote atomic.Bool
+	failRemove  atomic.Bool
 }
 
 func (f *membershipFake) Status(context.Context, *pbv2.StatusRequest) (*pbv2.StatusResponse, error) {
@@ -38,21 +39,21 @@ func (f *membershipFake) AddReplica(context.Context, *pbv2.AddReplicaRequest) (*
 }
 
 func (f *membershipFake) AddLearner(context.Context, *pbv2.AddLearnerRequest) (*pbv2.MembershipResponse, error) {
-	if f.failAdd {
+	if f.failAdd.Load() {
 		return &pbv2.MembershipResponse{Leader: f.addr, Error: "injected add failure"}, nil
 	}
 	return &pbv2.MembershipResponse{Success: true, Leader: f.addr}, nil
 }
 
 func (f *membershipFake) PromoteReplica(context.Context, *pbv2.PromoteReplicaRequest) (*pbv2.MembershipResponse, error) {
-	if f.failPromote {
+	if f.failPromote.Load() {
 		return &pbv2.MembershipResponse{Leader: f.addr, Error: "injected promote failure"}, nil
 	}
 	return &pbv2.MembershipResponse{Success: true, Leader: f.addr}, nil
 }
 
 func (f *membershipFake) RemoveVoter(context.Context, *pbv2.RemoveVoterRequest) (*pbv2.MembershipResponse, error) {
-	if f.failRemove {
+	if f.failRemove.Load() {
 		return &pbv2.MembershipResponse{Leader: f.addr, Error: "injected remove failure"}, nil
 	}
 	return &pbv2.MembershipResponse{Success: true, Leader: f.addr}, nil
@@ -118,7 +119,7 @@ func TestMetaAddReplicaUpdatesMapOnlyOnSuccess(t *testing.T) {
 	}
 
 	failures := newMembershipMeta(t, addrs[:3])
-	fakes[0].failAdd = true
+	fakes[0].failAdd.Store(true)
 	failCtx, failCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer failCancel()
 	if err := failures.AddReplica(failCtx, 1, target); err == nil {
@@ -127,7 +128,7 @@ func TestMetaAddReplicaUpdatesMapOnlyOnSuccess(t *testing.T) {
 	if got := failures.Cluster().Snapshot()[0].Replicas; len(got) != 3 {
 		t.Fatalf("replicas changed on failed add: %v", got)
 	}
-	fakes[0].failAdd = false
+	fakes[0].failAdd.Store(false)
 }
 
 func TestMetaRemoveReplicaUpdatesMapOnlyOnSuccess(t *testing.T) {
@@ -155,7 +156,7 @@ func TestMetaRemoveReplicaUpdatesMapOnlyOnSuccess(t *testing.T) {
 	}
 
 	failures := newMembershipMeta(t, addrs)
-	fakes[0].failRemove = true
+	fakes[0].failRemove.Store(true)
 	failCtx, failCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer failCancel()
 	if err := failures.RemoveReplica(failCtx, 1, victim); err == nil {
