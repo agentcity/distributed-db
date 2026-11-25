@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -178,24 +179,36 @@ func TestV2SnapshotChunkedCatchUp(t *testing.T) {
 			sum := sha256.Sum256(seed[:])
 			off += copy(value[off:], sum[:])
 		}
-		r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
-		if err != nil {
-			t.Fatalf("ts: %v", err)
+		var lastErr string
+		for attempt := 0; attempt < 3; attempt++ {
+			// A slow CI runner can elect a new leader between v2WaitLeader and
+			// the next write. Re-resolve the leader and retry the transaction
+			// instead of failing the snapshot scenario on a transient
+			// "not leader" response.
+			leader = v2WaitLeader(t, nodes)
+			r, err := metaClient.AllocTS(ctx, &pbv2.AllocTSRequest{Count: 2})
+			if err != nil {
+				t.Fatalf("ts: %v", err)
+			}
+			pr, err := leader.client.Prewrite(ctx, &pbv2.PrewriteRequest{
+				StartTs: r.Start, Primary: []byte(key),
+				Mutations: []*pbv2.Mutation{{Key: []byte(key), Value: value}},
+			})
+			if err == nil && pr.GetSuccess() {
+				cr, cerr := leader.client.Commit(ctx, &pbv2.CommitRequest{
+					StartTs: r.Start, CommitTs: r.Start + 1, Keys: [][]byte{[]byte(key)},
+				})
+				if cerr == nil && cr.GetSuccess() {
+					return kvWrite{key: []byte(key), value: value, ts: r.Start + 1}
+				}
+				lastErr = fmt.Sprintf("commit: %v %+v", cerr, cr)
+			} else {
+				lastErr = fmt.Sprintf("prewrite: %v %+v", err, pr)
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
-		pr, err := leader.client.Prewrite(ctx, &pbv2.PrewriteRequest{
-			StartTs: r.Start, Primary: []byte(key),
-			Mutations: []*pbv2.Mutation{{Key: []byte(key), Value: value}},
-		})
-		if err != nil || !pr.GetSuccess() {
-			t.Fatalf("prewrite %s: %v %+v", key, err, pr)
-		}
-		cr, err := leader.client.Commit(ctx, &pbv2.CommitRequest{
-			StartTs: r.Start, CommitTs: r.Start + 1, Keys: [][]byte{[]byte(key)},
-		})
-		if err != nil || !cr.GetSuccess() {
-			t.Fatalf("commit %s: %v %+v", key, err, cr)
-		}
-		return kvWrite{key: []byte(key), value: value, ts: r.Start + 1}
+		t.Fatalf("write %s after retries: %s", key, lastErr)
+		return kvWrite{}
 	}
 
 	// Four ~450 KiB values make the snapshot stream comfortably larger than
